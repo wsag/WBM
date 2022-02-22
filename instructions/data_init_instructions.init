@@ -1,0 +1,27 @@
+{
+Code_Name =>  '',      # Name to be used as dataset ID. Must be unique. Required.
+Var_Name  => '',     # Variable name IN THE DATA FILE to be read. Required. Leave it blank for some GDAL file formats, e.g. GeoTIFF, GridASCII, etc.
+Time_Series => '',     # One of: daily{N_subdaily}, daily, monthly, yearly, daily_clim, monthly_clim, yearly_clim.  Required/L1 for time series data.  Leave blank for non-time series.
+Start_Date => '',     # Start of time series in format YYYY-MM-DD. Required/L1 for time series data.  Leave blank for non-time series.
+End_Date  => '',     # End of time series in format YYYY-MM-DD. Can have 0000 for climatologies. Required for time series data.  Leave blank for non-time series.
+Var_Scale => '1',     # Scaling factor to convert Orig_Units to Units. Required/L1. Leave blank for no scaling.
+Var_Offset => '0',     # Offset factor to convert Orig_Units to Units. Required/L1. Leave blank for no offset.
+Units => '',     # Units as used by RIMS. This is the result of Var_Offset + Var_Scale x Orig_Units (below). Required/L1.
+Orig_Units => '',     # Original units of data set. Required/L1.
+Bands => '1',     # Number of layers (e.g., time slices) in data set. Required/L1. Can be blank for single layer datasets
+Processing => '',     # Provides opportunity to specify GDAL interpretation of data. Examples: ‘NoData=-9999’ (specifies a NoData value in the source files, if not defined in their metadata. Required/L1.
+Projection => '',     # EPSG code or proj4string for geographic projection of data. Required/L1.
+File_Path => '',     # File path to data. Required/L1.
+Data_Attrib => '',     # Dataset attribute table that links the value in a grid cell or shape file polygon to a Name, e.g. Land cover IDs to land cover names.
+Name => '',     # Human-readable name for the data. Optional, but recommended.
+Param_Name => '',     # Name for data labels on graphs, e.g. on Earth Atlas and other utilities using this data. Optional.
+Polygon_Aggregation => '',    # List of polygon/mask dataset IDs for pre-built spatial data aggregations. Optional.
+MetadataLink => '',     # URL for website data where it was downloaded from. Optional, Recommended.
+Creator => '',     # Dataset creator or downloader.  Indicate if the person created the data or downloaded the data.  Optional.
+Version => '',     # Version number.  If the data has a citation and/or DOI, this should match the version number of the DOI.  Optional.
+Citation => '',     # Full citation for data set. 
+Date => '',     # Date of data download or creation.  Optional
+Licence => '',      # Licence of data.  If no licence can be identified, enter “Unknown”. Optional/L2.
+AssociatedCode => '',     # Code used to create the data.  This can point to a code DOI, code available on gitHub or other code sharing site, or code maintained only on WSAG servers.  Best practice: make code available via DOI or gitHub.  Optional/L2 for data that was processed using code.
+DOI => ''     # DOI for dataset. 
+}
