@@ -10,6 +10,8 @@ Shan Zuidema: shan.zuidema@unh.edu<br/>
 Alex Prusevich: alex.prusevich@unh.edu<br/>
 Stanley Glidden: stanley.glidden@unh.edu<br/>
 
+General questions can be sent to: unh.wbm@unh.edu <br/>
+
 ## Files
 ### model/
 This directory contains:  
@@ -37,3 +39,6 @@ This version of WBM is being released by the [Water Systems Analysis Group](http
 
 2. Grogan, Danielle Sarah, "Global and regional assessments of unsustainable groundwater use in irrigated agriculture" (2016). Doctoral Dissertations. 2260.
 https://scholars.unh.edu/dissertation/2260. 
+
+## Input data
+Model input data and a Singularity container with the required operating system and software dependencies can be found here: https://wbm.unh.edu/
