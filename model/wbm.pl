@@ -139,7 +139,7 @@
 #######################################################################
 #
 #	Version-		
-use constant WBM_VERSION =>	'1.0';	# first open source release version
+use constant WBM_VERSION =>	'1.0.0';	# first open source release version
 #						
 #
 # Debugging errors: >perl -Mdiagnostics wbm.pl -v ...
