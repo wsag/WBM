@@ -135,13 +135,12 @@
 #		Users who are interested in the WSAG UNH domain version with full set of features should contact
 #		Dr. R. Lammers (WSAG director).
 #
-#	Documentation-		https://www.watsys.sr.unh.edu/WBM
 #
 #######################################################################
 #
-#	Version-		(YY.M.#)	# Number is zero-based
-use constant WBM_VERSION =>	'22.1.1';	# If this month is not listed in the notes above-
-#						#	this version has small bug fixes or minor changes.
+#	Version-		
+use constant WBM_VERSION =>	'1.0';	# first open source release version
+#						
 #
 # Debugging errors: >perl -Mdiagnostics wbm.pl -v ...
 #######################################################################
