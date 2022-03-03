@@ -40,4 +40,4 @@ This version of WBM is being released by the [Water Systems Analysis Group](http
 https://scholars.unh.edu/dissertation/2260. 
 
 ## Input data
-Model input data and a Singularity container with the required operating system and software dependencies can be found here: https://wbm.unh.edu/
+Model input data and a Singularity container with the required operating system and software dependencies can be found here: https://wbm.unh.edu/ (https://dx.doi.org/10.34051/d/2022.2)
