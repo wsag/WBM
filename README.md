@@ -20,7 +20,6 @@ This directory contains:
 **RIMS.pm**: custom perl library required by WBM   <br/>
 **RIMS.conf**: configuration file for RIMS.pm. <br/>
 **build_spool.pl**: script called by WBM to generate binary input files from primary input data. <br/>
-**build_static_spool.pl**: same as build_spool.pl, but for data that are not time series. <br/>
 **WBM_dataCube_expand.csv**: list of WBM output variables, and info required for temporal aggregation by utilites/temporal_aggregation.pl. <br/>
 **RIMS/**: directory containing RIMS perl library code. <br/>
 
