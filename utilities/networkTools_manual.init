@@ -7,10 +7,10 @@
 	###	NB 3- Use quotes for file names, and do not change Perl brackets/syntax when changing values
 	###	NB 4- Use hash character "#" to start comment or comment line(s)
 
-	###	Earliest compatible version of networkTools utility is:	21.9.0
+	###	Compatible version of networkTools utility is:	22.1.2
 
 {
-  Net_file	=> '/net/nfs/zero/data3/WBM_TrANS/data/flowdirection602.ascii',	# Optional- if running "combine" job
+  Net_file	=> '/net/nfs/zero/data3/WBM_TrANS/data/flowdirection602.ascii',	# Optional- if running jobs ## 4 or 6
   Net_proj	=> '',	# Optional- Projection of the "Net_file".  Default is "epsg:4326", if omitted
   Net_projForce	=> 0,	# Optional- Force to assume equal area proj. Value is conversion to meters. Default is 0
   basinID_file	=> '',	# Optional- to retain known basin IDs
@@ -18,24 +18,28 @@
   stnMask	=> 0,	# Optional- Save mask file of resulting Network (suffix "_msk"). Default is 0
 
 	### Top level jobs (e.g. "cell_table", "preclip", etc.) are done strictly in the following sequence:
-		# 1- cell_table		4- combine		7- merge_endorheic
-		# 2- preclip		5- subtract		8- Upstream area match
-		# 3- subset		6- copy_attrib
+		# 1- cell_table		5- subtract			9 - Endorheic direction
+		# 2- preclip		6- copy_attrib			10- Upstream percent
+		# 3- subset		7- merge_endorheic		11- Upstream average
+		# 4- combine		8- Upstream area match
 
 	#######################################################################
 	###  Job # 1 : Build cell table (CT), if "cell_table" key is given
   cell_table	=> {
 	output_file	=> 'test.csv',	# Optional- Same directory and Network file basename, if omitted
-	CT_csv		=> 1,		# Optional- Flag to build text   (CSV) version of the CT. Default is 1
-	CT_dat		=> 0,		# Optional- Flag to build binary (PDL) version of the CT. Default is 0
-	Net_shape	=> 0,		# Optional- Flag to build ESRI shape and GeoJSON files.   Default is 0
-	streamOrder	=> 0,		# Optional- Save stream order file (suffix "_strmOrder"). Default is 0
-	basinIDs	=> 1,		# Optional- Save basin ID file (suffix "_IDs"). Default is 1
-	upstrArea	=> 1,		# Optional- Save upstream area (km2) file (suffix "_upstrArea"). Default is 1
+	CT_csv		=> 1,		# Optional- Flag to build text   (CSV) version of the CT.        Default is 0
+	CT_dat		=> 0,		# Optional- Flag to build binary (PDL) version of the CT.        Default is 0
+	Net_shape	=> 0,		# Optional- Flag to build ESRI shape and GeoJSON files.          Default is 0
+	streamOrder	=> 0,		# Optional- Save stream order file (suffix "_strmOrder").        Default is 0
+	mouthDistance	=> 0,		# Optional- Save distance to mouth, km (suffix "_mouthDist").    Default is 0
+	basinIDs	=> 1,		# Optional- Save basin ID file (suffix "_IDs").                  Default is 0
+	upstrArea	=> 1,		# Optional- Save upstream area (km2) file (suffix "_upstrArea"). Default is 0
+	upstrAreaFmt	=> '%.1f',	# Optional- Upstream area rounding in output file.               Default is %.1f
 	endorheic	=> 0,		# Optional- Save mask file for endorheic basins (suffix "_EnR"). Default is 0
 	endorheic_csv	=> 0,		# Optional- Save csv file for endorheic basins info (suffix "_EnR"). Default is 0
 	endorheicBuffer	=> 200,		# Optional- Buffer around boundary to exclude endorheic outlets, km. Default is 0
-	segmentation	=> 0		# Optional- Segmentation  boundary to exclude endorheic outlets. Default is 0
+	segmentation	=> 0,		# Optional- Segmentation  boundary to exclude endorheic outlets. Default is 0
+	oceanMask_file	=> ''		# Optional- Ocean mask file to use to exclude endorheic outlets.
 		   },
 
 	#######################################################################
@@ -44,7 +48,7 @@
   preclip	=> {
 	output_file	=> 'PRECLIP.asc',	# Optional- Adds suffix "_preClip" to Network file basename, if omitted
 	truncation_check=> 1,			# Optional- Flag to check clipping truncation. Default is 1
-	trim_nodata	=> 1,			# Optional- Flag to trim nodata margins. Default is 1, if omitted
+	trim_nodata	=> 1,			# Optional- Flag to trim nodata margins.       Default is 1
 								# Note- "trim_nodata" works for "polygon" only.
 	rectangle	=> {	lonMin	=> -95.0,	lonMax => -70.0,	# Coordinates must be in the projection
 				latMin	=>  40.0,	latMax =>  52.0		# of "Net_file" above
@@ -63,15 +67,19 @@
 
   subset	=> {
 	output_file	=> 'SUBSET.asc',# Optional- Adds suffix "_Subset" to Network file basename, if omitted
-	trim_nodata	=> 1,		# Optional- Flag to trim nodata margins. Default is 1, if omitted
-	CT_csv		=> 0,		# Optional- Flag to build text   (CSV) version of the CT. Default is 0
-	CT_dat		=> 0,		# Optional- Flag to build binary (PDL) version of the CT. Default is 0
-	streamOrder	=> 0,		# Optional- Save stream order file (suffix "_strmOrder"). Default is 0
-	basinIDs	=> 1,		# Optional- Save basin ID file. Default is 1
-	upstrArea	=> 1,		# Optional- Save upstream area (km2) file (suffix "_upstrArea"). Default is 1
-	endorheic	=> 0,		# Optional- Save mask file for endorheic basins. Default is 0
+	trim_nodata	=> 1,		# Optional- Flag to trim nodata margins.                         Default is 0
+	CT_csv		=> 0,		# Optional- Flag to build text   (CSV) version of the CT.        Default is 0
+	CT_dat		=> 0,		# Optional- Flag to build binary (PDL) version of the CT.        Default is 0
+	streamOrder	=> 0,		# Optional- Save stream order file (suffix "_strmOrder").        Default is 0
+	mouthDistance	=> 0,		# Optional- Save distance to mouth, km (suffix "_mouthDist").    Default is 0
+	basinIDs	=> 1,		# Optional- Save basin ID file.                                  Default is 0
+	upstrArea	=> 1,		# Optional- Save upstream area (km2) file (suffix "_upstrArea"). Default is 0
+	upstrAreaFmt	=> '%.1f',	# Optional- Upstream area rounding in output file.               Default is %.1f
+	endorheic	=> 0,		# Optional- Save mask file for endorheic basins.                 Default is 0
+	endorheic_csv	=> 0,		# Optional- Save csv file for endorheic basins info (suffix "_EnR"). Default is 0
 	endorheicBuffer	=> 200,		# Optional- Buffer around boundary to exclude endorheic outlets, km. Default is 0
 	segmentation	=> 0,		# Optional- Segmentation  boundary to exclude endorheic outlets. Default is 0
+	oceanMask_file	=> '',		# Optional- Ocean mask file to use to exclude endorheic outlets.
 	
 
 	### Priority order of subsetting methods:
@@ -125,10 +133,10 @@
 
 			# Note- preclip job does not apply to this function
   subtract	=> {
-	Net_files	=> [	'/net/nfs/zero/home/WBM_TrANS/data/karsub3.asc',
+	Net_files	=> [	'/net/nfs/zero/home/WBM_TrANS/data/karsub3.asc',	# Networks to subtract from Net_file
 				'/net/nfs/zero/home/WBM_TrANS/data/nepal_1km_v2.asc' ],
 	output_file	=>   'LESS_NET_FILE.asc',		# Grid ASCII output file name (Tip: use extention *.asc)
-	trim_nodata	=> 1			# Optional- Flag to trim nodata margins. Default is 1, if omitted
+	trim_nodata	=> 1			# Optional- Flag to trim nodata margins. Default is 1
 		   },
 
 	#######################################################################
@@ -142,14 +150,15 @@
 	subcont_ID	=> '/net/nfs/zero/data3/WBM_TrANS/data/30min_w_stn-6.04/masks/grids/subcontinent.asc',
 	subcont_attr	=> '/net/nfs/zero/data3/WBM_TrANS/data/30min_w_stn-6.04/masks/SubContinent-Fields-V6.02-2001-01-30.txt',
 		# Destination basin ID file to copy/find attributes to-
-	basin_ID	=> '/net/nfs/swift/raid2/data/MERIT/MERIT_Hydro_IHU/05min/MERIT_05min_basinid.asc',
+	basin_ID	=> '/net/nfs/swift/raid2/data/MERIT/MERIT_Hydro_IHU/05min/MERIT_05min_IDs.asc',
+	basin_ID_EnR	=> '/net/nfs/swift/raid2/data/MERIT/MERIT_Hydro_IHU/05min/MERIT_05min_EnR.asc',	# Optional
 	basin_upArea	=> '/net/nfs/swift/raid2/data/MERIT/MERIT_Hydro_IHU/05min/MERIT_05min_flwdir_upstrArea.asc',
 		# Overlap method parameters
 	min_overlap	=> 0.6,			# Fraction of overlap area to match
 	min_check_area	=> 5000,		# Min basin area to check matching, km2
 	max_n_basins	=> 10000,		# Maximum number of largest basins to output 
 		# Output file for the destination “dst_basin_ID”
-	output_file	=> 'basin_attr.csv'	# Optional- Adds suffix/ext "_attr.csv" to basinID_file basename, if omitted
+	output_file	=> 'basin_attr.csv'	# Optional- Adds suffix/ext "_attr.csv" to basinID file basename, if omitted
 		   },
 
 	#######################################################################
@@ -162,12 +171,14 @@
 	endorh_ID_file	=> '/net/nfs/swift/raid2/data/MERIT/MERIT_Hydro_IHU/05min/05min_flwdir_EnR.asc',	# Input
 	uparea_file	=> '/net/nfs/swift/raid2/data/MERIT/MERIT_Hydro_IHU/05min/05min_uparea.tif',		# Input
 	elev_file	=> '/net/nfs/swift/raid2/data/MERIT/MERIT_Hydro_IHU/05min/05min_elevtn.tif',	# Input- River elevation
-	search_method	=> 0,			# Breakout cell search method: 0- min distance; 1- min elev in max dist;
-	max_distance	=> 0,			# Max outlet distance from basin boundary, pixels
-	max_elev_delta	=> 100,			# Max elevation delta between the breakout cell and outlet, m
-	max_area	=> 1e4,			# Max basing area to allow merging, km2. Default is unlimited.
-	dir_out_method	=> 0			# Breakout dir method: 0- lowest elevation 1- largest upstream area
-		   }
+	endorheic_csv	=> 0,		# Optional- Save csv file for endorheic basins info (suffix "_EnR"). Default is 0
+	upstrAreaFmt	=> '%.1f',	# Optional- Upstream area rounding in output file. Default is %.1f
+	search_method	=> 0,		# Breakout cell search method: 0- min distance; 1- min elev in max dist;
+	max_distance	=> 0,		# Max outlet distance from basin boundary, pixels
+	max_elev_delta	=> 100,		# Max elevation delta between the breakout cell and outlet, m
+	max_area	=> 1e4,		# Max basing area to allow merging, km2. Default is unlimited.
+	dir_out_method	=> 0		# Breakout dir method: 0- lowest elevation 1- largest upstream area
+		   },
 
 	#######################################################################
 	###  Job # 8 : Upstream area match between observed (sites) and network values
@@ -183,5 +194,36 @@
 	search_distance	=> 20,			# Search distance
 	search_units	=> 'km',		# Search distance units (km or pix). Default is 'km'
 	coord_round	=> '%.3f'		# Output coordinates rounding. Default is '%.2f'
-		   }
+		   },
+
+	#######################################################################
+	###  Job # 9 : Set endorheic mouth flow direction to -1
+
+  endorheic_dir => {
+	output_file	=> 'EnR_dir.asc',	# Optional- Adds suffix "_EnR_dir" to Network file basename, if omitted
+	endorheic_mask	=> '/net/nfs/zero/data3/WBM_TrANS/data/flowdirection602_EnR.asc'
+  }
+
+	#######################################################################
+	###  Job # 10 : Calculate landcover upstream percent in each network pixel
+
+  upstream_percent => {
+	output_file	=> 'upstr_pct.asc',	# Optional- Adds suffix "_upstr_pct" to Network file basename, if omitted
+						# Output file name will have a suffix of each group IDs, e.g. "_1_2_3.asc"
+	landcover_file	=> 'landcover.asc',	# Input
+	lc_file_proj	=> 'epsg:4326',		# Optional- Projection of the one above. Default is 'epsg:4326'	# Input
+	lc_ID_groups	=> [[1,2,3], [4,5]],	# Landcover ID group to use in calculations			# Input
+	percent		=> 1,			# Optional- Flag to output percent (1) or fractions (0). Default is 1
+	output_Fmt	=> '%.2f',		# Optional- Rounding in output file. Default is '%.2f'
+  }
+
+	#######################################################################
+	###  Job # 11 : Calculate data upstream average in each network pixel
+
+  upstream_average => {
+	output_file	=> 'upstr_avg.asc',	# Optional- Adds suffix "_upstr_avg" to Network file basename, if omitted
+	data_file	=> 'my_data.asc',	# Input
+	data_file_proj	=> 'epsg:4326',		# Optional- Projection of the one above. Default is 'epsg:4326'	# Input
+	output_Fmt	=> '%.2f',		# Optional- Rounding in output file. Default is '%.2f'
+  }
 }
