@@ -7,7 +7,7 @@
 	###	NB 3- Use quotes for file names, and do not change Perl brackets/syntax when changing values
 	###	NB 4- Use hash character "#" to start comment or comment line(s)
 
-	###	Compatible version of networkTools utility is:	22.1.2
+	###	Compatible version of networkTools utility is:	22.4.0
 
 {
   Net_file	=> '/net/nfs/zero/data3/WBM_TrANS/data/flowdirection602.ascii',	# Optional- if running jobs ## 4 or 6

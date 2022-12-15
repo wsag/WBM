@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl
 
 #######################################################################
 #
@@ -22,15 +22,16 @@
 #	Nov 2021	Added network distance to mouth calculations
 #	Dec 2021	Added Job # 9 to set endorheic mouth flow direction to -1
 #	Jan 2022	Added Job # 10-11 to calculate landcover upstream percent and average in each network pixel
+#	Apr 2022	Added qgis style file for the flow direction shape file group
+#	Aug 2022	Transition to GDAL FFI interface.
 #
-#	Version:	22.1.2
+#	Version:	22.8.0
 #
 #######################################################################
 
 use strict;
 use Benchmark;
 use Getopt::Long;
-use Geo::GDAL;
 use File::Basename;
 use File::Path;
 use File::Temp;
@@ -45,6 +46,7 @@ use PDL::NetCDF;
 use Inline qw/Pdlpp/;
 use Fcntl;
 use Storable qw/dclone/;
+use warnings;
 use RIMS;		### WSAG UNH module set
 use RIMS::WBM;
 
@@ -463,7 +465,7 @@ if ($runIO{subset}) {
 	my $searchPix	= sprintf "%.0f", $search / sqrt($cell_area->at(@{$colRow[$i]}));   # Rounding to nearest integer
 	my($colRow, $area)	= search_3x3($up_area, $colRow[$i], undef, $searchPix);
 	printf "      Upstream location is (%s, %s) found within $search km from (%s, %s): \"$name[$i]\"\n",
-	  Geo::GDAL::ApplyGeoTransform($$extent{gTransform}, $colRow[$i][0]+0.5, $colRow[$i][1]+0.5), @{$LonLat[$i]};
+	  ApplyGeoTransform($$extent{gTransform}, $colRow[$i][0]+0.5, $colRow[$i][1]+0.5), @{$LonLat[$i]};
 	$colRow[$i]	= $colRow;
       }
       $flowDir(@{$colRow[$i]}) .= 0;		# Set outlet point for the upstream subset network
@@ -773,7 +775,7 @@ if ($runIO{merge_endorheic}) {
     my $upArea	= $up_area($xmin:$xmax, $ymin:$ymax);
     my @mouth	=(whichND($basin & ($flow < 1)))->list;
     my $area	=-$upArea->at(@mouth);
-# printf FILE "$ID\t%f\t%f\t$area\n",Geo::GDAL::ApplyGeoTransform($$extent{gTransform},$mouth[0]+$xmin,$mouth[1]+$ymin); next;
+# printf FILE "$ID\t%f\t%f\t$area\n",ApplyGeoTransform($$extent{gTransform},$mouth[0]+$xmin,$mouth[1]+$ymin); next;
     my $distance= $basin->rvals({Center => \@mouth});
     my $dist	= $distance->where(!$basin)->min - 1;
     if($area	> $max_area) { $result[1]++; next; }	# Skip: exceeds max area
@@ -908,7 +910,7 @@ if ($runIO{upstream_match}) {
 
 	### Save resulted data
   my @result	= map [ $ID[$_], $lon[$_], $lat[$_], $area[$_],
-    map(sprintf($c_round,$_+0.5*$$extent{cellsize}), Geo::GDAL::ApplyGeoTransform($$extent{gTransform},@{$search[$_][0]})),
+    map(sprintf($c_round,$_+0.5*$$extent{cellsize}), ApplyGeoTransform($$extent{gTransform},@{$search[$_][0]})),
 	sprintf("%.2f", $search[$_][1]),
 	sprintf("%.2f", sqrt(($colRow[$_][0]-$search[$_][0][0])**2 + ($colRow[$_][1]-$search[$_][0][1])**2))], 0 .. $#data;
   write_csv($runIO{upstream_match}{output_file}, \@header, \@result);
@@ -1367,7 +1369,7 @@ sub info_EnR
     my $flow	= $flowDir($xmin:$xmax, $ymin:$ymax);
     my @mouth	=(whichND( $basin & ($flow < 1)))->list;
     my @colRow	=($mouth[0]+$xmin, $mouth[1]+$ymin);
-    my @lonLat	= map sprintf("%.4f",$_), Geo::GDAL::ApplyGeoTransform($$extent{gTransform}, $colRow[0]+0.5, $colRow[1]+0.5);
+    my @lonLat	= map sprintf("%.4f",$_), ApplyGeoTransform($$extent{gTransform}, $colRow[0]+0.5, $colRow[1]+0.5);
     push @list_EnR, [$id, @lonLat, @colRow, $basin->sum, sprintf("%.2f", $up_area->at(@colRow))];
   }
   print "\n";
@@ -1386,7 +1388,7 @@ sub write_CT_csv
     print FILE join("\t",@$header),"\n";	foreach my $row (0 .. $size-1) {
     print FILE join("\t",
 	$cell_pdl(,$row)->list, $strmOrder->at($cell_pdl(3:4,$row)->list),
-	Geo::GDAL::ApplyGeoTransform($$extent{gTransform},($cell_pdl(3:4,$row)+0.5)->list), $area->at($row),
+	ApplyGeoTransform($$extent{gTransform},($cell_pdl(3:4,$row)+0.5)->list), $area->at($row),
 	$mDist->at($cell_pdl(3:4,$row)->list)), "\n";
     print "\r\tSaving cell table: row $count of $size" unless ++$count %1000; }
   close FILE;
@@ -1414,14 +1416,17 @@ EOF
 die sprintf("(%d,%d)\n%s\n%s\n%s\n%s\n",@colRow,$basinID->at(@colRow),$strmOrder->at(@colRow),$cell_pdl->at(0,$row),$area->at($row)) if $basinID->at(@colRow) eq 'BAD' || $strmOrder->at(@colRow) eq 'BAD' || $cell_pdl->at(0,$row) eq 'BAD' || $area->at($row) eq 'BAD';
       printf FILE "{ \"type\": \"Feature\", \"properties\": { \"NAME\": \"Linestring\", \"ID\": %d, \"BASINID\": %d, \"STORDER\": %d, \"FLOWDIR\": %d, \"UPAREA\": %s }, \"geometry\": { \"type\": \"LineString\", \"coordinates\": [ [ %s, %s ], [ %s, %s ] ] } }%s",
 	++$count, $basinID->at(@colRow), $strmOrder->at(@colRow), $cell_pdl->at(0,$row), $area->at($row),
-    Geo::GDAL::ApplyGeoTransform($$extent{gTransform},($cell_pdl(3:4,$row)+0.5)->list),
-    Geo::GDAL::ApplyGeoTransform($$extent{gTransform},($cell_pdl(1:2,$row)+0.5)->list), ($count==$size?"\n]\n}\n":",\n");
+    ApplyGeoTransform($$extent{gTransform},($cell_pdl(3:4,$row)+0.5)->list),
+    ApplyGeoTransform($$extent{gTransform},($cell_pdl(1:2,$row)+0.5)->list), ($count==$size?"\n]\n}\n":",\n");
       print "\r   Saving GeoJSON: row $count of $size" unless $count % 10000;
     }
   close FILE;
   print "\r   Saving Network GeoJSON: row $size of $size - Done!\n";
   print   "   Saving Network ESRI Shape File...";
-    system "ogr2ogr -f 'ESRI Shapefile' $file.shp $file.geojson";
+    system "ogr2ogr -f 'ESRI Shapefile' $file.shp  $file.geojson";
+    open (FILE,">$file.qml") or die "Couldn't open $file.qml, $!";	# Save QGIS style file
+      print FILE flowDir_style();
+    close FILE;
   print " Done!\n";
   print   "   Saving Network KML File...";
     system "ogr2ogr -f 'KML' $file.kml $file.geojson";
@@ -1457,6 +1462,362 @@ v	Verbose mode.
 
 EOF
   exit;
+}
+
+#######################################################################
+
+sub flowDir_style
+{
+  return <<EOF;
+<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
+<qgis styleCategories="AllStyleCategories" version="3.10.4-A Coruña" labelsEnabled="0" simplifyAlgorithm="0" simplifyLocal="1" simplifyDrawingTol="1" simplifyMaxScale="1" hasScaleBasedVisibilityFlag="0" readOnly="0" maxScale="-4.65661e-10" minScale="1e+08" simplifyDrawingHints="1">
+  <flags>
+    <Identifiable>1</Identifiable>
+    <Removable>1</Removable>
+    <Searchable>1</Searchable>
+  </flags>
+  <renderer-v2 type="RuleRenderer" forceraster="0" symbollevels="0" enableorderby="0">
+    <rules key="{06ab79b2-7593-4533-9986-e692c82e0681}">
+      <rule scalemindenom="100000000" label="far out" filter="STORDER  > 5" symbol="0" scalemaxdenom="200000000" key="{e1554365-90dd-4298-a21e-a31ca11b7cdb}"/>
+      <rule scalemindenom="4000000" label="out" filter="STORDER  > 3" symbol="1" scalemaxdenom="100000000" key="{3fd36f6d-1ba7-4ccc-afcf-0db9096819e5}"/>
+      <rule scalemindenom="100000" label="In-2" filter="STORDER  > 2" symbol="2" scalemaxdenom="4000000" key="{afb83964-b1ce-44d8-9031-10176d65ede1}"/>
+      <rule scalemindenom="1000" label="In-1" symbol="3" scalemaxdenom="1000000" key="{e5f7e5fe-8dbf-4342-b141-87d8508ebf13}"/>
+    </rules>
+    <symbols>
+      <symbol type="line" alpha="1" name="0" clip_to_extent="1" force_rhr="0">
+        <layer class="SimpleLine" locked="0" enabled="1" pass="0">
+          <prop v="square" k="capstyle"/>
+          <prop v="5;2" k="customdash"/>
+          <prop v="3x:0,0,0,0,0,0" k="customdash_map_unit_scale"/>
+          <prop v="MM" k="customdash_unit"/>
+          <prop v="0" k="draw_inside_polygon"/>
+          <prop v="bevel" k="joinstyle"/>
+          <prop v="31,120,180,255" k="line_color"/>
+          <prop v="solid" k="line_style"/>
+          <prop v="0.26" k="line_width"/>
+          <prop v="MM" k="line_width_unit"/>
+          <prop v="0" k="offset"/>
+          <prop v="3x:0,0,0,0,0,0" k="offset_map_unit_scale"/>
+          <prop v="MM" k="offset_unit"/>
+          <prop v="0" k="ring_filter"/>
+          <prop v="0" k="use_custom_dash"/>
+          <prop v="3x:0,0,0,0,0,0" k="width_map_unit_scale"/>
+          <data_defined_properties>
+            <Option type="Map">
+              <Option type="QString" name="name" value=""/>
+              <Option name="properties"/>
+              <Option type="QString" name="type" value="collection"/>
+            </Option>
+          </data_defined_properties>
+        </layer>
+      </symbol>
+      <symbol type="line" alpha="0.94" name="1" clip_to_extent="1" force_rhr="0">
+        <layer class="SimpleLine" locked="0" enabled="1" pass="0">
+          <prop v="square" k="capstyle"/>
+          <prop v="5;2" k="customdash"/>
+          <prop v="3x:0,0,0,0,0,0" k="customdash_map_unit_scale"/>
+          <prop v="MM" k="customdash_unit"/>
+          <prop v="0" k="draw_inside_polygon"/>
+          <prop v="bevel" k="joinstyle"/>
+          <prop v="31,120,180,255" k="line_color"/>
+          <prop v="solid" k="line_style"/>
+          <prop v="0.26" k="line_width"/>
+          <prop v="MM" k="line_width_unit"/>
+          <prop v="0" k="offset"/>
+          <prop v="3x:0,0,0,0,0,0" k="offset_map_unit_scale"/>
+          <prop v="MM" k="offset_unit"/>
+          <prop v="0" k="ring_filter"/>
+          <prop v="0" k="use_custom_dash"/>
+          <prop v="3x:0,0,0,0,0,0" k="width_map_unit_scale"/>
+          <data_defined_properties>
+            <Option type="Map">
+              <Option type="QString" name="name" value=""/>
+              <Option type="Map" name="properties">
+                <Option type="Map" name="outlineWidth">
+                  <Option type="bool" name="active" value="true"/>
+                  <Option type="QString" name="field" value="STORDER"/>
+                  <Option type="Map" name="transformer">
+                    <Option type="Map" name="d">
+                      <Option type="double" name="exponent" value="1"/>
+                      <Option type="double" name="maxSize" value="1"/>
+                      <Option type="double" name="maxValue" value="8"/>
+                      <Option type="double" name="minSize" value="0"/>
+                      <Option type="double" name="minValue" value="3"/>
+                      <Option type="double" name="nullSize" value="0"/>
+                      <Option type="int" name="scaleType" value="0"/>
+                    </Option>
+                    <Option type="int" name="t" value="1"/>
+                  </Option>
+                  <Option type="int" name="type" value="2"/>
+                </Option>
+              </Option>
+              <Option type="QString" name="type" value="collection"/>
+            </Option>
+          </data_defined_properties>
+        </layer>
+      </symbol>
+      <symbol type="line" alpha="1" name="2" clip_to_extent="1" force_rhr="0">
+        <layer class="SimpleLine" locked="0" enabled="1" pass="0">
+          <prop v="square" k="capstyle"/>
+          <prop v="5;2" k="customdash"/>
+          <prop v="3x:0,0,0,0,0,0" k="customdash_map_unit_scale"/>
+          <prop v="MM" k="customdash_unit"/>
+          <prop v="0" k="draw_inside_polygon"/>
+          <prop v="bevel" k="joinstyle"/>
+          <prop v="31,120,180,255" k="line_color"/>
+          <prop v="solid" k="line_style"/>
+          <prop v="0.26" k="line_width"/>
+          <prop v="MM" k="line_width_unit"/>
+          <prop v="0" k="offset"/>
+          <prop v="3x:0,0,0,0,0,0" k="offset_map_unit_scale"/>
+          <prop v="MM" k="offset_unit"/>
+          <prop v="0" k="ring_filter"/>
+          <prop v="0" k="use_custom_dash"/>
+          <prop v="3x:0,0,0,0,0,0" k="width_map_unit_scale"/>
+          <data_defined_properties>
+            <Option type="Map">
+              <Option type="QString" name="name" value=""/>
+              <Option type="Map" name="properties">
+                <Option type="Map" name="outlineWidth">
+                  <Option type="bool" name="active" value="true"/>
+                  <Option type="QString" name="field" value="STORDER"/>
+                  <Option type="Map" name="transformer">
+                    <Option type="Map" name="d">
+                      <Option type="double" name="exponent" value="1"/>
+                      <Option type="double" name="maxSize" value="1.2"/>
+                      <Option type="double" name="maxValue" value="8"/>
+                      <Option type="double" name="minSize" value="0.1"/>
+                      <Option type="double" name="minValue" value="1"/>
+                      <Option type="double" name="nullSize" value="0"/>
+                      <Option type="int" name="scaleType" value="0"/>
+                    </Option>
+                    <Option type="int" name="t" value="1"/>
+                  </Option>
+                  <Option type="int" name="type" value="2"/>
+                </Option>
+              </Option>
+              <Option type="QString" name="type" value="collection"/>
+            </Option>
+          </data_defined_properties>
+        </layer>
+      </symbol>
+      <symbol type="line" alpha="1" name="3" clip_to_extent="1" force_rhr="0">
+        <layer class="SimpleLine" locked="0" enabled="1" pass="0">
+          <prop v="square" k="capstyle"/>
+          <prop v="5;2" k="customdash"/>
+          <prop v="3x:0,0,0,0,0,0" k="customdash_map_unit_scale"/>
+          <prop v="MM" k="customdash_unit"/>
+          <prop v="0" k="draw_inside_polygon"/>
+          <prop v="bevel" k="joinstyle"/>
+          <prop v="31,120,180,255" k="line_color"/>
+          <prop v="solid" k="line_style"/>
+          <prop v="0.26" k="line_width"/>
+          <prop v="MM" k="line_width_unit"/>
+          <prop v="0" k="offset"/>
+          <prop v="3x:0,0,0,0,0,0" k="offset_map_unit_scale"/>
+          <prop v="MM" k="offset_unit"/>
+          <prop v="0" k="ring_filter"/>
+          <prop v="0" k="use_custom_dash"/>
+          <prop v="3x:0,0,0,0,0,0" k="width_map_unit_scale"/>
+          <data_defined_properties>
+            <Option type="Map">
+              <Option type="QString" name="name" value=""/>
+              <Option type="Map" name="properties">
+                <Option type="Map" name="outlineWidth">
+                  <Option type="bool" name="active" value="true"/>
+                  <Option type="QString" name="field" value="STORDER"/>
+                  <Option type="Map" name="transformer">
+                    <Option type="Map" name="d">
+                      <Option type="double" name="exponent" value="1"/>
+                      <Option type="double" name="maxSize" value="2"/>
+                      <Option type="double" name="maxValue" value="8"/>
+                      <Option type="double" name="minSize" value="0.2"/>
+                      <Option type="double" name="minValue" value="1"/>
+                      <Option type="double" name="nullSize" value="0"/>
+                      <Option type="int" name="scaleType" value="0"/>
+                    </Option>
+                    <Option type="int" name="t" value="1"/>
+                  </Option>
+                  <Option type="int" name="type" value="2"/>
+                </Option>
+              </Option>
+              <Option type="QString" name="type" value="collection"/>
+            </Option>
+          </data_defined_properties>
+        </layer>
+      </symbol>
+    </symbols>
+  </renderer-v2>
+  <customproperties>
+    <property value="0" key="embeddedWidgets/count"/>
+    <property key="variableNames"/>
+    <property key="variableValues"/>
+  </customproperties>
+  <blendMode>0</blendMode>
+  <featureBlendMode>0</featureBlendMode>
+  <layerOpacity>1</layerOpacity>
+  <SingleCategoryDiagramRenderer attributeLegend="1" diagramType="Histogram">
+    <DiagramCategory minimumSize="0" enabled="0" penWidth="0" barWidth="5" backgroundColor="#ffffff" sizeType="MM" diagramOrientation="Up" maxScaleDenominator="1e+08" opacity="1" penColor="#000000" sizeScale="3x:0,0,0,0,0,0" lineSizeScale="3x:0,0,0,0,0,0" lineSizeType="MM" minScaleDenominator="-4.65661e-10" scaleDependency="Area" width="15" height="15" rotationOffset="270" labelPlacementMethod="XHeight" scaleBasedVisibility="0" penAlpha="255" backgroundAlpha="255">
+      <fontProperties description="Ubuntu,11,-1,5,50,0,0,0,0,0" style=""/>
+      <attribute label="" field="" color="#000000"/>
+    </DiagramCategory>
+  </SingleCategoryDiagramRenderer>
+  <DiagramLayerSettings priority="0" zIndex="0" dist="0" linePlacementFlags="18" placement="2" obstacle="0" showAll="1">
+    <properties>
+      <Option type="Map">
+        <Option type="QString" name="name" value=""/>
+        <Option name="properties"/>
+        <Option type="QString" name="type" value="collection"/>
+      </Option>
+    </properties>
+  </DiagramLayerSettings>
+  <geometryOptions removeDuplicateNodes="0" geometryPrecision="0">
+    <activeChecks/>
+    <checkConfiguration/>
+  </geometryOptions>
+  <fieldConfiguration>
+    <field name="NAME">
+      <editWidget type="TextEdit">
+        <config>
+          <Option/>
+        </config>
+      </editWidget>
+    </field>
+    <field name="ID">
+      <editWidget type="Range">
+        <config>
+          <Option/>
+        </config>
+      </editWidget>
+    </field>
+    <field name="BASINID">
+      <editWidget type="Range">
+        <config>
+          <Option/>
+        </config>
+      </editWidget>
+    </field>
+    <field name="STORDER">
+      <editWidget type="Range">
+        <config>
+          <Option/>
+        </config>
+      </editWidget>
+    </field>
+    <field name="FLOWDIR">
+      <editWidget type="Range">
+        <config>
+          <Option/>
+        </config>
+      </editWidget>
+    </field>
+    <field name="UPAREA">
+      <editWidget type="TextEdit">
+        <config>
+          <Option/>
+        </config>
+      </editWidget>
+    </field>
+  </fieldConfiguration>
+  <aliases>
+    <alias field="NAME" name="" index="0"/>
+    <alias field="ID" name="" index="1"/>
+    <alias field="BASINID" name="" index="2"/>
+    <alias field="STORDER" name="" index="3"/>
+    <alias field="FLOWDIR" name="" index="4"/>
+    <alias field="UPAREA" name="" index="5"/>
+  </aliases>
+  <excludeAttributesWMS/>
+  <excludeAttributesWFS/>
+  <defaults>
+    <default expression="" field="NAME" applyOnUpdate="0"/>
+    <default expression="" field="ID" applyOnUpdate="0"/>
+    <default expression="" field="BASINID" applyOnUpdate="0"/>
+    <default expression="" field="STORDER" applyOnUpdate="0"/>
+    <default expression="" field="FLOWDIR" applyOnUpdate="0"/>
+    <default expression="" field="UPAREA" applyOnUpdate="0"/>
+  </defaults>
+  <constraints>
+    <constraint unique_strength="0" field="NAME" constraints="0" notnull_strength="0" exp_strength="0"/>
+    <constraint unique_strength="0" field="ID" constraints="0" notnull_strength="0" exp_strength="0"/>
+    <constraint unique_strength="0" field="BASINID" constraints="0" notnull_strength="0" exp_strength="0"/>
+    <constraint unique_strength="0" field="STORDER" constraints="0" notnull_strength="0" exp_strength="0"/>
+    <constraint unique_strength="0" field="FLOWDIR" constraints="0" notnull_strength="0" exp_strength="0"/>
+    <constraint unique_strength="0" field="UPAREA" constraints="0" notnull_strength="0" exp_strength="0"/>
+  </constraints>
+  <constraintExpressions>
+    <constraint exp="" desc="" field="NAME"/>
+    <constraint exp="" desc="" field="ID"/>
+    <constraint exp="" desc="" field="BASINID"/>
+    <constraint exp="" desc="" field="STORDER"/>
+    <constraint exp="" desc="" field="FLOWDIR"/>
+    <constraint exp="" desc="" field="UPAREA"/>
+  </constraintExpressions>
+  <expressionfields/>
+  <attributeactions>
+    <defaultAction value="{00000000-0000-0000-0000-000000000000}" key="Canvas"/>
+  </attributeactions>
+  <attributetableconfig sortExpression="" actionWidgetStyle="dropDown" sortOrder="0">
+    <columns>
+      <column type="field" name="NAME" hidden="0" width="-1"/>
+      <column type="field" name="ID" hidden="0" width="-1"/>
+      <column type="field" name="BASINID" hidden="0" width="-1"/>
+      <column type="field" name="STORDER" hidden="0" width="-1"/>
+      <column type="field" name="FLOWDIR" hidden="0" width="-1"/>
+      <column type="field" name="UPAREA" hidden="0" width="-1"/>
+      <column type="actions" hidden="1" width="-1"/>
+    </columns>
+  </attributetableconfig>
+  <conditionalstyles>
+    <rowstyles/>
+    <fieldstyles/>
+  </conditionalstyles>
+  <storedexpressions/>
+  <editform tolerant="1"></editform>
+  <editforminit/>
+  <editforminitcodesource>0</editforminitcodesource>
+  <editforminitfilepath></editforminitfilepath>
+  <editforminitcode><![CDATA[# -*- coding: utf-8 -*-
+"""
+QGIS forms can have a Python function that is called when the form is
+opened.
+
+Use this function to add extra logic to your forms.
+
+Enter the name of the function in the "Python Init function"
+field.
+An example follows:
+"""
+from qgis.PyQt.QtWidgets import QWidget
+
+def my_form_open(dialog, layer, feature):
+	geom = feature.geometry()
+	control = dialog.findChild(QWidget, "MyLineEdit")
+]]></editforminitcode>
+  <featformsuppress>0</featformsuppress>
+  <editorlayout>generatedlayout</editorlayout>
+  <editable>
+    <field name="BASINID" editable="1"/>
+    <field name="FLOWDIR" editable="1"/>
+    <field name="ID" editable="1"/>
+    <field name="NAME" editable="1"/>
+    <field name="STORDER" editable="1"/>
+    <field name="UPAREA" editable="1"/>
+  </editable>
+  <labelOnTop>
+    <field name="BASINID" labelOnTop="0"/>
+    <field name="FLOWDIR" labelOnTop="0"/>
+    <field name="ID" labelOnTop="0"/>
+    <field name="NAME" labelOnTop="0"/>
+    <field name="STORDER" labelOnTop="0"/>
+    <field name="UPAREA" labelOnTop="0"/>
+  </labelOnTop>
+  <widgets/>
+  <previewExpression>NAME</previewExpression>
+  <mapTip></mapTip>
+  <layerGeometryType>1</layerGeometryType>
+</qgis>
+EOF
 }
 
 #######################################################################
