@@ -186,11 +186,10 @@ There are two solutions for how to submit the commands to ROAR without violating
 
 The other solution is to log into ROAR through the ROAR Open OnDemand portal (https://portal2.aci.ics.psu.edu) and launch an interactive desktop session (ACI RHEL7 Interactive Desktop). The interactive desktop provides a GUI for ROAR but does include a shell app for running bash commands. Commands submitted to ROAR through the interactive desktop do tend to run slower than ones submitted though a job script. However, the interactivity and ability to quickly fix mistakes or experiment with your own ideas is a great benefit when learning a new modeling technique.
 
-Before running the model, the data needs to be collected from the UNH FTP site. **If you have just worked though the previous exercise, please close the container.** For ease of reference, it will be assumed the Ipswich example data will be downloaded to the same directory as the WBM `.sif` file. As done with the downloading of the example data for the WBM install, a tar ball will be downloaded and extracted:
+Before running the model, the data needs to be collected from the UNH WBM site. **If you have just worked though the previous exercise, please close the container.** For ease of reference, it will be assumed the Ipswich example data will be downloaded to the same directory as the WBM `.sif` file. As done with the downloading of the example data for the WBM install, a tar ball will be downloaded and extracted:
 ```shell
 ##Download the Ipswich example data
-wget --user=ftp ftp://merrimack.sr.unh.edu/wbm_public/ipswich_test.tar.gz
-
+wget  https://wbm.unh.edu/resources/ipswich_test.tar.gz
 ##Extract the contents of the tar ball
 tar -xvzf ./ipswich_test.tar.gz
 ```
@@ -334,7 +333,7 @@ cd ..
 ```
 For this example, the river network has already been created. However, the above data source would be a good source for collecting river network data for other projects. For these other projects, keep in mind that that the data is downloaded in tiles and unless your study area is completely contained on a single tile there will need to be some GIS processing in order to get a useable input.
 
-For this exercise, the correct river network needs to be pointed to. This is done within the model `.init` file. The Wyoming river network is not available from the UNH FTP site. However, UNH has provided a copy of this file which has been made available on ROAR at: `/gpfs/group/kaf26/default/private/mdl5548/WBMOfficialContainer_Data/Wyoming_05min_flwdir.asc`. **Find the `Network` variable in the model `.init` file. Replace the current input with the above file.**
+For this exercise, the correct river network needs to be pointed to. This is done within the model `.init` file. The Wyoming river network is not available from the UNH WBM web site. However, UNH has provided a copy of this file which has been made available on ROAR at: `/gpfs/group/kaf26/default/private/mdl5548/WBMOfficialContainer_Data/Wyoming_05min_flwdir.asc`. **Find the `Network` variable in the model `.init` file. Replace the current input with the above file.**
 
 **Dams / Reservoirs**  
 To state the obvious, dams have a significant impact on the flow of water on a landscape. Within WBM, dams are used to define the location of reservoirs. Within the model `.init` file, it can be seen that the `Reservoirs` variable is set to accept input from a variable `.init` file. **Open the dams variable `.init` file to take a look at it.**
@@ -373,18 +372,16 @@ The last of the glacier `.init` files is `./global_rgi6_glaciers_area_1km.init`.
 **Analysis Mask**  
 Conceptually, masking in GIS is a method used to identify locations which should be included in any analysis. Most geographic based tools work on the Minimum Bounding Rectangle (MBR) - or the smallest "box" of coordinates which can be theoretically "drawn" around any set of geographic data, as the default working extent. However, in the real-world irregular shapes often encountered. These irregular shapes may be a set of political boundaries or a collection of delineated watersheds. In either case, there are likely times when using the MBR is inconvenient. Most often this will often involve preforming the analysis on an area much larger than is needed, therefore taking up more time and computing resources. Less common is the case of the MBR for some input not filling the entire area of analysis, therefore posing and issue if the entire analysis area is not filled. The purpose of a mask is to override the MBR default to allow the user to define the area that best suits their needs.
 
-The Wyoming `.init` file includes has mask arguments set under the variable group `Runoff_mask`. When checking on the `maskFile` and `attFile` variables, these files are also missing. UNH does have the masking files available, but on a different FTP site that the one previously connected to. **Run the following code to create a new masks directory and the download the masking files into it.**
+The Wyoming `.init` file includes has mask arguments set under the variable group `Runoff_mask`. When checking on the `maskFile` and `attFile` variables, these files are also missing. UNH does have the masking files available, on the same HTTPS web site as before. **Run the following code to create a new masks directory and the download the masking files into it.**
 ```shell
 mkdir ./masks
 cd ./masks
 
-##Using wget to connect the the UNH Public FTP server and download the mask data
+##Using wget to connect the the UNH HTTPS server and download the mask data
 ##First is the mask ASCII file
-wget --user=ftp ftp://merrimack.sr.unh.edu/wbm_public/state_6min.ascii
-
+wget https://wbm.unh.edu/resources/state_6min.ascii
 ##Second is a supporting state text file
-wget --user=ftp ftp://merrimack.sr.unh.edu/wbm_public/state.txt
-
+wget https://wbm.unh.edu/resources/state.txt
 ##Return to the data directory
 cd ..
 ```
