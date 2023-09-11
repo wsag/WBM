@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl
 
 #######################################################################
 #
@@ -6,7 +6,7 @@
 #      intellectual property of the copyright holder.
 #      Any partial or complete reproduction, redistribution or modification
 #      without approval of the authors is strictly prohibited.
-#      (C) University of New Hampshire and Water Systems Analysis Group 2008-2017
+#      (C) University of New Hampshire and Water Systems Analysis Group 2008-2019
 #
 #######################################################################
 
@@ -21,19 +21,26 @@
 #	Written by Dr. A. Prusevich (alex.proussevitch@unh.edu)
 #
 #	October 2010
-#	Modified-	February 2011 (sigma caculations are added)
-#			April 2014	Changing data type to double for lon and lat
-#			May 2014	Added credits to output files, NetCDF v4 support
-#			December 2014	Added georeferencing to output NetCDF files; some bugs fixed
-#			October 2015	"decadal" destination time series is added
-#			July 2016	Adding "flip" in Processing (Magic Table)
-#			November 2016	Adding flag to alternative Magic Table file, and
-#					Aggregation range to NetCDF Global attributes
-#			December 2016	Scale and offset for the output data
-#			January 2017	Creating output files with data band > 1
-#			June 2017	Removing old NetCDF module
+#		History-
+#	Feb 2011	Sigma caculations are added
+#	Apr 2014	Changing data type to double for lon and lat
+#	May 2014	Added credits to output files, NetCDF v4 support
+#	Dec 2014	Added georeferencing to output NetCDF files; some bugs fixed
+#	Oct 2015	"decadal" destination time series is added
+#	Jul 2016	Adding "flip" in Processing (Magic Table)
+#	Nov 2016	Adding flag to alternative Magic Table file, and
+#			Aggregation range to NetCDF Global attributes
+#	Dec 2016	Scale and offset for the output data
+#	Jan 2017	Creating output files with data band > 1
+#	Jun 2017	Removing old NetCDF module
+#	Oct 2017	Making correct lon/lat vars/units based on projection type- NetCDF CF-1.6
+#	Jan 2019	Option to patch nodata in the input layers with a given value
+#	Feb 2019	Added use of "*.init" files for dataset IDs aling with Magic Table
+#	Apr 2021	Added option to output files in nc3 for classic (v.3) NetCDF format
+#	Aug 2021	Removed Proj4 module dependencies.
+#	Aug 2022	Transition to GDAL FFI interface.
 #
-#	Version- 17.6.0	(YY.M.#)
+#	Version- 23.4.0	(YY.M.#) - Small change if not listed above
 #
 #######################################################################
 
@@ -42,17 +49,19 @@ use Getopt::Long;
 use File::Basename;
 use File::Path;
 use FileHandle;
-use Geo::GDAL;
+use Geo::GDAL::FFI;
 use PDL;
 use PDL::Char;
 use PDL::IO::FlexRaw;
 use PDL::NetCDF;
 use Time::JulianDay;
 use Time::DaysInMonth;
+use warnings;
 use RIMS;		### WSAG UNH module
 
-use vars qw(*OLDERR);		# To avoid silly message-
-open OLDERR, ">&STDERR";	# "No UNIDATA NC_GLOBAL:Conventions attribute"
+use vars qw(*NEWERR *OLDERR);	# To avoid silly warning messages from GDAL, such as
+open NEWERR, ">/dev/null";	# "No UNIDATA NC_GLOBAL:Conventions attribute"
+open OLDERR, ">&STDERR";
 
 STDOUT->autoflush(1);		# Disable buffering
 my $credits = get_credits();	# Credits to output file metadata
@@ -60,11 +69,11 @@ my $credits = get_credits();	# Credits to output file metadata
 #######################################################################
 #############   Process and check command line inputs   ###############
 
-my ($help,$verbose,$remove,$rm_rec,$agg_type,$sclOffs,$trim,$push,$mdt,$type,$s_date,$e_date,$MT_file) =
-   (  0,     0,       0,      0,       0,      undef,    0,   0,   '',   '',    '',     ''  ,   ''   );
+my ($help,$verbose,$remove,$rm_rec,$agg_type,$sclOffs,$patch,$trim,$push,$dcCheck,$mdt,$type,$s_date,$e_date,$MT_file,$nc3) =
+   (  0,     0,       0,      0,       0,      undef,  'N/A',   0,   0,     0,     '',   '',    '',     ''  ,   '',    0  );
 # print "$sclOffs[0] $sclOffs[1] $agg_type\n";
 						# Get command line options
-usage() if !GetOptions('h'=>\$help, 'v'=>\$verbose, 'rm'=>\$remove, 'rr=i'=>\$rm_rec, 'a=i'=>\$agg_type, 'so=i{2}'=>\@$sclOffs, 'trim'=>\$trim, 'pd'=>\$push, 'mdt=s'=>\$mdt, 'ot=s'=>\$type, 'sd=s'=>\$s_date, 'ed=s'=>\$e_date, 'mt=s'=>\$MT_file) or $help;
+usage() if !GetOptions('h'=>\$help, 'v'=>\$verbose, 'rm'=>\$remove, 'rr=i'=>\$rm_rec, 'a=i'=>\$agg_type, 'so=i{2}'=>\@$sclOffs, 'trim'=>\$trim, 'pd'=>\$push, 'ndc'=>\$dcCheck, 'mdt=s'=>\$mdt, 'ot=s'=>\$type, 'sd=s'=>\$s_date, 'ed=s'=>\$e_date, 'mt=s'=>\$MT_file, 'p=f'=>\$patch, 'nc3'=>\$nc3) or $help;
 
 my $d_code  = shift() or usage();	# Source
 my $m_code  = shift() or usage();	# Destination
@@ -97,13 +106,8 @@ printf "\nThe job started on %04d-%02d-%02d at %02d:%02d:%02d.\n\n",
 			### Other Initializations
 
 my $names_file	= $MT_file ? $MT_file : get_file_path()->{names_file};
-my %names_d	= read_attrib($names_file,$d_code,'Code_Name');		# Source
-my %names_m	= read_attrib($names_file,$m_code,'Code_Name');		# Destination
-
-check_MT_date($names_d{Start_Date});
-check_MT_date($names_d{End_Date});
-check_MT_date($names_m{Start_Date});
-check_MT_date($names_m{End_Date});
+my %names_d	= attrib($d_code,$names_file);		# Source
+my %names_m	= attrib($m_code,$names_file);		# Destination
 
 	### Willmott-Matsuura test dates-
 # $names_d{Start_Date} = '1960-01-00';
@@ -132,15 +136,17 @@ my $search = make_search_par($names_d{Time_Series},$names_m{Time_Series});
 $agg_type  = 0 if $names_m{Time_Series} =~ m/_clim/;
 
 die "NetCDF Variable Name is not defined in the Magic Table. Aborting...\n"
-	unless $names_m{Var_Name};
+	unless $names_m{Var_Name};	unless ($dcCheck)  {
 die "Source and Destination datasets are not in the same DataCube. Aborting...\n"
-	unless $names_d{Data_Cube} eq $names_m{Data_Cube};
+	unless $names_d{Data_Cube} eq $names_m{Data_Cube}; }
 
-my @metadata = split m/:/,$mdt;
-$metadata[0] = $names_d{Param_Name}	unless defined $metadata[0];
-$metadata[1] = $names_d{Orig_Units}	unless defined $metadata[1];
-$metadata[2] = $names_d{Round}		unless defined $metadata[2];
-$metadata[3] = $agg_type[$agg_type];
+my @metadata =	split m/:/,$mdt;
+$metadata[0] =	$names_d{Param_Name}	unless defined $metadata[0];
+$metadata[1] =	$names_d{Orig_Units}	unless defined $metadata[1];
+$metadata[2] =	$names_d{Round}		unless defined $metadata[2];
+$metadata[3] =	$agg_type[$agg_type];
+$metadata[4] =	$names_d{Time_Series} =~ m/daily\{\d+\}/ ? 'hourly' :
+		$names_d{Time_Series} =~ m/([a-z]+)/ ? $1 : 'N/A';
 
 #######################################################################
 
@@ -160,13 +166,13 @@ trimDates($names_d{Start_Date},$names_d{End_Date})	# Trim dates
 	if $trim && $names_m{Time_Series}!~m/_clim/;
 
 my ($j_date_list,$date_list) = make_date_list($names_d{Start_Date},$names_d{End_Date},\%names_d);
-my $file_list = make_file_list($j_date_list,\%names_d,1e10,'0_0');
+my $file_list	= make_file_list($j_date_list,\%names_d,1e10,'0_0');
 
 		### Get data compression parameters
-(my $test_file = $$file_list[0][0]) =~ s/NETCDF:(.+):$names_d{Var_Name}/$1/;
+(my $test_file	= $$file_list[0][0]) =~ s/NETCDF:(.+):$names_d{Var_Name}/$1/;
 my ($netcdf_scale,$netcdf_offset,$netcdf_nodata) =
-	get_netcdf_compression($test_file,$names_d{Var_Name});
-my $compression = [$netcdf_scale,$netcdf_offset];
+	get_netcdf_compression($test_file,$names_d{Var_Name},$names_d{Processing});
+my $compression	= [$netcdf_scale,$netcdf_offset,$patch];
 
 #######################################################################
 #####     Build date and file lists for the destination dataset    ####
@@ -239,7 +245,7 @@ foreach my $file (@$file_List)
 			### Pad missing bands with Nodata
 	if ($band > 1) {
 	  my $nodata = $data*0 + $$info[2];
-	  write_nc($path,$$info[2],$lat,$lon,$nodata,$nodata,$type,$info,\%names_d,\%names_m,\@metadata,$credits,$gT);
+	  write_nc($path,$$info[2],$lat,$lon,$nodata,$nodata,$type,$info,\%names_d,\%names_m,\@metadata,$credits,$gT,$nc3);
 	  printf "\tFile- %s: written (%s)\n",basename($path),'Nodata, band=1' if $verbose;
 	  foreach my $b (2 .. $band-1) {
 	    update_nc($path,$names_m{Var_Name},$nodata,$nodata,$$info[2],$b);
@@ -251,7 +257,7 @@ foreach my $file (@$file_List)
 	}
 	else {
 # 	die "Not coded to create NetCDF file with BAND # gt 1..." if $band != 1;
-	  write_nc($path,$nc_Time[$count],$lat,$lon,$data,$sigma,$type,$info,\%names_d,\%names_m,\@metadata,$credits,$gT);
+	  write_nc($path,$nc_Time[$count],$lat,$lon,$data,$sigma,$type,$info,\%names_d,\%names_m,\@metadata,$credits,$gT,$nc3);
 	  printf "\tFile- %s: written (%s)\n",basename($path),$$date_List[$count] if $verbose;
 	}
       }
@@ -268,7 +274,7 @@ printf "\nTime used for the job - %d hours, %d minutes, and %d seconds\n\n",
 
 print "\nAll Done!\n\n" if $verbose;
 
-close OLDERR;
+close NEWERR; close OLDERR;
 exit;
 
 #######################################################################
@@ -348,7 +354,7 @@ sub aggregate
   else { die "Unknown aggregation method...\n"; }
 
   $agg_data->inplace->setbadtoval($$agg_info[2]);
-  $agg_sgma->copybad($agg_data);
+  $agg_sgma->copybad($agg_data)->setbadtoval($$agg_info[2]);
   $agg_sgma=$agg_sgma->convert($agg_data->type);
 
   return $agg_info,$agg_gT,$agg_data,$agg_sgma;
@@ -365,33 +371,24 @@ sub read_GDAL
   die "Requested file (in read_GDAL)-\n$file_s\ndoes not exist...\n" unless -e $file_s;
 
   open STDERR, ">/dev/null";
-    my $geotiff_data = Geo::GDAL::Open( $file, 'ReadOnly' );
+    my $geotiff_data = Geo::GDAL::FFI::Open( $file, {Flags => ['READONLY']} );
   open STDERR, ">&OLDERR";
 
   my $geoTransform = $geotiff_data->GetGeoTransform;
-  my $band         = $geotiff_data->GetRasterBand($b);
+  my $band         = $geotiff_data->GetBand($b);
+  die "Failed to get geoTransform. Uneven grid is likely the problem. Aborting...\n"
+	if join('', @$geoTransform) eq '010001';
 
-  my $x_size	= $band->{XSize};
-  my $y_size	= $band->{YSize};
-  my $bin_data  = $band->ReadRaster(0, 0, $x_size, $y_size);
+  my($x_size, $y_size) = $band->GetSize;
+  my $pdl	= $band->GetPiddle;		# Note, GetPiddle(...) can do resample too
   my $nodata	= $band->GetNoDataValue;
      $nodata	= $netcdf_nodata unless defined $nodata;
 
-		### Data types needed for PDL
-  my @data_type = (undef,'byte','ushort','short',undef,'long','float','double',
-	'short','long','float','double');
-  die sprintf("%s (%d) is not defined...\n",
-    Geo::GDAL::GetDataTypeName($band->{DataType}),$band->{DataType})
-	unless defined $data_type[$band->{DataType}];
-
-  open(my $FH,"<",\$bin_data) or die "Couldn't open filehabdle to binary data stream, $!";
-  my $pdl = readflex($FH,
-	[{Dims=>[$x_size,$y_size], Type=>$data_type[$band->{DataType}]}]);
-  close $FH;
 		### Uncompress data and nodata
      $nodata	= $nodata*$$compr[0]+$$compr[1];
      $pdl	= $pdl*$$compr[0]+$$compr[1];
      $pdl	= $pdl->setbadif(abs($pdl-$nodata) < 1e-12);
+     $pdl	= $pdl->setbadtoval($$compr[2]) if $$compr[2] ne 'N/A';
 
   return [$x_size,$y_size,$nodata],$geoTransform,$pdl;
 }
@@ -415,7 +412,7 @@ sub make_Lon_Lat
 sub write_nc
 
 {
-  my ($file,$time,$lat,$lon,$data,$sigma,$type,$info,$names_d,$names_m,$metadata,$credits,$gT,$aggRange) = @_;
+  my ($file,$time,$lat,$lon,$data,$sigma,$type,$info,$names_d,$names_m,$metadata,$credits,$gT,$nc3) = @_;
 
 			### Check credits
   $credits = [(getpwuid($<))[0,6],'email unknown','unknown'] unless $credits;
@@ -434,6 +431,9 @@ sub write_nc
   my $var_name	= $$names_m{Var_Name};
   my $sig_name	= $var_name.'_sigma';
   my $fill_val	= eval(sprintf("%s([%s])",$data->type,$$info[2]));
+  my $proj_crs	= crs_to_Obj($$names_m{Projection});
+  my $wkt	= $proj_crs->Export('Wkt');		### Convert to Wkt fromat
+  my($xVr,$yVr)	= Geo::GDAL::FFI::OSRIsGeographic($$proj_crs) ? qw(lon lat) : qw(x y);
 
 			###  Create NetCDF attributes
   my %var_att	= (
@@ -442,7 +442,8 @@ sub write_nc
 	'units'		=> $$metadata[1],
 	'format'	=> $$metadata[2],
 	'aggregation'	=> $$metadata[3],
-	'grid_mapping'	=> 'src'
+	'source_TS'	=> $$metadata[4],
+	'grid_mapping'	=> 'crs'
   );
 
   my %sig_att	= (
@@ -450,11 +451,13 @@ sub write_nc
 	'long_name'	=> "Sigma of $$metadata[0]",
 	'units'		=> $$metadata[1],
 	'format'	=> $$metadata[2],
-	'grid_mapping'	=> 'src'
+	'source_TS'	=> $$metadata[4],
+	'grid_mapping'	=> 'crs'
   );
-  my %src_att	= (
+  my %crs_att	= (
 	'srs_ref'	=> $$names_m{Projection},
-	'spatial_ref'	=> srs_to_Wkt($$names_m{Projection}),
+	'srs_wkt'	=> $wkt,		### Attribute name convention used by CF
+	'spatial_ref'	=> $wkt,		### Attribute name convention used by GDAL
 	'GeoTransform'	=> join(' ',@$gT)
   );
 
@@ -465,76 +468,62 @@ sub write_nc
 	'calendar'	=> $calendar_str{$calendar}
   );
 
-  my %lon_att	= (
-	'units'		=> 'degrees_east',
-	'long_name'	=> 'longitude'
-  );
+  my %lon_att	= Geo::GDAL::FFI::OSRIsGeographic($$proj_crs) ? (
+	'units'		=> 'degrees_east',	'long_name'	=> 'longitude',	'standard_name' => 'longitude') : (
+	'units'		=> 'meters',		'long_name'	=> 'x coordinate of projection',
+	'standard_name' => 'projection_x_coordinate' );
 
-  my %lat_att	= (
-	'units'		=> 'degrees_north',
-	'long_name'	=> 'latitude'
-  );
+  my %lat_att	= Geo::GDAL::FFI::OSRIsGeographic($$proj_crs) ? (
+	'units'		=> 'degrees_north',	'long_name'	=> 'latitude',	'standard_name' => 'latitude' ) : (
+	'units'		=> 'meters',		'long_name'	=> 'y coordinate of projection',
+	'standard_name' => 'projection_y_coordinate' );
 
   my %global_att= (
-	'Conventions'	=> 'CF-1.0',
+	'Conventions'	=> 'CF-1.6',
 	'title'		=> 'Temporal aggregation of data',
 	'history'	=> 'Created on '.date_now()." by $$credits[1] ($$credits[2])",
 	'projection'	=>  $$names_m{Projection},
 	'Temporal_Res.'	=>  $$names_m{Time_Series},
-	'NetCDF_version'=> 'netCDF.3.5.1',
+	'NetCDF_driver'	=> 'NetCDF.' . $PDL::NetCDF::VERSION,
 	'source'	=> 'Unreferenced Data',
 	'institution'	=>  $$credits[3],
-	'references'	=> 'http://www.wsag.unh.edu',
+	'references'	=> 'https://www.wsag.unh.edu',
 	'FilePath'	=>  $file,
+	'System'	=>  get_file_path()->{SYSTEM},
 		$$names_m{Time_Series} =~ m/_clim/  ? (
 	'AggrRangeStart'=> $$names_d{Start_Date},
 	'AggrRangeEnd'	=> $$names_d{End_Date}) : ()
   );
 
 			###  NetCDF File definitions
-  my $nc = new PDL::NetCDF($file, {MODE => O_CREAT, REVERSE_DIMS => 1, NC_FORMAT => PDL::NetCDF::NC_FORMAT_NETCDF4});
+  my $nc = new PDL::NetCDF($file, {MODE => O_CREAT, REVERSE_DIMS => 1,
+	NC_FORMAT => !$nc3 ? PDL::NetCDF::NC_FORMAT_NETCDF4 : PDL::NetCDF::NC_FORMAT_CLASSIC});
+  my $slice_opt = {_FillValue => $fill_val};
+    $$slice_opt{SHUFFLE} = 0 if !$nc3;
+    $$slice_opt{DEFLATE} = 1 if !$nc3;
 
 			###  Write Dimensions
   $nc->putslice('time',['time'],[PDL::NetCDF::NC_UNLIMITED()],[0],[1],long($time));
-  $nc->putslice('lat', ['lat'], [$$info[1]], [0], [$$info[1]], double($lat));
-  $nc->putslice('lon', ['lon'], [$$info[0]], [0], [$$info[0]], double($lon));
-  $nc->putslice('src', [],      [0],         [0], [1],         PDL::Char->new(''));
+  $nc->putslice( $yVr, [$yVr],  [$$info[1]], [0], [$$info[1]], double($lat));
+  $nc->putslice( $xVr, [$xVr],  [$$info[0]], [0], [$$info[0]], double($lon));
+  $nc->putslice('crs', [],      [],          [0], [1],         PDL::Char->new(''));
 
 			###  Write Data
-  $nc->putslice($var_name,['lon','lat','time'],[$$info[0],$$info[1],PDL::NetCDF::NC_UNLIMITED()],
-	[0,0,0], [$data->dims,1], ($type ? $data->$type : $data)->slice(':,-1:0'),
-		{SHUFFLE => 0, DEFLATE => 1, _FillValue => $fill_val});
-  $nc->putslice($sig_name,['lon','lat','time'],[$$info[0],$$info[1],PDL::NetCDF::NC_UNLIMITED()],
-	[0,0,0], [$data->dims,1], ($type ? $sigma->$type : $sigma)->slice(':,-1:0'),
-		{SHUFFLE => 0, DEFLATE => 1, _FillValue => $fill_val});
+  $nc->putslice($var_name,[$xVr,$yVr,'time'],[$$info[0],$$info[1],PDL::NetCDF::NC_UNLIMITED()],
+	[0,0,0], [$data->dims,1], ($type ? $data->$type : $data)->slice(':,-1:0'), $slice_opt);
+  $nc->putslice($sig_name,[$xVr,$yVr,'time'],[$$info[0],$$info[1],PDL::NetCDF::NC_UNLIMITED()],
+	[0,0,0], [$data->dims,1], ($type ? $sigma->$type: $sigma)->slice(':,-1:0'),$slice_opt);
 
 			###  Write Attributes
   foreach my $key (keys %global_att) { $nc->putatt ($global_att{$key}, $key); }
-  foreach my $key (keys %time_att)   { $nc->putatt ($time_att{$key},   $key, 'time');}
-  foreach my $key (keys %lat_att)    { $nc->putatt ($lat_att{$key},    $key, 'lat'); }
-  foreach my $key (keys %lon_att)    { $nc->putatt ($lon_att{$key},    $key, 'lon'); }
+  foreach my $key (keys %time_att)   { $nc->putatt ($time_att{$key},   $key, 'time'); }
+  foreach my $key (keys %lat_att)    { $nc->putatt ($lat_att{$key},    $key, $yVr); }
+  foreach my $key (keys %lon_att)    { $nc->putatt ($lon_att{$key},    $key, $xVr); }
   foreach my $key (keys %var_att)    { $nc->putatt ($var_att{$key},    $key, $var_name); }
   foreach my $key (keys %sig_att)    { $nc->putatt ($sig_att{$key},    $key, $sig_name); }
-  foreach my $key (keys %src_att)    { $nc->putatt ($src_att{$key},    $key, 'src'); }
+  foreach my $key (keys %crs_att)    { $nc->putatt ($crs_att{$key},    $key, 'crs'); }
 
   $nc->close();
-}
-
-sub srs_to_Wkt
-{
-  my     $epsg = shift;
-  return $epsg if $epsg =~ m/^GEOGCS/i;	### Wkt fromat: No need to convert
-
-  my $epsgID	= $epsg =~ m/epsg:(\d+)/i ? $1 : 4326;
-  my $srs	= new Geo::OSR::SpatialReference(EPSG=>$epsgID);
-
-  if    ($epsg =~ s/epsg:(\d+)/$1/i) {	### Import EPSG  fromat
-     $srs->ImportFromEPSG($epsg); }
-  elsif ($epsg =~ m/proj=/i) {		### Import Proj4 fromat
-     $srs->ImportFromProj4($epsg); }
-  else { die "Unknown projection format <$epsg>...\n"; }
-
-  return $srs->ExportToWkt;		### Convert to Wkt fromat
 }
 
 #######################################################################
@@ -632,6 +621,64 @@ sub pushDates
 
 #######################################################################
 
+sub attrib
+{
+  my($id, $MT)	=  @_;
+
+		### Read MT attributes
+  my $file_flag	= $id=~m/\.init$/i  || -e $id;
+  my %attrib	= $file_flag ? read_init($id) : read_attrib($MT,$id,'Code_Name');
+		### Read dates from file, if needed
+  check_MT_date($attrib{Start_Date});
+  check_MT_date($attrib{End_Date});
+		### Fill up blanks
+  $attrib{Var_Scale}  = 1 unless $attrib{Var_Scale};
+  $attrib{Var_Offset} = 0 unless $attrib{Var_Offset};
+		### Other cleanups
+  $attrib{Processing} =~ s/\s//g;		# Remove blank spaces in processing
+
+  get_calendar(   \%attrib);			# Find the dataset calendar format
+
+  return %attrib;
+}
+
+#######################################################################
+
+sub read_init
+	### Read IO options from a separate file
+{
+  my ($file, $options) = @_;
+  die "Init file does not exist:\n   $file\n" unless -e $file;
+  			### Options
+  my $check	= set_default( $$options{CHECK_ARR},	undef);
+  my $make	= set_default( $$options{MAKE_ARR},	undef);
+
+  #####################################################################
+  ############    Read parameter = value pairs   ######################
+
+  my $str =  htm_template($file);
+     $str =~ s/=>\s*,/=> '',/g;		# Fix some erroneous hash values
+  my $att =  eval $str;
+  die "Error in read_init 'eval': $@\nFile = $file\n" if $@;
+  my %attrib = %{ $att };
+
+  #####################################################################
+  ############    Read additional parameters. Options.   ##############
+
+	### Check required parameters-
+  if ($check) {
+    map { die("Parameter \"$_\" is required in File:\n   $file\n") unless $attrib{$_} } @$check;
+  }
+	### Make optional parameters-
+  if ($make) {
+    map { $attrib{$_} = '' unless defined $attrib{$_} } @$make;
+  }
+
+  return %attrib;
+}
+
+#######################################################################
+
 sub time_used
 
 {
@@ -654,9 +701,9 @@ sub usage
   print <<EOF;
 
 Usage:
-	$app_name [-h] [-v] [-ot TYPE] [-a AGG_TYPE] [-so SCALE OFFSET] [-rm] [-rr NUMBER] [-trim] [-pd] [-mdt NAME:UNITS:FORMAT] [-sd START_DATE] [-ed END_DATE] [-mt MT_FILE] SRC_DATA_CODE DST_DATA_CODE
+	$app_name [-h] [-v] [-ot TYPE] [-a AGG_TYPE] [-so SCALE OFFSET] [-rm] [-nc3] [-rr NUMBER] [-p PATCH] [-trim] [-pd] [-mdt NAME:UNITS:FORMAT] [-sd YYYY-MM-DD] [-ed YYYY-MM-DD] [-mt MT_FILE] SRC_DATA_CODE DST_DATA_CODE
 
-This code makes new or updates existing temporal aggregation of the Magic Table SRC_DATA_CODE data to DST_DATA_CODE data. DST_DATA_CODE files can be only in NetCDF format.
+This code makes new or updates existing temporal aggregation of the MagicTable/*.init SRC_DATA_CODE dataset to DST_DATA_CODE dataset. DST_DATA_CODE files can be only in NetCDF format.
 
 Options:
 
@@ -664,17 +711,20 @@ h	Display this help.
 v	Verbose mode.
 rm	Remove and do not update existing DST_DATA_CODE files.
 rr	Remove end NUMBER of records before updating DST_DATA_CODE files.
-sd	Start date for the aggregation.
-ed	End   date for the aggregation.
+sd	Start date (YYYY-MM-DD) for the aggregation.
+ed	End   date (YYYY-MM-DD) for the aggregation.
 ot	Output data type (byte, short, long, float, double). Default is float.
 a	Aggregation type. TYPE is 0 for average (default), 1 for cumulative,
 	  2 for category. Note- option 2 is not done yet.
 so	Scale and offset the output data. Consider changing units with -mtd flag:
 	  -mtd ":NEW_UNITS:"
+p	Patch input datasets nodata with value PATCH.
 trim	Discard incomplete start/end records in monthly/yearly aggregations.
 pd	Push/overwrite destination dates to maximize aggregation range.
 mdt	Metadata to overwrite Magic Table values for NAME, UNITS, and FORMAT.
 mt	File path to an alternative Magic Table file.
+ndc	Do not check DataCube field in the Magic Table.
+nc3	Output files in classic (v.3) NetCDF format.
 
 EOF
   exit;
@@ -688,11 +738,13 @@ sub get_credits
 	'institution'	=> 'Water Systems Analysis Group (WSAG), the University of New Hampshire (UNH)',
 
 	'alexp'		=> 'alex.proussevitch@unh.edu',
-	'stanley'	=> 'Stanley.Glidden@unh.edu',
-	'dwisser'	=> 'dwisser@uni-bonn.de',
-	'sasha'		=> 'alex.shiklomanov@unh.edu',
 	'dgrogan'	=> 'Danielle.Grogan@unh.edu',
-	'lammers'	=> 'Richard.Lammers@unh.edu');
+	'dwisser'	=> 'dwisser@uni-bonn.de',
+	'lammers'	=> 'Richard.Lammers@unh.edu',
+	'sasha'		=> 'alex.shiklomanov@unh.edu',
+	'shan'		=> 'Shan.Zuidema@unh.edu',
+	'stanley'	=> 'Stanley.Glidden@unh.edu'
+	);
 
   my ($user,$name) =  (getpwuid($<))[0,6];
             $name  =~ s/,.*//;

@@ -91,9 +91,9 @@
 
 	rectangle	=> {	lonMin	=> -80.05,	lonMax => -78.45,	# Coordinates must be in the projection
 				latMin	=>  44.838,	latMax =>  45.782,	# of "Net_file" above
-				inscribe=>  {	# Optional- Flag:  0- suprescribe. This is default.
-						#	    Flag:  1- inscribe with full basins (watersheds)
-						#	    Block: {}-inscribe with full basins and upstream sub-basins
+				inscribe=>  0,	# Optional- Flag:  0- superscribe; 1- inscribe. Default is 0.
+				inscribe=>  {	# Alternative special case (not common) to inscribe with full basins and 
+						#	upstream sub-basins with the following criteria:
 				   spillOver	=> 0,		# Optional- Area frac. of sub basins allowed to be outside
 								#	Default is 0 (no spill over). Recommended 0.1
 				   continuous	=> 0,		# Optional- Flag for continuous Network. Default is 0
@@ -103,7 +103,7 @@
 				}
 			   },
 
-	polygon		=> {	file	=> '/net/nfs/ipswich/raid/atlas/data/masks/country_6min.ascii',
+	polygon		=> {	file	=> '/net/nfs/ipswich/raid/atlas/data/masks/country_6min.shp',
 				shp_var	=> '',			# Required for shape file above
 				polIDs	=> [233],		# Required- List of IDs of polygons or masks
 				proj	=> 'epsg:4326',		# Optional- File projection. Default is "epsg:4326"

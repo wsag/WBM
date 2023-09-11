@@ -25,7 +25,7 @@
 #	Apr 2022	Added qgis style file for the flow direction shape file group
 #	Aug 2022	Transition to GDAL FFI interface.
 #
-#	Version:	22.8.0
+#	Version:	23.8.0
 #
 #######################################################################
 
@@ -49,8 +49,6 @@ use Storable qw/dclone/;
 use warnings;
 use RIMS;		### WSAG UNH module set
 use RIMS::WBM;
-
-#$PDL::BIGPDL = 1 if !$PDL::BIGPDL;	# Use BIGPDL if the network is really big (over 1GB)
 
 STDOUT->autoflush(1);				# Disable buffering
 
@@ -696,7 +694,8 @@ if ($runIO{copy_attrib}) {
     if($area   >= $runIO{copy_attrib}{min_check_area}) {
 		### Check overlap area
       my $b_ID	= $basin_ID->indexND($idx)->mode;
-     ($id,$name)= ($b_ID, $basinAttr{$b_ID}{Name}=~ m/GHAAS/ ? 'N/A' : $basinAttr{$b_ID}{Name})
+     ($id,$name)= ($b_ID, defined $basinAttr{$b_ID}{Name}  ? ($basinAttr{$b_ID}{Name}=~ m/GHAAS/ ?
+			  'N/A' : $basinAttr{$b_ID}{Name}) : 'N/A')
 	if (1 - abs($cell_area->where($basin_ID == $b_ID)->sum - $area)/$area >= $runIO{copy_attrib}{min_overlap});
     }		### Put together this basin attributes
     push @attrib, [ map(defined($_)?$_:'N/A', $ID, $name, sprintf('%.2f',$area), $id,  $seaID, $seaAttr{$seaID}{SeaName},
@@ -1153,7 +1152,7 @@ sub inscribe_upstream
   my $bnd_idx	= whichND($msk_bnd > 0);	# Must make $bnd_idx otherwhise it will cause whichND list warning
   my @msk_bnd	= unpdl_data( $bnd_idx );
   foreach my $rec (@msk_bnd) {
-    if ($mask(@$rec) == 0) {
+    if ($mask(@$rec) == 0 && $network(@$rec)->isgood) {
       my @colRow_to  = ($$rec[0]+$direction[0][$log2{$network->at(@$rec)}],
 			$$rec[1]+$direction[1][$log2{$network->at(@$rec)}]);
 		### Check upsteam section, if flow at the boundary goes outside of the polygon
@@ -1314,12 +1313,19 @@ sub trim
 		### Trim
     if ($trm) {
       foreach my $i (0..3) { $trim[$i]++ while ($check[$i]->($trim[$i])->isbad) }
-      $$ext{ncols}    -= $trim[2]+$trim[3];
-      $$ext{nrows}    -= $trim[0]+$trim[1];
-      $$ext{xllcorner}+= $trim[2]*$$ext{cellsize};
-      $$ext{yllcorner}+= $trim[1]*$$ext{cellsize};
-
-      $net	= $net($trim[2]:-$trim[3]-1,$trim[0]:-$trim[1]-1);
+      $net			 = $net($trim[2]:-$trim[3]-1,$trim[0]:-$trim[1]-1);
+      $$ext{mask}		 = $net;
+      $$ext{file}		 = '';
+      $$ext{file_s}		 = '';
+      $$ext{ncols}		-= $trim[2]+$trim[3];
+      $$ext{nrows}		-= $trim[0]+$trim[1];
+      $$ext{xllcorner}		+= $trim[2]*$$ext{cellsizeX};
+      $$ext{yllcorner}		+= $trim[1]*$$ext{cellsizeY};
+      $$ext{xurcorner}		 = $$ext{xllcorner} + $$ext{ncols}*$$ext{cellsizeX};
+      $$ext{yurcorner}		 = $$ext{yllcorner} - $$ext{nrows}*$$ext{cellsizeY};
+      $$ext{gTransform}[0]	 = $$ext{xllcorner};
+      $$ext{gTransform}[3]	 = $$ext{yurcorner};
+      $$ext{igTransform}	 = InvGeoTransform($$ext{gTransform});
     }
   }
 
