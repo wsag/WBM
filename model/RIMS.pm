@@ -5,7 +5,7 @@
 #      intellectual property of the copyright holder.
 #      Any partial or complete reproduction, redistribution or modification
 #      without approval of the authors is strictly prohibited.
-#      C University of New Hampshire and Water Systems Analysis Group 2008-2021
+#      C University of New Hampshire and Water Systems Analysis Group 2008-2023
 #
 #######################################################################
 #######################################################################
@@ -23,12 +23,15 @@
 #	Apr 2021	Added few calendar functions
 #	Jul 2021	Added write_csv prepare_dir functions
 #	Aug 2021	Proj4 dependency is removed. Math::VecStat is replaced with List::Util (faster)
+#	Apr 2022	Updated make_date_list function for multi-day time series
+#	Jun 2022	Switching from GDAL swig to FFI interface. Added band mapping for dates from file
+#	Jun 2023	Added check_ascii_file function
 #
 #	NB 1 - Only significant modifications are indicated in the revision/version history above.
 #	NB 2 - Old significant versions are saved in "old_versions/" folder off development path.
 #
 #	Version-	(YY.M.#)	# Number is zero-based
-#			'21.11.0';	# Version. Note- update version variable below
+my $version =		'23.8.0';	# Version. Note- update version variable below
 #
 #######################################################################
 
@@ -37,19 +40,23 @@ package RIMS;
 use v5.8.8;
 use warnings;
 
+use Cwd qw/abs_path/;
 use CGI qw/header param/;
+use Fcntl;
 use File::Basename;
 use File::Path;
+use Geo::GDAL::FFI;
 use List::Util;
 use Time::JulianDay;
+use Time::DaysInMonth;
 use POSIX qw/log10 floor ceil/;
-use Geo::GDAL;
+use Storable qw/dclone/;
 use Sys::Hostname;
 
 require Exporter;
 
+our $VERSION	= $version;
 our @ISA	= qw(Exporter);
-our $VERSION	= '21.8.0';
 
 # Items to export into callers namespace by default. Note: do not export
 # names by default without a very good reason. Use EXPORT_OK instead.
@@ -66,7 +73,7 @@ band_mapping rm_duplicate_options split_date get_calendar calendar360_day calend
 calendar365_DaysInMonth calendar360_DaysInMonth calendar365_is_leap calendar360_is_leap
 make_date_list make_file_list make_date_layers jday_hour_min trim_dates chk_date_list band_count
 check_MT_date STD_date check_file_type check_sigma polygon_files dumperror set_default write_csv
-prepare_dir crs_to_Obj transform_point transform_points
+prepare_dir crs_to_Obj transform_point transform_points check_ascii_file
 ) ] );
 
 our @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
@@ -75,17 +82,20 @@ our @EXPORT    = ( @{ $EXPORT_TAGS{'all'} } );
 #######################################################################
 ######################  Utilities  ####################################
 
-my $conf_file	= '/etc/RIMS.conf';
+my $conf_file	= abs_path(dirname($0)).'/RIMS.conf';		# Try conf file in the user directory
+   $conf_file	= '/etc/RIMS.conf' unless -e $conf_file;	# Default conf
 my $path	= get_file_path();
 
 use vars qw(*OLDERR);		### A switch to control STDERR output
 open OLDERR, ">&STDERR";	*OLDERR if 0; # Prevent spurious warning
 
+no if $] >= 5.017011, warnings => 'experimental::smartmatch';
+
 ######################  Functions  ####################################
 
 sub get_file_path
 {
-  my  $file = $conf_file;
+  my $file = $conf_file;
 
   my $hash = eval htm_template($file);
   die "Error in RIMS get_file_path 'eval':\nFile = $file\n   $@" if $@;
@@ -187,14 +197,29 @@ sub read_attrib         ### Read ascii table (Attributes)
 sub read_table                  ### Read ascii table (Attributes)
 
 {
-  my $file = shift;		# Skip some number of lines from the file
-  my $skip = shift || 0;	# If $skip is negative: read table without header
-  my $sep  = shift;		# Separator, e.g. '\s+'
-  my(@data, %field, $records);
+  my $file	= shift;	# Skip some number of lines from the file
+  my $options	= shift || 0;	# Options or $skip (backward compartibility)
+  my $sep	= shift;	# Separator, e.g. '\s+'
+  my $asc	= shift;	# Check file for non-ASCII characters
+  my(@data, %field, $records, $skip);
+
+		### Get Options (Added on Jun 6, 2023
+  if (ref($options)) {
+    $skip  = set_default($$options{SKIP},	0    );	# If $skip is negative: read table without header
+    $sep   = set_default($$options{SEPARATOR},	undef);	# Separator, e.g. '\s+'
+    $asc   = set_default($$options{CHECK_ASCII},1    );	# Check file for non-ASCII characters
+  } else {
+    $skip  = $options;
+  }
+		### Check non-ASCII characters in the file (Added on Jun 6, 2023
+  check_ascii_file($file) if $asc;
 
   open (FILE,"<$file") or die "Couldn't open $file, $!";
     my @lines	= <FILE>;
   close FILE;
+  while ($#lines>=0 && $lines[-1] !~ m/\S/) { pop @lines };	# Remove bottom empty lines
+  return(\%field,@data) if $#lines < 0;				# Case of empty file
+  
 		### Skip top lines, if requested
   if ($skip > 0) {
     while ($skip > 0) { shift @lines; $skip--; }
@@ -520,7 +545,9 @@ sub draw_graph
     my @used;
     for (my $i=0; $i<=$x_m_ticks; $i++)				# Draw major X-labels
     {
+  open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
       my $label = sprintf("%04d-%02d-%02d", &$inverse_julian_day(sprintf("%.0f",$x_scale[0]+$x_range/$x_m_ticks*$i)));
+  open STDERR, ">&OLDERR";
       next unless $label =~ s/(.+)-01$/$1/;
       $label =~ s/\d{4}/0000/ if $time=~m/clim/;
 
@@ -536,7 +563,9 @@ sub draw_graph
     D_LOOP:
     for (my $i=0; $i<=$x_m_ticks; $i++)				# Draw X-labels
     {
+  open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
       my @date = &$inverse_julian_day(sprintf("%.0f",$x_scale[0]+$x_range/$x_m_ticks*$i));
+  open STDERR, ">&OLDERR";
       my $label = sprintf("%04d-%02d-%02d",@date);
       $label =~ s/\d{4}/0000/ if $time=~m/clim/;
       if (scalar(@used))
@@ -563,10 +592,12 @@ sub draw_graph
   }
   elsif (($data_x[-1]-$data_x[0]) < 732)
   {
+  open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
     my @end_date = &$inverse_julian_day($data_x[-1]);
     @x_scale = (
 	&$julian_day((&$inverse_julian_day($data_x[0]))[0,1],1),
 	&$julian_day($end_date[0],$end_date[1]+1,1));
+  open STDERR, ">&OLDERR";
     $x_range = $x_scale[1] - $x_scale[0];
     $x_ticks = sprintf("%.0f",$x_range/30)+0;
     $x_m_ticks = 4;
@@ -574,8 +605,10 @@ sub draw_graph
     my @used;
     for (my $i=0; $i<=$x_ticks; $i++)				# Draw X-labels
     {								# and grid for Years
+  open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
       my $label = sprintf("%04d-%02d",(&$inverse_julian_day(
 	sprintf("%.0f",$x_scale[0]+$x_range/$x_ticks*$i)+10))[0,1]);
+  open STDERR, ">&OLDERR";
       next unless $label =~ s/(.+)-01/$1/;
       $label =~ s/\d{4}/0000/ if $time=~m/clim/;
 
@@ -588,7 +621,9 @@ sub draw_graph
     M_LOOP:
     for (my $i=0; $i<=$x_ticks; $i++)				# Draw X-labels
     {								# and grid for Months
+  open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
       my @date = &$inverse_julian_day(sprintf("%.0f",$x_scale[0]+$x_range/$x_ticks*$i)+10);
+  open STDERR, ">&OLDERR";
       my $label = (scalar(@used)) ? sprintf("%02d",$date[1]) :
 	sprintf("%04d-%02d",@date[0,1]);
       $label =~ s/\d{4}/0000/ if $time=~m/clim/;
@@ -609,9 +644,11 @@ sub draw_graph
   }
   else
   {
+  open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
     @x_scale = (
 	&$julian_day((&$inverse_julian_day($data_x[0]))[0],1,1),
 	&$julian_day((&$inverse_julian_day($data_x[-1]))[0]+1,1,1));
+  open STDERR, ">&OLDERR";
     $x_range = $x_scale[1] - $x_scale[0];
     $x_ticks = sprintf("%.0f",$x_range/365)+0;
     $x_m_ticks = ($x_ticks<10)?6:(($x_ticks<20)?3:1);
@@ -619,8 +656,10 @@ sub draw_graph
     my $x_posF = 0;
     for (my $i=0; $i<=$x_ticks; $i++)				# Draw X-labels
     {								# and grid
+  open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
       my $label = (&$inverse_julian_day(
 	sprintf("%.0f",$x_scale[0]+$x_range/$x_ticks*$i)+10))[0];
+  open STDERR, ">&OLDERR";
 
       my $x_pos = $x0+$dx/$x_ticks*$i;
       my $x_posS = $x_pos-3*length($label);
@@ -977,24 +1016,17 @@ sub shp_file_list
 }
 
 #######################################################################
-###########	Geo::OSR functions	###############################
-#
-# Some useful snippets for Geo::OSR - 
-# https://git.earthdata.nasa.gov/projects/GEE/repos/gdal-enhancements-for-esdis/browse/gdal-2.0.0/swig/perl/lib/Geo/OSR.dox
-# https://git.earthdata.nasa.gov/projects/GEE/repos/gdal-enhancements-for-esdis/browse/gdal-2.0.0/swig/perl/t/osr.t
-# and few others (?) in .../perl/ directory
-#
-#######################################################################
+###########	Geo::GDAL::FFI functions	#######################
 
 sub crs_to_Obj
 {
   my $proj	= shift;
-  my $obj	= new Geo::OSR::SpatialReference(
+  my $obj	= new Geo::GDAL::FFI::SpatialReference(
 	$proj	=~ m/epsg:(\d+)/i ? (EPSG  => $1)    :
 	$proj	=~ m/proj=/i      ? (Proj4 => $proj) :
-	$proj	=~ m/GEOGCS/      ? (WKT   => $proj) :
+	$proj	=~ m/GEOGCS/      ?           $proj  :	# WKT
 	die "Unknown projection format <$proj>...\n");	# Can add more formats listed in OSR.pm
-  $obj->SetAxisMappingStrategy($Geo::OSR::OAMS_TRADITIONAL_GIS_ORDER) if $Geo::GDAL::VERSION >= 3;
+  Geo::GDAL::FFI::OSRSetAxisMappingStrategy($$obj,0) if !defined($ENV{GDAL_VERSION_NUM}) or $ENV{GDAL_VERSION_NUM} >= 3;
 
   return $obj;
 }
@@ -1002,37 +1034,65 @@ sub crs_to_Obj
 #######################################################################
 
 sub transform_point				# Returns array or array ref
-{ return Geo::OSR::CoordinateTransformation->new(crs_to_Obj($_[0]),crs_to_Obj($_[1]))->TransformPoint(@_[2,3]); }
+{
+  my($x,$y) =	map \$_, @{dclone([@_[2,3]])};
+  my $obj   =	Geo::GDAL::FFI::OCTNewCoordinateTransformation(${crs_to_Obj($_[0])}, ${crs_to_Obj($_[1])});
+  my $out   = 	Geo::GDAL::FFI::OCTTransform($obj, 1, $x, $y);
+		Geo::GDAL::FFI::OCTDestroyCoordinateTransformation($obj);
+
+  return wantarray ? ($$x, $$y) : [$$x, $$y];
+}
 
 sub transform_points
 {
-  my ($proj_from, $proj_to, $points) = @_;
-  my  $Points = [map([map($_,@$_)],@$points)];	# Clone array of points to be transformed in-place
-  
-  Geo::OSR::CoordinateTransformation->new(crs_to_Obj($proj_from),crs_to_Obj($proj_to))->TransformPoints($Points);
+  my($proj_from, $proj_to, $points) = @_;
+  my $Points =	dclone( $points );
+  my $obj    =	Geo::GDAL::FFI::OCTNewCoordinateTransformation(${crs_to_Obj($proj_from)}, ${crs_to_Obj($proj_to)});
+  map		Geo::GDAL::FFI::OCTTransform($obj, 1, \$$_[0], \$$_[1]), @$Points;
+		Geo::GDAL::FFI::OCTDestroyCoordinateTransformation($obj);
   return wantarray ? @$Points : $Points;	# Returns array or array ref
 }
 
-###########	End of Geo::OSR functions	#######################
+###########	End of Geo::GDAL::FFI functions		###############
 #######################################################################
 
 sub get_netcdf_compression
-
 {
-  my ($file,$var_name) = @_;
-  my ($scale,$offset,$nodata) = (1,0,-9999);
-  return ($scale,$offset,$nodata) unless $file =~ m/\.nc$/i && $var_name && -e $file;
+  my ($file,$var_name,$processing) = @_;
+  my ($scale,$offset,$nodata) = (1,0,undef);
+  return ($scale,$offset,$nodata) unless $file =~ m/\.nc$/i && $var_name;
 
-  open STDERR, ">/dev/null";
-    my $dataset = Geo::GDAL::Open("NETCDF:$file:$var_name", 'ReadOnly');
-  open STDERR, ">&OLDERR";
-
-  my $meta = $dataset->GetMetadata;
-  foreach my $key (keys %$meta) {
-    $scale  = $$meta{$key} if $key =~ m/$var_name#scale_factor/;
-    $offset = $$meta{$key} if $key =~ m/$var_name#add_offset/;
-    $nodata = $$meta{$key} if $key =~ m/$var_name#(_FillValue|missing_value)/;
+  my $ncobj	= PDL::NetCDF->new ($file, {MODE => O_RDONLY});
+		### Check that variable exists
+  unless ($var_name ~~ @{$ncobj->getvariablenames()}) {
+  (my  $file_s = $file) =~ s/.+:(.+):.+/$1/;
+    die "\nRequested variable \"$var_name\" is not found in the NetCDF file:\n   $file_s\n\tAborting...\n\n";
   }
+		### Get variable Attributes
+  my %att	= map(($_ => $ncobj->getatt($_,$var_name)), @{$ncobj->getattributenames($var_name)});
+  $ncobj->close();
+
+  $scale  = $att{scale_factor} ->at(0)	if defined $att{scale_factor};
+  $offset = $att{add_offset}   ->at(0)	if defined $att{add_offset};
+		### Find Nodata in the NEtCDF file or from "Processing" attribute
+  if (defined($processing) && $processing =~ m/nodata=([-+e\.\d]+)/i) {
+    $nodata = $1;
+  } else {
+    $nodata = $att{_FillValue}   ->at(0)	if defined $att{_FillValue};
+    $nodata = $att{missing_value}->at(0)	if defined $att{missing_value} && !defined($att{_FillValue});
+    die "\nNodata value 'NaN' defined in the NetCDF metadata for $var_name variable in the NetCDF file:\n".
+        "\t$file\nis not valid.\n\t".
+	"It can be set/forced using:\n\t".
+	"1. NetCDF attribute editor, e.g. \"ncatted  -h -O -a _FillValue,$var_name,m,f,9.96921e+36 FILE\"\n\t".
+	"2. Using \"nodata\" key in \"Processing\" attribute for this dataset in the MT DB\n\tAborting...\n\n"
+		if defined($nodata) && $nodata =~ m/NaN/i;
+  }
+
+  die "\nNodata value is not found for $var_name variable in the NetCDF file:\n\t$file\n".
+	"It can be set/forced using:\n\t".
+	"1. NetCDF attribute editor, e.g. \"ncatted  -h -O -a _FillValue,$var_name,a,f,-9999 FILE\"\n\t".
+	"2. Using \"nodata\" key in \"Processing\" attribute for this dataset in the MT DB\n\tAborting...\n\n"
+		unless defined $nodata;
 
   return ($scale,$offset,$nodata);
 }
@@ -1100,9 +1160,9 @@ sub timecheck {     ### Returns true if file1 is more recent.
 #######################################################################
 
 sub band_mapping {
-  my ($names, $date, $daytime)   = @_;
+  my ($names, $date, $daytime)	 = @_;
   my ($nc_bands,$ts,$start_date) = ($$names{Bands},$$names{Time_Series},$$names{Start_Date});
-      $daytime = [0,0] unless defined $daytime;
+      $daytime = [0,0]	unless defined $daytime;
   return 1 unless $nc_bands;
 
 		### Get calendar and link calendar functions
@@ -1111,21 +1171,25 @@ sub band_mapping {
 
 		############################################
 
-  my @start_date = split m/-/,$start_date;
-  $$date[0] = 2001 if $ts=~m/clim/ || $nc_bands==365;		# No Leap year
+  my @start_date= split m/-/,$start_date;
+    $$date[0]	= 2001 if $ts=~m/clim/ || $nc_bands==365;	# No Leap year
+  my $date_str	= sprintf("%04d-%02d-%02d", @$date);
+  my $multiDay	= $ts=~m/daily\[/ ? 1 : 0;			# Custom daily dates
 
   my $rec_num = 1;					# Default
-	############   Daily for 360-day calendar   ############
-  if ($ts =~ m/daily$/ && $calendar == 360) {
-    if ($nc_bands <= 360) {
-		$rec_num = calendar360_day(@$date) - calendar360_day($$date[0],1,0);
-    }
-    else {
-		$rec_num = calendar360_day(@$date) - calendar360_day(@start_date[0,1],0);
-    }
-  }
+
+	############   Dates from file   ############
+	###	NB- Works for one data file only
+  my $dates_file = ($ts =~ m/:(\/.+)/) ? $1 : '';
+  if (-e $dates_file) {
+    $date_str =~ s/-\d{2}$/-00/ if $ts =~ m/monthly/i;
+    my ($field,@data) = read_table($dates_file);
+    foreach  $rec_num (0..$#data) {
+      return($rec_num+1) if $data[$rec_num][$$field{Date}] eq $date_str;
+  }   return 1; }
+
 	############   Hourly   ############
-  elsif	($ts=~m/daily\{(\d+)}/) {
+  if	($ts=~m/daily\{(\d+)}/) {
 		my $step = 24/$1;
 	# Case one file per date
 	if ($nc_bands == 1) {
@@ -1139,22 +1203,27 @@ sub band_mapping {
 	else { die "Undefined sub-daily band mapping. Aborting...\n"; }
   }
 	############   Daily    ############
-  elsif	($ts=~m/daily/) {				# 1 year per file
-    if ($nc_bands==365 || $nc_bands==366) {
-		$rec_num = &$julian_day(@$date) - &$julian_day($$date[0],1,0);
+  elsif	($ts=~m/daily/) {
+    if ($nc_bands==360 || $nc_bands==365 || $nc_bands==366) {		# 1 year per file
+		$rec_num = $multiDay ? multiDay_band($$date[0].'-01-01', $date_str, $names) :
+			   &$julian_day(@$date) - &$julian_day($$date[0],1,0);
     }
-    elsif ($nc_bands==31) {				# 1 month per file
-		$rec_num = &$julian_day(@$date) - &$julian_day(@$date[0,1],0);
+    elsif ($nc_bands==30 || $nc_bands==31) {				# 1 month per file
+		$rec_num = $multiDay ? multiDay_band(sprintf("%04d-%02d-%02d",@$date[0,1],1), $date_str, $names) :
+			   &$julian_day(@$date) - &$julian_day(@$date[0,1],0);
     }
     elsif ($nc_bands > 366) {				# > 1 year per file (single large file)
       if ($calendar == 366) {				# With leap years
-		$rec_num = &$julian_day(@$date) - &$julian_day(@start_date) + 1;
+		$rec_num = $multiDay ? multiDay_band($start_date, $date_str, $names) :
+			   &$julian_day(@$date) - &$julian_day(@start_date) + 1;
       }
       elsif ($calendar ==  365) {			# Without leap years
-		$rec_num = 365*($$date[0]-$start_date[0])+&$julian_day(2001,@$date[1,2])-2451910;
+		$rec_num = $multiDay ? multiDay_band($start_date, $date_str, $names) :
+			   365*($$date[0]-$start_date[0])+&$julian_day(2001,@$date[1,2])-2451910;
       }
       elsif ($calendar ==  360) {
-		$rec_num = &$julian_day(@$date) - &$julian_day(@start_date) + 1;
+                $rec_num = $multiDay ? multiDay_band($start_date, $date_str, $names) :
+			  &$julian_day(@$date) - &$julian_day(@start_date) + 1;
       }
       else { die "Unknown calendar format to get band # (in RIMS.pm). Aborting...\n"; }
     }
@@ -1172,8 +1241,24 @@ sub band_mapping {
   elsif	($ts=~m/yearly/ && $nc_bands>1) {
 		$rec_num = $$date[0]-$start_date[0]+1;
   }
+	############   Decadal   ############
+  elsif	($ts=~m/decadal/ && $nc_bands>1) {
+		$rec_num =($$date[0]-$start_date[0])/10+1;
+  }
 
   return int $rec_num;
+}
+
+#######################################################################
+
+sub multiDay_band
+{
+  my ($start, $date, $names)	= @_;
+
+  my ($junk,$list) = make_date_list($start, $date, $names);
+  die "Date $date is not part of the time series for $$names{Time_Series}. Aborting...\n" if $$list[-1] ne $date;
+
+  return scalar(@$list);
 }
 
 #######################################################################
@@ -1273,6 +1358,21 @@ sub get_calendar
 
 #######################################################################
 
+sub unzero_dates
+{
+  my ($date,$ts)= @_;
+  my  $clim_yr	= 2001;
+
+  if	($ts =~ m/clim/)		{ $date =~ s/^\d{4}/$clim_yr/;		}
+  if	($ts =~ m/8day|jday/)		{ $date =~ s/(\d{4})-(\d{3})/$1-01-$2/;	}
+  elsif	($ts =~ m/monthly/)		{ $date =~ s/\d{2}$/15/;		}
+  elsif ($ts =~ m/yearly|decadal/)	{ $date =~ s/\d{2}-\d{2}$/07-01/;	}
+
+  return $date;
+}
+
+#######################################################################
+
 sub make_date_list
 
 {
@@ -1284,8 +1384,18 @@ sub make_date_list
   my			   $calendar = get_calendar($names);
   my	     $julian_day = $calendar==360 ? \&calendar360_day         : \&Time::JulianDay::julian_day;
   my $inverse_julian_day = $calendar==360 ? \&calendar360_inverse_day : \&Time::JulianDay::inverse_julian_day;
-  my $days_in		 = $calendar==360 ? \&calendar360_DaysInMonth : \&Time::DaysInMonth::days_in;
-  my $is_leap		 = $calendar==360 ? \&calendar360_is_leap     : \&Time::DaysInMonth::is_leap;
+  my $days_in		 = $calendar==360 ? \&calendar360_DaysInMonth :
+			   $calendar==365 ? \&calendar365_DaysInMonth : \&Time::DaysInMonth::days_in;
+  my $is_leap		 = $calendar==360 ? \&calendar360_is_leap     :
+			   $calendar==365 ? \&calendar365_is_leap     : \&Time::DaysInMonth::is_leap;
+
+		### Check input errors
+  if ($ts_type) {
+    die "Wrong format for the time series start date (ID = $$names{Code_Name}) in RIMS.pm. Aborting...\n"
+	if $date_start !~ m/^\d{4}-(\d{2}-\d{2}|\d{3})(T.+)*$/;
+    die "Wrong format for the time series   end date (ID = $$names{Code_Name}) in RIMS.pm. Aborting...\n"
+	if $date_end   !~ m/^\d{4}-(\d{2}-\d{2}|\d{3})(T.+)*$/;
+  }
 
   ################################################
   #####   Get dates from file if available   #####
@@ -1294,11 +1404,9 @@ sub make_date_list
   if (-e $dates_file) {
     my @idx;
 	#####   Convert start and end dates to Julian Day format   #####
-    $date_start =~ s/(\d{4})-(\d{3})/$1-01-$2/ if $ts_type =~ m/8day|jday/;
-    $date_end   =~ s/(\d{4})-(\d{3})/$1-01-$2/ if $ts_type =~ m/8day|jday/;
-    $date_end   =~ s/00$/15/ if $ts_type =~ m/monthly/;
-
-    my ($j_date_start,$j_date_end) = (&$julian_day(split m/-/,$date_start), &$julian_day(split m/-/,$date_end));
+    my ($j_date_start, $j_date_end) =
+	(&$julian_day(split m/-/,unzero_dates($date_start,$ts_type)),
+	 &$julian_day(split m/-/,unzero_dates($date_end,  $ts_type)));
 
     my ($field,@data) = read_table($dates_file);
     my @date   = map $$_[$$field{Date}],@data;
@@ -1323,22 +1431,8 @@ sub make_date_list
   my $dtime_end     = ($daytime_end   =~ m/(\d{2}):(\d{2})/) ? ($1/24+$2/24/60) : 0;
 
   #####   Prepare date string to be used for Julian Day format   #####
-  if ($ts_type =~ m/clim/)
-  {
-    $date_start =~ s/^\d{4}/$clim_yr/;		### Get rid of leap year
-    $date_end   =~ s/^\d{4}/$clim_yr/;		### in climatology dates
-  }
-
-  if ($ts_type =~ m/monthly/)
-  {
-    $date_start =~ s/\d{2}$/15/;
-    $date_end   =~ s/\d{2}$/15/;
-  }
-  elsif ($ts_type =~ m/yearly|decadal/)
-  {
-    $date_start =~ s/\d{2}-\d{2}$/07-01/;
-    $date_end   =~ s/\d{2}-\d{2}$/07-01/;
-  }
+  $date_start = unzero_dates($date_start,$ts_type);
+  $date_end   = unzero_dates($date_end,  $ts_type);
 
   #####   Convert start and end dates to Julian Day format   #####
   $date_start =~ s/(\d{4})-(\d{3})/$1-01-$2/ if $ts_type =~ m/8day|jday/;
@@ -1356,10 +1450,12 @@ sub make_date_list
 
   while ($j_date[-1] < $j_date_end-0.001)		###  0.001 account for day time accuracy
   {
-    my $step =
+    open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
+      my $step =
 	($ts_type =~ m/monthly/) ?       &$days_in(&$inverse_julian_day($j_date[-1])) :
 	($ts_type =~ m/yearly/)  ? 365 + &$is_leap(&$inverse_julian_day($j_date[-1]+365)) :
 	($ts_type =~ m/decadal/) ? 3653  : 1/$time_int;		### Daily
+    open STDERR, ">&OLDERR";
 
     push @j_date, $j_date[-1]+$step;
     push @J_DATE,[$j_date[-1], 0,0];
@@ -1370,16 +1466,18 @@ sub make_date_list
   }
 
   #####   Build list of formatted dates   #####
-  my @date = ($time_int==1) ?
+  open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
+    my @date = ($time_int==1) ?
 	map(sprintf("%04d-%02d-%02d",		&$inverse_julian_day($_)),		@j_date) :
 	map(sprintf("%04d-%02d-%02dT%02d:%02d",	&$inverse_julian_day($$_[0]),@$_[1,2]), @J_DATE) ;
+  open STDERR, ">&OLDERR";
 
   if ($ts_type =~ m/yearly|decadal/)	{ map s/\d{2}-\d{2}$/00-00/,@date; }
   if ($ts_type =~ m/monthly/)		{ map s/\d{2}$/00/,         @date; }
   if ($ts_type =~ m/clim/)		{ map s/^\d{4}/0000/,       @date; }
 
   #####   Trim leap year dates   #####
-  if ($ts_type eq 'daily' && $calendar==365)
+  if ($ts_type =~ m/daily(\[)*/ && $calendar==365)
   {
     my @list;
     map {push @list,$_ if substr($date[$_],5) ne '02-29'} 0..$#date;
@@ -1389,12 +1487,18 @@ sub make_date_list
   }
 
   #####   Trim custom daily dates   #####
-  if ($ts_type =~ m/(daily)\[([\d,]+)\]/)
+  if ($ts_type =~ m/(daily)\[([\d,]+)(lastDay)*\]/)
   {
-    (my $days = $2) =~ s/,/\|/g;		### Make search string
-    my @list;					### Make match list
-    map {push @list,$_ if substr($date[$_],8) =~ m/$days/} 0..$#date;
-
+    my  $last = $3;
+    my  @days = split m/,/, $2;
+    map $_    = sprintf("%02d",$_),@days;	### Format days to be zero-padded
+    my  $days = join '|', @days;		### Make search string
+    my  @list;					### Make match list
+    foreach my $i (0 .. $#date) {
+      my @date	= split m/-/, $date[$i];
+      my $add	= $last ? '|'.&$days_in(@date[0,1]) : '';
+      push(@list, $i) if $date[2] =~ m/$days$add/;
+    }
     @date   = @date[@list];			### Trim lists
     @j_date = @j_date[@list];
   }
@@ -1438,8 +1542,10 @@ sub make_file_list
   foreach my $date (@$dates)
   {
     my @daytime	= jday_hour_min($date);
-    my @date	=(split_date(sprintf("%04d-%02d-%02d",&$inverse_julian_day($daytime[0])),$$names{Time_Series}),
+    open STDERR, ">/dev/null";	### Warning for "pre-dates British use of Gregorian calendar" < yr.1760
+      my @date	=(split_date(sprintf("%04d-%02d-%02d",&$inverse_julian_day($daytime[0])),$$names{Time_Series}),
 			map( sprintf("%02d",$_), @daytime[1,2]));
+    open STDERR, ">&OLDERR";
     my $data_file = $file;
 
     $data_file =~ s/_YEAR_/$date[0]/g;
@@ -1558,10 +1664,10 @@ sub band_count
   my $file = shift;
 
   open STDERR, ">/dev/null";
-    my $dataset = Geo::GDAL::Open($file, 'ReadOnly');
+    my $dataset = Geo::GDAL::FFI::Open($file, {Flags => ['READONLY']});
   open STDERR, ">&OLDERR";
 
-  return $dataset->{RasterCount};
+  return Geo::GDAL::FFI::GDALGetRasterCount($$dataset);
 }
 
 #######################################################################
@@ -1609,6 +1715,7 @@ sub check_MT_date
     my $content = htm_template($_[0]);
     $_[0] = ($content =~ m/(\d{4}-\d{2}-\d{2})/) ? $1 : '';
   }
+  return(!length($_[0]) ? 0 : $_[0] =~ m/\d{4}-\d{2}-\d{2}/ ? 0 : 1);
 }
 
 #######################################################################
@@ -1648,7 +1755,7 @@ sub check_sigma
 
   if ($file =~ s/(NETCDF:.+:.+)/$1\_sigma/) {
     open STDERR, ">/dev/null";
-      my $dataset = eval { Geo::GDAL::Open($file, 'ReadOnly') };
+      my $dataset = eval { Geo::GDAL::FFI::Open($file, {Flags => ['READONLY']}) };
     open STDERR, ">&OLDERR";
     return defined($dataset) ? 1 : 0;
   }
@@ -1685,6 +1792,22 @@ sub set_default
 {
   my ($value, $default)	= @_;
   return defined($value) && length($value) ? $value : $default;
+}
+
+#######################################################################
+
+sub check_ascii_file		### Check ASCII file for non-ASCII characters
+{				#   Added on Jun 5, 2023
+  my ($file, $i) = (shift(), 0);
+
+  open (FILE,"<$file") or die "Couldn't open $file, $!";
+    while (<FILE>) { $i++;
+      die sprintf("\nError in reading ASCII file:\n\t$file\n" .
+		"It has non-ASCII character \\x%X at column %d of line %d. " .
+		"Fix it, e.g. using \"dos2unix\".\n\tAborting...\n\n", ord($1), $+[0], $i)
+	if m/([^[:ascii:]])/;
+    }
+  close FILE;
 }
 
 #######################################################################
