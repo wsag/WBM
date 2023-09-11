@@ -17,13 +17,15 @@
 #	October, 2012
 #
 #		Last Modified:
-#	October 2016	Spool removed
-#	March 2017	Convertion of non-timeseries dataset to fake 'yearly_clim'
-#	October 2018	Added "UNITS" option to check/verify units of the dataset data
-#	July 2019	Hourly
-#	September 2019	Year up search and changes in date search function
+#	Oct 2016	Spool removed
+#	Mar 2017	Convertion of non-timeseries dataset to fake 'yearly_clim'
+#	Oct 2018	Added "UNITS" option to check/verify units of the dataset data
+#	Jul 2019	Hourly
+#	Sep 2019	Year up search and changes in date search function
+#	Nov 2022	Option for forsed spool/sparse Delta
 #
-#	Version		20.8.0	(YY.M.#)	# Number is zero-based
+#	Version-	(YY.M.#)	# Number is zero-based
+my $version =		'22.12.0';	# Version. Note- update version variable below
 #
 #######################################################################
 
@@ -34,7 +36,7 @@ use Time::JulianDay;
 use Time::DaysInMonth;
 use RIMS qw/check_MT_date make_date_list make_file_list make_date_layers set_default/;
 
-our $VERSION	= '20.8.0';
+our $VERSION	= '22.12.0';
 
 no if $] >= 5.017011, warnings => 'experimental::smartmatch';
 
@@ -54,13 +56,21 @@ sub new
   my $units		= $$options{UNITS}		|| undef;	# Option to check units
   my $TS_res_min	= $$options{MIN_TS_RES}		|| undef;	# Option to check minimum temporal resolution
   my $TS_res_max	= $$options{MAX_TS_RES}		|| undef;	# Option to check maximum temporal resolution
+  my $spDelta		= $$options{SP_DELTA}		|| undef;	# Option to use sparse delta method for spool
 
 	### Attributes from the Magic Table or init file
-  check_MT_date($$metadata{Start_Date});
-  check_MT_date($$metadata{End_Date});
-  substr($$metadata{Start_Date},0,4,$start_year_clip) if defined($start_year_clip) && $$metadata{Time_Series} &&
-	($start_year_clip > substr($$metadata{Start_Date},0,4));
+  my $check_MT_date  = check_MT_date($$metadata{Start_Date});
+     $check_MT_date += check_MT_date($$metadata{End_Date});
+  die "Wrong format of Start_Date or End_Date in the metadata for the dataset ID: $$metadata{Code_Name}\nAborting...\n"
+	if $check_MT_date;
 
+	### Check/apply START_YEAR_CLIP option
+  if (defined($start_year_clip)) {
+    die "Wrong format of START_YEAR_CLIP option for the dataset ID: $$metadata{Code_Name}\nAborting...\n"
+	if $start_year_clip !~ m/^\d{4}$/;
+    substr($$metadata{Start_Date},0,4,$start_year_clip)		  if $$metadata{Time_Series} &&
+	  ($start_year_clip > substr($$metadata{Start_Date},0,4)) && $$metadata{File_Path} =~ /_YEAR_/;
+  }
 	### Check/verify dataset units
   die sprintf("Dataset ID: \"%s\". Requested units do not match (%s vs. %s). Aborting...\n",
     $$metadata{Code_Name}, $units, $$metadata{Units}) if defined($units) && $$metadata{Units} !~ m/^$units/i;
@@ -80,7 +90,6 @@ sub new
     die sprintf("Dataset ID: \"%s\". TS resolution is \"%s\" while requested minimum is \"%s\"). Aborting...\n",
       $$metadata{Code_Name}, $$metadata{Time_Series}, $TS_res_min) unless m/$TS/ ~~ @TS_list;
   }
-
 	### Check/verify dataset maximum temporal resolution
   if ($TS_res_max) {	my @TS_list;
    (my $TS = $$metadata{Time_Series}) =~ s/_clim$//i;
@@ -90,6 +99,9 @@ sub new
     die sprintf("Dataset ID: \"%s\". TS resolution is \"%s\" while requested maximum is \"%s\"). Aborting...\n",
       $$metadata{Code_Name}, $$metadata{Time_Series}, $TS_res_max) unless m/$TS/ ~~ @TS_list;
   }
+	### Check forsed spool/sparse Delta option
+  $spDelta	= 1	if $$metadata{Time_Series} =~ m/^daily$/i && $$metadata{Processing} =~ m/SpDelta/i;
+  $spDelta	= 0	if $$metadata{Processing}  =~ m/noSpDelta/i;	# Highest priority option
 
 	### Convert non-timeseries dataset to fake 'yearly_clim'
   ($$metadata{Time_Series}, $$metadata{Start_Date}, $$metadata{End_Date}) =
@@ -117,7 +129,7 @@ sub new
 	'decadal'	=> $$metadata{Time_Series} =~ m/decadal/i	? 1 : 0,
 	'climatology'	=> $$metadata{Time_Series} =~ m/_clim/i		? 1 : 0,
 	'units'		=> $$metadata{Units},
-	'spool'		=> 1			### Backward compatibility for "spool" option- REMOVE!!!
+	'spDelta'	=>  $spDelta
   };
 
   my $object = bless $self,$class;

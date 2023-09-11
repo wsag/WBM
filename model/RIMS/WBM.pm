@@ -4,7 +4,7 @@
 #      intellectual property of the copyright holder.
 #      Any partial or complete reproduction, redistribution or modification
 #      without approval of the authors is strictly prohibited.
-#      (C) University of New Hampshire and Water Systems Analysis Group 2008-2021
+#      (C) University of New Hampshire and Water Systems Analysis Group 2008-2023
 #
 #######################################################################
 
@@ -18,7 +18,7 @@
 #	Last Modified-	See Main model for details.
 #
 #	Version-	(YY.M.#)	# Number is zero-based
-my $version =		'22.1.0';	# Version. Note- update version variable below
+my $version =		'23.9.0';	# Version. Note- update version variable below
 #
 #######################################################################
 
@@ -31,7 +31,7 @@ use Data::Dumper;
 use File::Basename;
 use File::Path;
 use File::Temp;
-use Geo::GDAL;
+use Geo::GDAL::FFI;
 use List::Util;
 use Math::Trig qw/pi/;
 use PDL;
@@ -40,14 +40,14 @@ use PDL::GSL::MROOT;
 use PDL::Image2D;
 use PDL::IO::FlexRaw;
 use PDL::Math;
-use PDL::NetCDF;
+use PDL::NetCDF;	$ENV{GDAL_NETCDF_IGNORE_XY_AXIS_NAME_CHECKS} = "YES";	# required for GDAL > 3.0
 use PDL::NiceSlice;
 use Fcntl;
 use Storable qw/dclone/;
 use Sys::Hostname;
 use Time::JulianDay;
 use Time::DaysInMonth;
-use RIMS qw(get_file_path date_now htm_template read_attrib read_table read_table_hash get_calendar make_date_list check_MT_date set_default prepare_dir crs_to_Obj transform_point);
+use RIMS qw(get_file_path date_now htm_template read_attrib read_table read_table_hash get_calendar calendar360_day calendar360_DaysInMonth calendar365_DaysInMonth make_date_list check_MT_date set_default prepare_dir crs_to_Obj transform_point get_netcdf_compression check_ascii_file);
 
 require Exporter;
 
@@ -64,7 +64,7 @@ our @ISA	= qw(Exporter);
 # If you do not need this, moving things directly into @EXPORT or @EXPORT_OK
 # will save memory.
 our %EXPORT_TAGS = ( 'all' => [ qw(
-get_conf copy_path set_err wbm_params wbm_reqParams spinup_param_init dump_init attrib isInitFile check_defaults read_init read_param_str init_DSet isNumber make_runAttr make_list_out make_GW_BW_output make_dataCube uniq_list GDAL_FileCheck isDataSet_TS read_Layer read_dateLayer read_climate_bias read_GDAL read_raster get_extent lonLat cell_area area_layers write_cell_area colRow write_gridascii write_tif write_nc GDAL_test unpdl_data unpdl_scalars flow_to check_circularityC build_cell_table cell_table find_outlets saveEndoMask grid_to_table table_to_grid add_connectivity diversion_yr_total aquifer_summary compBalance_save add_reservoirs a_dam_equaton b_dam_equaton B_dam_equaton d_root_solver add_DIN_WWPT springs_init usgs_init update_usgs rehash_stack make_stack gl_scale aquifer_init aqf_ID_mask Aqf_Storage_2_Head Aqf_Well_Storage ModFlow_EFDM condition condition_slice set_to_zero checkZero checkOnes hash_to_arr hash_to_keys arr_to_hash change_meta add_spinup_dates readState fileBaseName time_used post_processing make_build_spool bMarkMap make_URL
+get_conf copy_path set_err wbm_params wbm_reqParams spinup_param_init dump_init attrib isInitFile check_defaults read_init read_param_str find_done check_PET_str init_DSet isNumber make_runAttr make_list_out make_GW_BW_output make_dataCube uniq_list GDAL_FileCheck isDataSet_TS read_Layer read_dateLayer spoolFile_read read_dateLayers read_climate_bias read_GDAL read_raster get_extent get_geo_transform InvGeoTransform ApplyGeoTransform lonLat cell_area area_layers write_cell_area colRow write_gridascii write_tif write_nc GDAL_test unpdl_data unpdl_scalars flow_to check_circularityC build_cell_table cell_table find_outlets saveEndoMask grid_to_table table_to_grid add_connectivity diversion_yr_total aquifer_summary compBalance_save add_reservoirs muskingum_Mask a_dam_equaton b_dam_equaton B_dam_equaton d_root_solver add_DIN_WWPT springs_init usgs_init update_usgs rehash_stack make_stack gl_scale aquifer_init Aqf_Storage_2_Head Aqf_Well_Storage ModFlow_EFDM condition condition_slice set_to_zero checkZero checkOnes hash_to_arr hash_to_keys arr_to_hash change_meta add_spinup_dates readState fileBaseName time_used post_processing make_build_spool bMarkMap make_URL mask_boundary rm_tmp_files
 ) ] );
 
 our @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
@@ -113,26 +113,31 @@ sub MT_reqParams
 
 sub spinup_param_init
 {
-  my ($runIO, $flag) = @_;
+  my ($runIO, $dState, $noStateID) = @_;
   die "\nObsolete spinup parameters  input. Use \"Spinup\" block  instead. Aborting...\n\n"
 	if grep m/^spinup_/i, keys %$runIO;
 
 	### Read spinup parameters
   my %spinup	= read_param_str($runIO, 'Spinup');
   map { die "\nWrong key \"$_\" in the \"Spinup\" input block. See \"WBM_Usage_and_Input_Reference.xlsx\". Aborting...\n\n"
-		     unless m/^(Start|End|Loops|State_ID|Force_ID_Date)$/; } keys %spinup;
+		     unless m/^(Start|End|Loops|State_ID|Force_ID_Date|Save_Vars)$/; } keys %spinup;
   $spinup{Loops}= 0  unless exists $spinup{Loops} && isNumber($spinup{Loops});	map
- {$spinup{$_}	= '' unless exists $spinup{$_}; } qw(State_ID Start End Force_ID_Date);
+ {$spinup{$_}	= '' unless exists $spinup{$_}; } qw(State_ID Start End Force_ID_Date Save_Vars);
+ ($spinup{State_ID}, $spinup{Force_ID_Date}) = ('','')	if $noStateID;
 
 	### Check spinup parameters
   map {	die "\nWrong format of Spinup=>$_ input. Should be YYYY-MM-DD. Aborting...\n\n"
 		if  $spinup{$_} && $spinup{$_} !~ m/\d{4}-\d{2}-\d{2}/; } qw(Start End Force_ID_Date);
 	die "\nInput Spinup=>Start/End dates are required with Loops > 0. Aborting...\n\n"
 		if  $spinup{Loops} && !($spinup{Start} && $spinup{End});
+	die "\nCommand line -dState and -noStateID flags cannot be used together. Aborting...\n\n"
+		if $noStateID && $dState;
 	die "\nInput Spinup=>State_ID is required with the use of -dState flag. Aborting...\n\n"
-		if !$spinup{State_ID} && $flag;
+		if !$spinup{State_ID} && $dState;
 	die "\nCannot apply Spinup=>Force_ID_Date to undefined Spinup=>Force_ID state in the input. Aborting...\n\n"
 		if  $spinup{Force_ID_Date} && !$spinup{State_ID};
+	die "\nInput Spinup=>Save_Vars is not valid. Aborting...\n\n"
+		if  $spinup{Save_Vars} && !($spinup{Save_Vars} ~~ @{[1,2]});
 
   return \%spinup;
 }
@@ -157,6 +162,7 @@ sub dump_init
     @{wbm_params()};
 		### Check and re-format block parameters
   unless ($isMT) {
+    $$set{PET} = $$set{PET}{method} if ref($$set{PET}) && $$set{PET}{Scale} == 1;		### Reduce PET entry
     foreach my $param (@list) {
       if (ref $$set{$param}) {
 	my $dumper = Data::Dumper->new([$$set{$param}]);
@@ -197,9 +203,14 @@ sub attrib
 	"Aborting...\n\n")	if defined $key && !$attrib{Code_Name};
 
 		### Check required MT attributes
-  map { die("MT parameter \"$_\" is required in this MT ".($file_flag?'init file':'entry').":\n\t$id\nAborting...\n\n")
+  map { die("\nMT parameter \"$_\" is required in this MT ".($file_flag?'init file':'entry').":\n\t$id\nAborting...\n\n")
 				unless exists $attrib{$_} }	@{MT_reqParams()};
   map { $attrib{$_} = ''	unless exists $attrib{$_} }	@{MT_params()};
+
+		### Check dataset ID vs. init file name
+  die "\nDataset init file name does not match its ID in Code_Name entry.\n" .
+      "\tFile:\t$id\n\tCode_Name:\t$attrib{Code_Name}\nAborting...\n\n"
+	if $file_flag && ($attrib{Code_Name} ne basename($id, '.init', '.INIT'));
 
 		### Convert tileindex shape file to vrt (the former files have to retire and be replaces with vrt)
   tileindex_2_vrt(\%attrib)
@@ -213,11 +224,15 @@ sub attrib
 	    $attrib{Processing} !~ m/polygon/i;
 
 		### Read dates from file, if needed
-  check_MT_date($attrib{Start_Date});
-  check_MT_date($attrib{End_Date});
+  my $check_MT_date  = check_MT_date($attrib{Start_Date});
+     $check_MT_date += check_MT_date($attrib{End_Date});
+  die "Wrong format of Start_Date or End_Date in the metadata for the dataset ID: $attrib{Code_Name}\nAborting...\n"
+	if $check_MT_date;
+
 		### Fill up blanks
   $attrib{Var_Scale}  = 1 unless $attrib{Var_Scale};
   $attrib{Var_Offset} = 0 unless $attrib{Var_Offset};
+
 		### Other cleanups
   $attrib{Processing} =~ s/\s//g;		# Remove blank spaces in processing
 
@@ -342,14 +357,14 @@ sub read_init
   my $check	= set_default( $$options{CHECK_ARR},	undef);
   my $make	= set_default( $$options{MAKE_ARR},	undef);
 
+  check_ascii_file($file);	# Check file for non-ASCII characters
+
   #####################################################################
   ############    Read parameter = value pairs   ######################
 
   my $str =  htm_template($file);
      $str =~ s/=>\s*,/=> '',/g;		# Fix some erroneous hash values
   my $att =  eval $str;
-  die "\nError in read_init 'eval': $@\tFile = $file\n" .
-	($str=~m/[^[:ascii:]]/?"It has non-ASCII characters. Fix it using \"dos2unix\".\n\n" : "\n") if $@;
   die "\nFailed to read attributes in read_init... File =\n   $file\n\n" unless ref($att);
   my %attrib = %{ $att };
 
@@ -362,7 +377,7 @@ sub read_init
   }
 	### Make optional parameters-
   if ($make) {
-    map { $attrib{$_} = '' unless defined $attrib{$_} } @$make;
+    map { $attrib{$_} //= '' } @$make;
   }
 
   return %attrib;
@@ -379,6 +394,43 @@ sub read_param_str
 	die(	"\nWBM initialization key \"$key\" has wrong format (see WBM documentation).\n",
 		"It is supposed to be a hash block statement or a path to an init file that exists,\nbut it is-\n",
 		"   $key => '$hash_or_file',\n\tAborting...\n\n"));
+}
+
+#######################################################################
+
+sub check_PET_str
+{
+  my $runIO = shift();
+
+  if (!$$runIO{PET}) {
+    $$runIO{PET} = { method => 'Hamon', Scale => 1 }; }
+  if (!ref($$runIO{PET})) {
+    my $method   = delete $$runIO{PET};
+    $$runIO{PET} = { method => $method, Scale => 1 }; }
+  if (ref($$runIO{PET}) ne 'HASH') {
+    die "\nWrong input for PET method. Aborting...\n\n";
+  }
+  $$runIO{PET}{Scale}  = 1 unless exists($$runIO{PET}{Scale});
+
+		### Check for wrong inputs
+  foreach my $key (keys %{$$runIO{PET}}) {
+    die "\nScale value for PET must be a number. Aborting...\n\n"
+	if $key eq 'Scale' &&  !isNumber($$runIO{PET}{Scale});
+    die "\nWrong input key \"$key\" in PET input. Aborting...\n\n"
+	if $key !~ m/method|Scale/;
+  }
+}
+
+#######################################################################
+
+sub find_done		### Find number of done steps from run state files
+{
+  my ($j_date,$n_spinup,$j_date_list) = @_;
+
+  for ( my $i=$n_spinup; $i<=$#$j_date_list; $i++ ) {
+    return $i+1 if $j_date == $$j_date_list[$i];
+  }
+  return $n_spinup;
 }
 
 #######################################################################
@@ -434,11 +486,12 @@ sub make_runAttr
        $$runIO{Project}	  = 'My project'	unless  defined	$$runIO{Project};
 
     die "\nIllegal value of \"Time_Series\" key \"$MT_param{Time_Series}\" in \"MT_Code_Name block\". Aborting...\n\n"
-	if $MT_param{Time_Series} && $MT_param{Time_Series} !~ m/daily(\{\d+\})*|monthly/;
+	if $MT_param{Time_Series} && $MT_param{Time_Series} !~ m/daily(\{\d+\})*|daily\[([\d,]+)(lastDay)*\]|monthly/;
 
+       $attrib{Run_Step}  = $MT_param{Time_Series} &&  $MT_param{Time_Series} =~ s/:(daily.*)// ? $1 : 'daily';
     my $start_date	  = $MT_param{Run_Start}   ||  $$runIO{Spinup}{Start} || '';
     my $time_series	  = $MT_param{Time_Series} || ($start_date =~ m/-00$/ ? 'monthly' : 'daily');
-    my $TIME_SERIES	  = $time_series =~ m/daily\{\d+\}/ ? 'hourly' : $time_series;
+    my $TIME_SERIES	  = $time_series =~ m/daily\{\d+\}/ ? 'hourly' : $time_series =~ m/daily/ ? 'daily' : 'monthly';
     my $file_size	  = $TIME_SERIES eq 'hourly'  ? 'day' : set_default($MT_param{File_Size}, 'year');
     $MT_param{Run_Title}  = $MT_param{Run_Title}   ? $MT_param{Run_Title} . ", Runoff, $TIME_SERIES" :
 			'WBM-TrANS, '.($$runIO{Project} || 'Simulation')  . ", Runoff, $TIME_SERIES" ;
@@ -474,8 +527,10 @@ sub make_runAttr
 	### Read MT metadata for runoff from Global Magic Table or init file
     %attrib	= %{ attrib($$runIO{MT_Code_Name}, $MT) };
   }
-  check_MT_date($attrib{Start_Date});	# It can be a dynamic date from the file
-  check_MT_date($attrib{End_Date});	# It can be a dynamic date from the file
+  my $check_MT_date  = check_MT_date($attrib{Start_Date});	# It can be a dynamic date from the file
+     $check_MT_date += check_MT_date($attrib{End_Date});	# It can be a dynamic date from the file
+  die "Wrong format of Start_Date or End_Date in the metadata for the dataset ID: $attrib{Code_Name}\nAborting...\n"
+	if $check_MT_date;
 
 	### Check format of "Start_Date" and "End_Date" attributes
   die "\nRun attribute \"Start_Date\" ($attrib{Start_Date}) is in a wrong format (must be YYYY-MM-DD). Aborting...\n\n"
@@ -533,7 +588,7 @@ sub get_wbm_var_list
 sub make_GW_BW_output		### Green/Blue water output aggregations
 {
   my ($sMoistGr, $sMoistGrET, $sMoist, $sMoistET, $landFrac, $list_out) = @_;
-  my ($sMoistGR, $sMoistBL,   $GW_ET,  $BW_ET);
+  my ($sMoistGR, $sMoistBL,   $GW_ET,  $BW_ET)	= (0,0,0,0);
 
   if (m/(sMoistGr|sMoistBl)$/ ~~ @$list_out) {
     foreach my $lnd (sort keys %$landFrac) { foreach my $tp (sort keys %{$$landFrac{$lnd}}) {	### ADDED SORT-NEED!
@@ -573,16 +628,18 @@ sub make_dataCube
     close FILE;
   }
 		### Data Cube components
-  my $subDi	= $$attrib{Time_Series} =~ m/daily\{(\d+)}/ ? $1 : 1;	# Sub-daily intervals in a day
-  my $ts_org	= $$attrib{Time_Series};
+  my $subDi	= $$attrib{Time_Series} =~ m/daily\{(\d+)}/ ? $1 : 1 ;	# Sub-daily intervals in a day
+  my $multiDs	= $$attrib{Time_Series} =~ m/daily(\[.+\])/ ? $1 : '';	# Multi-day string
+  my $ts_org	= $$attrib{Name}	=~ m/(\w+)$/	    ? $1 : 'N/A';
   my @suff	= qw/_h _d _m _y _dc _mc _yc/;
-  my @ts	= qw/daily{} daily monthly yearly daily_clim monthly_clim yearly_clim/;	$ts[0] =~ s/\{\}/{$subDi}/;
+  my @ts	= qw/daily{} daily monthly yearly daily_clim monthly_clim yearly_clim/;
+     $ts[0]	=~ s/\{\}/{$subDi}/;	$ts[1] .= $multiDs;
   my @ts_full	=('hourly','daily','monthly','yearly','daily climatology','monthly climatology','yearly climatology');
   my @s_date	= dc_dates($$attrib{Start_Date},0);
   my @e_date	= dc_dates($$attrib{End_Date},  1);
   my @bands	= ($subDi,366,12,1,365,12,1);
   my $hourly	= $subDi > 1;
-  my $daily	= $$attrib{Time_Series} eq 'daily';
+  my $daily	= $$attrib{Time_Series} eq 'daily' || $multiDs;
   my $monthly	= $$attrib{Time_Series} eq 'monthly';
      $bands[1]	= 1			if $hourly;
   my @path	= dc_path($$attrib{File_Path},$hourly,$daily,$monthly);
@@ -716,7 +773,7 @@ sub GDAL_FileCheck
   my $file  = shift;
   my $check = -e ($file =~ m/:(.+):/ ? $1 : $file) && eval {
       open STDERR, ">&NEWERR";
-	$_ = Geo::GDAL::Open($file);
+	$_ = Geo::GDAL::FFI::Open($file);
       open STDERR, ">&OLDERR";
   };
   open STDERR, ">&OLDERR";	# Must be reset after eval, if eval fails.
@@ -742,7 +799,7 @@ sub isDataSet_TS
 #######################################################################
 
 sub read_Layer
-	### Reads a single data layer
+	### Reads a single data layer (does not write spool file)
 {
   my($ext, $meta, $str, $MT, $options) = @_;
 			### Options
@@ -757,7 +814,7 @@ sub read_Layer
   return read_GDAL($ext,$meta,$resample,$str,1,$patch_val) if GDAL_FileCheck($str);
 		### RIMS DataSet
   my $dSet	= new RIMS::DataSet(attrib($str,$MT,$inputKey),	$dSetOpt);
-  return read_dateLayer($dSet, '2001-01-01', $ext, 0,		$options);
+  return read_dateLayer($dSet, '2001-01-01', $ext, 0,		$options);	# 4th argument: Do not cache to spool
 }
 
 #######################################################################
@@ -788,10 +845,14 @@ sub read_dateLayer
 
 			### Previously read data for monthly and yearly TS
   unless ( $dataSet->daily || $noCaching) {
-    return $dataSet->{data}	if defined($dataSet->{'data'})  &&
-      (($dataSet->monthly && $date !~ m/-01$/)  || ($dataSet->yearly  && $date !~ m/-01-01$/));
+    return $dataSet->{data}	if defined($dataSet->{data})  &&
+      (	($dataSet->monthly && substr($date,0,7) eq substr($dataSet->{date},0,7)) ||
+	($dataSet->yearly  && substr($date,0,4) eq substr($dataSet->{date},0,4)) ||
+	($dataSet->decadal && substr($date,0,3) eq substr($dataSet->{date},0,3)) );
   }
-			### Read data layer
+			### Read date layer
+# $dataSet->{spDelta} = 0;					# DELETE in 2023
+# my $new_spool = 1;						# DELETE in 2023
   my $data;
   if ($spool_dir) {
     my $dir  = $spool_dir.$dataSet->{ID}.($patchFlag ? '_'.$patch_val->{MT_attrib}{Code_Name} : '');
@@ -800,22 +861,109 @@ sub read_dateLayer
       mkpath($dir,0,0775) or die "Cannot make directory...\n$dir\n";
     }
     if (-e $file) {
-      $data = readflex($file);
+# if ($new_spool) {						# DELETE in 2023
+# printf "Read DATASET ID = %s\n", $dataSet->{ID};		# DELETE in 2023
+      $data = spoolFile_read($file, $ext, $dataSet);
+# } else {							# DELETE in 2023
+      # $data = readflex($file);				# DELETE in 2023
+# }								# DELETE in 2023
     } else {
-      $data =	read_GDAL($ext,$dataSet  ->{MT_attrib},$resample,$dataSet  ->dateLayer($date,$DtSrchOpt), $patchFlag ?
+		######################################
+		### Case of no-Delta spool write
+      if (!$dataSet->{spDelta} || $date =~ m/-01$/) {
+	$data =	read_GDAL($ext,$dataSet  ->{MT_attrib},$resample,$dataSet  ->dateLayer($date,$DtSrchOpt), $patchFlag ?
 		read_GDAL($ext,$patch_val->{MT_attrib},$resample,$patch_val->dateLayer($date,$DtSrchOpt), $PATCH_val):
-												 $patch_val);
-      writeflex($file, $data);		$$ext{spool_writes}++;
+													  $patch_val);
+# if ($new_spool) {						# DELETE in 2023
+	writeflex($file, $data->flat->index($$ext{indx}));
+# } else {							# DELETE in 2023
+	# writeflex($file, $data);	$$ext{spool_writes}++;	# DELETE in 2023
+# }								# DELETE in 2023
+      } else {
+		######################################
+		### Case of Delta spool write
+	my @date_prev	= $dataSet->{date} ?	split(m/-/, $dataSet->{date}) : (0,0,0);
+	my @date	=			split m/-/, $date;
+			### First day of month no-Delta spool write
+	if ($date[1] != $date_prev[1]) {
+	  (my $DATE = $date)	=~ s/\d{2}$/01/;
+	  $file			=~ s/\d{2}\.dat$/01.dat/;
+          $data=read_GDAL($ext,$dataSet  ->{MT_attrib},$resample,$dataSet  ->dateLayer($DATE,$DtSrchOpt), $patchFlag ?
+		read_GDAL($ext,$patch_val->{MT_attrib},$resample,$patch_val->dateLayer($DATE,$DtSrchOpt), $PATCH_val):
+													  $patch_val);
+	  writeflex($file, $data->flat->index($$ext{indx}));
+	  @date_prev		= (@date[0,1],1);
+	  $dataSet->{data}	=  $data;
+	}
+			### Other days of month Delta spool write
+	for (my $day=$date_prev[2]+1; $day<=$date[2]; $day++) {
+	  (my $DATE = $date)	=~ s/\d{2}$/sprintf("%02d",$day)/e;
+	  $file			=~ s/\d{2}\.dat$/sprintf("%02d",$day).".dat"/e;
+	  $data=read_GDAL($ext,$dataSet  ->{MT_attrib},$resample,$dataSet  ->dateLayer($DATE,$DtSrchOpt), $patchFlag ?
+		read_GDAL($ext,$patch_val->{MT_attrib},$resample,$patch_val->dateLayer($DATE,$DtSrchOpt), $PATCH_val):
+													  $patch_val);
+	  my $delta		= $data->flat - $dataSet->{data}->flat;
+	  my $idx		= which($delta != 0);
+	  writeflex($file, $delta->index($idx), $idx);
+	  $dataSet->{data}	=  $data;
+        }
+      } $$ext{spool_writes}++;
     }
   }
-  else {		### See note above about read_GDAL...
+		######################################
+		### Case of no spool
+  else {
       $data =	read_GDAL($ext,$dataSet  ->{MT_attrib},$resample,$dataSet  ->dateLayer($date,$DtSrchOpt), $patchFlag ?
 		read_GDAL($ext,$patch_val->{MT_attrib},$resample,$patch_val->dateLayer($date,$DtSrchOpt), $PATCH_val):
-												 $patch_val);
+													  $patch_val);
   }
   $dataSet->{data} = $data;
+  $dataSet->{date} = $date;
 
   return $data;
+}
+
+sub spoolFile_read
+{
+  my ($file, $ext, $dataSet) = @_;
+  my ($data, $idx) = readflex($file);
+  my  $FILE	   = $file;
+  my  $DATA	   = defined  $dataSet->{data} ? $dataSet->{data} :
+			zeroes($data->type,$$ext{ncols},$$ext{nrows})->copybad($$ext{mask});
+
+	### Case of no-Delta
+  if (!defined($idx)) {
+    $DATA->flat->index($$ext{indx}) .= $data;
+    return $DATA;
+  }
+	### Case of Delta
+  my @date_prev	= $dataSet->{date} ?	split(m/-/, $dataSet->{date}) : (0,0,0);
+  my @date	=			split m/-/, basename($file,'.dat');
+  if ($date[1] != $date_prev[1]) {
+		### Read first day of the month
+    $FILE	=~ s/\d{2}\.dat/01.dat/;
+    $DATA->flat->index($$ext{indx}) .= readflex($FILE);
+    @date_prev	= (@date[0,1],1);
+  }		### Apply Delta to the previous day(s)
+  for (my $day=$date_prev[2]+1; $day<=$date[2]; $day++) {
+    $FILE	=~ s/\d{2}\.dat/sprintf("%02d",$day).".dat"/e;
+   ($data,$idx) = readflex($FILE) if $FILE ne $file;	# Avoid reading same file again
+    $DATA->flat->index($idx) += $data;
+  }
+
+  return $DATA;
+}
+
+#######################################################################
+
+sub read_dateLayers		### Wrapper function for multi-day runs
+{
+  my ($dataSet, $date, $ext, $spool_dir, $options) = @_;
+  my  $data  = 0;
+  foreach my $day (@$date) {	# map() does not work. Not sure why (?)
+      $data += read_dateLayer($dataSet, $day, $ext, $spool_dir, $options);
+  }
+  return $data/scalar(@$date);	### Average
 }
 
 #######################################################################
@@ -906,7 +1054,7 @@ sub read_GDAL
 
 		### Get NetCDF data compression and NODATA
   my($netcdf_scale, $netcdf_offset, $netcdf_nodata) =
-	 get_NetCDF_compression($file_s, $varName, $processing);
+	 get_netcdf_compression($file_s, $varName, $processing);
   my $nodataStr	=
 	($processing=~m/nodata=([-+e\.\d]+)/i)	? "-srcnodata $1 -dstnodata -9999" :
 	 defined( $netcdf_nodata )		? "-srcnodata $netcdf_nodata -dstnodata $netcdf_nodata" : '';
@@ -982,7 +1130,6 @@ sub read_GDAL
 #######################################################################
 
 sub read_raster
-
 {
   my ($file,$b,$compr) = @_;
       $b	=  1	unless $b;
@@ -990,35 +1137,28 @@ sub read_raster
  (my  $file_s	= $file) =~ s/.+:(.+):.+/$1/;
   die "Requested file (in read_raster)-\n$file_s\ndoes not exist...\n" unless -e $file_s;
 
-  open STDERR, ">&NEWERR";	# Reversed back to OLDERR about 15 lines below (suppresses warnings)
-    my $geotiff_data = Geo::GDAL::Open( $file, 'ReadOnly' );
-
-#     my $geoTransform = $geotiff_data->GetGeoTransform;
-#     my $order = ($$geoTransform[5]>0) ? 1 : -1;
-#     print "Order = $order\n";
-    my $band	= $geotiff_data->GetRasterBand($b);
-
-    my $x_size	= $band->{XSize};
-    my $y_size	= $band->{YSize};
-	# Warning: TIFFReadDirectoryCheckOrder:Invalid TIFF directory; tags are not sorted in ascending order
-    my $bin_data= $band->ReadRaster(0, 0, $x_size, $y_size);
-    my $nodata	= $band->GetNoDataValue;
-       $nodata	= -9999 unless defined $nodata;
+  open STDERR, ">&NEWERR";
+    my $dataset	= Geo::GDAL::FFI::Open( $file, {Flags => ['READONLY']} );
   open STDERR, ">&OLDERR";
+	### Check number of bands in the file
+  my $nBands	= Geo::GDAL::FFI::GDALGetRasterCount($$dataset);
+  die "\nRequested band number <$b> in the file\n   $file_s\nexceeds the file's band count <$nBands>\n" .
+      "   Aborting...\n\n"    if $b > $nBands;	# It cannot be a .tif file from read_GDAL(),
+  my $band	= $dataset->GetBand($b);
+	### Check BIGPDL
+  $PDL::BIGPDL	= 1 if !$PDL::BIGPDL && 7.5e8 <
+	 Geo::GDAL::FFI::GDALGetRasterBandXSize($$band) * Geo::GDAL::FFI::GDALGetRasterBandYSize($$band) *
+	(Geo::GDAL::FFI::Band::pack_char($Geo::GDAL::FFI::data_type2pdl_data_type{$band->GetDataType}))[1];
 
-		### Data types needed for PDL
-  my @data_type = (undef,'byte','ushort','short',undef,'long','float','double',
-	'short','long','float','double');
-  die sprintf("Data type problem in \"read_raster\": %s (%d) is not defined...\n",
-    Geo::GDAL::GetDataTypeName($band->{DataType}),$band->{DataType})
-	unless defined $data_type[$band->{DataType}];
+	### Read band data			# and so it does not need to be removed from /dev/shm/
+  open STDERR, ">&NEWERR";			# Required for $band->Read to suppress warnings
+    my $pdl	= $band->GetPiddle;		# Note, GetPiddle(...) can do resample too
+  open STDERR, ">&OLDERR";
+  my $nodata	= $band->GetNoDataValue;
+     $nodata  //= -9999;
 
-  open(my $FH,"<",\$bin_data) or die "Couldn't open filehabdle to binary data stream, $!";
-  my $pdl = readflex($FH,
-	[{NDims=>2, Dims=>[$x_size,$y_size], Type=>$data_type[$band->{DataType}]}]);
-  close $FH;
 		### Set bad and uncompress data
-  $pdl	= $pdl->setvaltobad($nodata)*$$compr[0]+$$compr[1];
+  $pdl = $pdl->setvaltobad($nodata)*$$compr[0]+$$compr[1];
 
   return $pdl;
 }
@@ -1026,7 +1166,6 @@ sub read_raster
 #######################################################################
 
 sub get_extent
-
 {
   my ($file, $projection, $options) = @_;
   if (ref($projection) eq 'HASH') {			# Shift secondary arguments, if projection is not present
@@ -1035,16 +1174,18 @@ sub get_extent
   }
 		### Options
   my $mask_opt	= set_default($$options{MASK},	1);	# Option to read mask layer
+  my $indx_opt	= set_default($$options{INDEX},	0);	# Option to read 1D index of valid pixels
 
  (my  $file_s	= $file) =~ s/.+:(.+):.+/$1/;
-  $projection	= 'epsg:4326' unless defined $projection;
-  die "Requested file (in get_extent)-\n$file_s\ndoes not exist...\n" unless -e $file_s;
+  $projection //= 'epsg:4326';
+  die "\nRequested file (in get_extent)-\n$file_s\ndoes not exist...\n\n" unless -e $file_s;
 
   my($size,$gT)	= get_geo_transform($file);
-  my $igT	= Geo::GDAL::InvGeoTransform($gT);
-  my @llcorner	= Geo::GDAL::ApplyGeoTransform($gT, 0, $$size[1]);
-  my @urcorner	= Geo::GDAL::ApplyGeoTransform($gT, $$size[0], 0);
-  my %extent	= (	'file'		=> $file_s,
+  my $igT	= InvGeoTransform($gT);
+  my @llcorner	= ApplyGeoTransform($gT, 0, $$size[1]);
+  my @urcorner	= ApplyGeoTransform($gT, $$size[0], 0);
+  my %extent	= (	'file_s'	=> $file_s,
+			'file'		=> $file,
 			'ncols'		=> $$size[0],
 			'nrows'		=> $$size[1],
 			'xllcorner'	=> $llcorner[0],
@@ -1056,9 +1197,14 @@ sub get_extent
 			'cellsizeY'	=>-$$gT[5],
 			'projection'	=> $projection,
 			'gTransform'	=> $gT,
-			'igTransform'	=> $igT,
-			'mask'		=> $mask_opt?read_raster($file):undef);
+			'igTransform'	=> $igT);
 
+	### Add optional keys
+  if ($mask_opt || $indx_opt) {
+    $extent{mask}	= read_raster($file);
+    $extent{indx}	= which($extent{mask}->flat->isgood) if  $indx_opt;
+			delete  $extent{mask}		     if !$mask_opt;
+  }
 #   die "Non-Square pixels in $file..." if $$gT[1] != -$$gT[5];
   return \%extent;
 }
@@ -1066,7 +1212,7 @@ sub get_extent
 sub fill_extent
 {
   my $ext = shift;
-		# Fill extent with maks that does not have nodata values
+		# Fill extent with mask that does not have nodata values
   my %extent = ( 'mask' => ones($$ext{ncols}, $$ext{nrows}) );
   foreach my $key (keys %$ext) {
     next  if $key eq 'mask';
@@ -1082,19 +1228,64 @@ sub get_geo_transform
 {
   my $file = shift;
   open STDERR, ">&NEWERR";
-    my $geotiff_data = Geo::GDAL::Open($file, 'ReadOnly');
+    my $options	= $file =~ m/.+:.+:.+/i ? ['IGNORE_XY_AXIS_NAME_CHECKS=YES'] : [];	# NetCDF specific iptions
+    my $geotiff_data = Geo::GDAL::FFI::Open($file, {Flags => ['READONLY'], Options => $options});
   open STDERR, ">&OLDERR";
+  my $gT = $geotiff_data->GetGeoTransform;
+     $gT = parse_gdalinfo($file) if join('',@$gT) eq '010001';
+		### Check the geotransform to be valid
+  if (join('',@$gT) eq '010001') {
+   (my  $file_s = $file) =~ s/.+:(.+):.+/$1/;
+    die "\nGDAL problem: Failed to read coordinates/geotransform in\n   $file_s\nAborting...\n\n";
+  }
 
-  my $geoTransform = $geotiff_data->GetGeoTransform;
-#   die "Incompatible GeoTransform in $file : ".join(' ',map("[$_] $$geoTransform[$_]",0..5))
-# 	if !$$geoTransform[2] && !$$geoTransform[4] && abs($$geoTransform[1]+$$geoTransform[5]) > 1e-6;
-
-  my $band = $geotiff_data->GetRasterBand(1);
-  my $x_size	= $band->{XSize};
-  my $y_size	= $band->{YSize};
-
-  return [$x_size,$y_size],$geoTransform;
+  return [$geotiff_data->GetBand(1)->GetSize], $gT;
 }
+sub parse_gdalinfo	### Just in case the Geo::GDAL::FFI does not work on WRF output files...
+{
+  my $file = shift();
+  my $str  = &{sub{$_=get_file_path->{gdalinfo}." --config GDAL_NETCDF_IGNORE_XY_AXIS_NAME_CHECKS YES $file";
+		   $_=qx($_); chomp; return($_)}};
+
+  my @pix_size	= ($1,$2) if $str =~ m/Pixel Size = \((\S+),(\S+)\)/;
+  my @ul_corner	= ($1,$2) if $str =~ m/Upper Left\s+\(\s+(\S+),\s+(\S+)\)/;
+
+  return @pix_size && @ul_corner ? [$ul_corner[0],$pix_size[0],0,$ul_corner[1],0,$pix_size[1]] : [0,1,0,0,0,1];
+}
+
+sub InvGeoTransform
+{
+  my $gT  = shift();
+  my $igT = [0,0,0,0,0,0];
+	die "\nFailed to get InvGeoTransform. Aborting...\n\n" unless
+  Geo::GDAL::FFI::GDALInvGeoTransform($gT, $igT);
+  return $igT;
+}
+
+sub ApplyGeoTransform
+{
+  my ($X, $Y) = (0,0);
+  Geo::GDAL::FFI::GDALApplyGeoTransform(@_, \$X, \$Y);
+  return $X, $Y;
+}
+
+#######################################################################
+
+# sub check_BIGPDL
+# {
+  # my $file	= shift;
+		# ### Check memory size of the band layer piddle
+  # open STDERR, ">&NEWERR";
+    # my $bandObj	= Geo::GDAL::FFI::Open($file)->GetBand(1);	# First band will do it
+  # open STDERR, ">&OLDERR";
+  # my $datatype	= $bandObj->GetDataType;
+  # my @bSize	= $bandObj->GetSize;
+  # my $mSize	= $bSize[0] * $bSize[1] *	# * $bytes_per_cell
+	# (Geo::GDAL::FFI::Band::pack_char($Geo::GDAL::FFI::data_type2pdl_data_type{$datatype}))[1];
+		# ### Set BIGPDL, if needed
+  # $PDL::BIGPDL	=  1 if !$PDL::BIGPDL && $mSize > 7.5e8;
+  # return $datatype;
+# }
 
 #######################################################################
 
@@ -1103,12 +1294,12 @@ sub get_bad_value
 {
   my $file = shift;
   open STDERR, ">&NEWERR";
-    my $geotiff_data = Geo::GDAL::Open("$file", 'ReadOnly');
+    my $geotiff_data = Geo::GDAL::FFI::Open("$file", {Flags => ['READONLY']});
   open STDERR, ">&OLDERR";
 
-  my $band	= $geotiff_data->GetRasterBand(1);
+  my $band	= $geotiff_data->GetBand(1);
   my $nodata	= $band->GetNoDataValue;
-     $nodata	= -9999 unless defined $nodata;
+     $nodata  //= -9999;
 
   return $nodata;
 }
@@ -1172,16 +1363,17 @@ sub area_layers
 sub write_cell_area
 {
   my ($c_area, $a_area, $s_area, $flag, $runIO, $grid, $credits,  $year) = @_;
-      $year	= substr($$runIO{Run_Start}, 0, 4) unless defined $year;
+      $year   //= substr($$runIO{Run_Start}, 0, 4);
   my  $FILE	= $$runIO{Area_dir}.'full_cell_area.nc';
   my  $file	= $$runIO{Area_dir}. 'sub_cell_area.nc';
+  my $julian_day= $$runIO{calendar}==360 ? \&calendar360_day : \&Time::JulianDay::julian_day;
 
   if ($flag) {		### Write active and soil area to annual time series NetCDF file
 
     my $BAND	= get_nc_dim($file, 'time');					# Band number in the NC file
     my $band	= $year - substr($$runIO{Run_Start}, 0, 4) + 1;			# Band to write
     unless ($BAND && $BAND == $band) {
-      my $time	= julian_day(1900, 1, 1) - julian_day($year, 6, 30);		# NC time
+      my $time	= &$julian_day(1900, 1, 1) - &$julian_day($year, 6, 30);	# NC time
       write_nc($file, $band, $time, $grid,
 		{active_cell_area => [$a_area,'Active area in a grid cell', 'km2'],
 		   soil_cell_area => [$s_area,  'Soil area in a grid cell', 'km2']},
@@ -1206,7 +1398,7 @@ sub write_cell_area
 sub colRow
 {
   my ($extent,$lon,$lat) = @_;
-  return map(int, Geo::GDAL::ApplyGeoTransform($$extent{igTransform},$lon,$lat));	# (col,row)
+  return map(int, ApplyGeoTransform($$extent{igTransform},$lon,$lat));	# (col,row)
 }
 
 #######################################################################
@@ -1281,7 +1473,7 @@ sub write_tif
 			### Convert extent file to GeoTiff
   prepare_dir( $file );			# Prepare output directory
   open STDERR, ">&NEWERR";
-    my $junk	= `$$PATH{gdal_translate} -q -ot $ot $NODATA $CO -a_srs "$$extent{projection}" $$extent{file} $file`;
+    my $junk	= `$$PATH{gdal_translate} -q -ot $ot $NODATA $CO -a_srs "$$extent{projection}" -b 1 $$extent{file} $file`;
 
 			### Add custom metadata tags
     if ($MO) {	# Custom tags go to XML, if "PROFILE=..." is used. Must do it below
@@ -1291,11 +1483,11 @@ sub write_tif
       move("$file.tmp", $file);			# Move temporary file to its final copy
     }
 			### Replace extent data with the data to write
-    my $geotiff_data = Geo::GDAL::Open($file, 'Update');
-    my $band	= $geotiff_data->GetRasterBand(1);
+    my $geotiff_data = Geo::GDAL::FFI::Open($file, {Flags => [qw/UPDATE/]});
+    my $band	= $geotiff_data->GetBand(1);
     my $nodata	= $band->GetNoDataValue;
-       $nodata	= -9999 unless defined $nodata;
-       $band->WriteRaster(0,0,$$extent{ncols},$$extent{nrows},pack($pack{$ot},$data->setbadtoval($nodata)->list));
+       $nodata//= -9999;
+       $band->SetPiddle($data->setbadtoval($nodata));
   open STDERR, ">&OLDERR";
   unlink $file.'.aux.xml';
 }
@@ -1313,7 +1505,7 @@ sub write_nc
 {
 	# Subroutine input:
   my (	$file,		# Output file path (directory will be created, if it does not exists)
-	$band,		# Band number for the "unlimited dimension" to start writng data to
+	$band,		# Band number for the "unlimited dimension" to start writng data to. Append, if set to zero
 	$time,		# "time" variable to write to the output NetCDF file
 	$grid,		# Reference to an array containg pointers to- [longitude, latitude, geotransform, projection]
 	$data,		# See "Data Notes" above
@@ -1338,6 +1530,7 @@ sub write_nc
 	###	Update existing NetCDF file/dataset
 
   if (-e $file) {
+    $band  = get_nc_dim($file, 'time') + 1	unless $band;		# Append. Do not update
 			### Open NetCDF file and write data
     my $nc = new PDL::NetCDF($file, {MODE => O_RDWR, REVERSE_DIMS => 1});
        $nc->putslice('time', [], [], [$band-1], [long($time)->dim(0)], long($time)) if defined $time;
@@ -1352,16 +1545,18 @@ sub write_nc
 	###############################################################
 	###	Create new NetCDF file/dataset
 
-  die "\nNot coded to create NetCDF file with BAND # gt 1 for file-\n\t$file\nIt is $band...\n\n" if $band != 1;
 			### Calendar metadata string
   my %calendar_str = (366 => 'standard', 365 => '365_day', 360 => '360_day');
-			### Prepare output directory
+			### Prepare output directory and band number
   prepare_dir($file);
+  $band		= 1	unless $band;
+  die "\nNot coded to create NetCDF file with BAND # gt 1 for file-\n\t$file\nIt is $band...\n\n" if $band != 1;
+
 			###  Prepare georeferencing
   my($lon, $lat, $gT, $proj)	= @$grid;
   my $proj_crs	= crs_to_Obj($proj);
-  my $wkt	= $proj_crs->ExportToWkt;		### Convert to Wkt fromat
-  my($xVr,$yVr)	= $proj_crs->IsGeographic ? qw(lon lat) : qw(x y);
+  my $wkt	= $proj_crs->Export('Wkt');		### Convert to Wkt fromat
+  my($xVr,$yVr)	= Geo::GDAL::FFI::OSRIsGeographic($$proj_crs) ? qw(lon lat) : qw(x y);
 
 			###  Prepare variables
   my @var_name	= sort {$$data{$a}[4] <=> $$data{$b}[4] if defined $$data{$a}[4]} keys %$data;
@@ -1393,21 +1588,22 @@ sub write_nc
 	'srs_ref'	=> $proj,
 	'srs_wkt'	=> $wkt,		### Attribute name convention used by CF
 	'spatial_ref'	=> $wkt,		### Attribute name convention used by GDAL
-	'GeoTransform'	=> join(' ', @$gT)
+	'GeoTransform'	=> join(' ', @$gT)#,
+#   'grid_mapping_name' => ''			### TBD - required (?) by CF-1.8; What is this?
   );
 
-  my %lon_att	= $proj_crs->IsGeographic ? (
+  my %lon_att	= Geo::GDAL::FFI::OSRIsGeographic($$proj_crs) ? (
 	'units'		=> 'degrees_east',	'long_name'	=> 'longitude',	'standard_name' => 'longitude') : (
 	'units'		=> 'meters',		'long_name'	=> 'x coordinate of projection',
 	'standard_name' => 'projection_x_coordinate' );
 
-  my %lat_att	= $proj_crs->IsGeographic ? (
+  my %lat_att	= Geo::GDAL::FFI::OSRIsGeographic($$proj_crs) ? (
 	'units'		=> 'degrees_north',	'long_name'	=> 'latitude',	'standard_name' => 'latitude' ) : (
 	'units'		=> 'meters',		'long_name'	=> 'y coordinate of projection',
 	'standard_name' => 'projection_y_coordinate' );
 
   my @global_att= (
-	['Conventions',		'CF-1.6'],
+	['Conventions',		'CF-1.8'],
 	['history',		'Created on '.date_now()." by $$credits[1] ($$credits[2])"],
 	['NetCDF_driver',	'NetCDF.' . $PDL::NetCDF::VERSION],
 	['institution',		 $$credits[3]],
@@ -1473,44 +1669,6 @@ sub get_nc_dim		### Get dimension size by dimension name
 
 #######################################################################
 
-sub get_NetCDF_compression
-
-{
-  my ($file,$var_name,$processing) = @_;
-  my ($scale,$offset,$nodata) = (1,0,undef);
-  return ($scale,$offset,$nodata) unless $file =~ m/\.nc$/i && $var_name;
-
-  my $ncobj	= PDL::NetCDF->new ($file, {MODE => O_RDONLY});
-		### Check that variable exists
-  unless ($var_name ~~ @{$ncobj->getvariablenames()}) {
-  (my  $file_s = $file) =~ s/.+:(.+):.+/$1/;
-    die "\nRequested variable \"$var_name\" is not found in the NetCDF file:\n   $file_s\n\tAborting...\n\n";
-  }
-		### Get variable Attributes
-  my %att	= map(($_ => $ncobj->getatt($_,$var_name)), @{$ncobj->getattributenames($var_name)});
-  $ncobj->close();
-
-  $scale  = $att{scale_factor} ->at(0)	if defined $att{scale_factor};
-  $offset = $att{add_offset}   ->at(0)	if defined $att{add_offset};
-		### Find Nodata in the NEtCDF file or from "Processing" attribute
-  if (defined($processing) && $processing =~ m/nodata=([-+e\.\d]+)/i) {
-    $nodata = $1;
-  } else {
-    $nodata = $att{_FillValue}   ->at(0)	if defined $att{_FillValue};
-    $nodata = $att{missing_value}->at(0)	if defined $att{missing_value} && !defined($att{_FillValue});
-  }
-
-  die "\nNodata value is not found for $var_name variable in the NetCDF file:\n\t$file\n".
-	"It can be set/forced using:\n\t".
-	"1. NetCDF attribute editor, e.g. \"ncatted  -h -O -a _FillValue,$var_name,a,f,-9999 FILE\"\n\t".
-	"2. Using \"nodata\" key in \"Processing\" attribute for this dataset in the MT DB\n\tAborting...\n\n"
-		unless defined $nodata;
-
-  return ($scale,$offset,$nodata);
-}
-
-#######################################################################
-
 sub GDAL_test
 {
   my $test_dir	= shift;
@@ -1548,13 +1706,9 @@ sub GDAL_test
 	unless ($raster > 0)->sum == 323;
 
 	##########     Check NetCDF-4       ###########################
-
-  open STDERR, ">&NEWERR";
-  { my $geotiff_data	= Geo::GDAL::Open( $file_b1, 'ReadOnly' );
-    my $band		= $geotiff_data->GetRasterBand(1);
-    my $x_size		= $band->{XSize};
-    my $y_size		= $band->{YSize};
-    eval { my $bin_data	= $band->ReadRaster(0, 0, $x_size, $y_size); };
+  {
+    open STDERR, ">&NEWERR";
+      eval { my $data	= Geo::GDAL::FFI::Open($file_b1,{Flags=>['READONLY']})->GetBand(1)->Read; };
     open STDERR, ">&OLDERR";
     die  "\n   GDAL test failed: GDAL cannot read NetCDF-4 file-\n   $file_b1\n   Aborting...\n\n" if $@;
   }
@@ -1619,7 +1773,7 @@ sub unpdl_scalars
 {
   my @arr;
   foreach my $var (@_) {
-    push @arr, (ref($var) eq 'PDL' ? $var->at(0) : $var);
+    push @arr, (ref($var) eq 'PDL' ? $var->nelem==1 ? $var->at(0) : 'PDL' : $var);
   }
 
   return @arr;
@@ -1689,7 +1843,7 @@ sub check_circularityC
     } until $route[0][0] == $route[-1][0] && $route[0][1] == $route[-1][1];
 
     my  $route		= join("\n\t",map(join("\t",@$_),@route));
-    my ($lon,$lat)	= Geo::GDAL::ApplyGeoTransform( $gT, $route[0][0]+0.5, $route[0][1]+0.5 );
+    my ($lon,$lat)	= ApplyGeoTransform( $gT, $route[0][0]+0.5, $route[0][1]+0.5 );
 
     die <<END;
 
@@ -1739,7 +1893,7 @@ sub check_circularity
 	if (defined $route{$route_to}) {		### Circularity check
 	  shift @flow while ($flow[0][0].'_'.$flow[0][1] ne $route_to);
 	  my $route	= join("\n\t",map(join("\t",@$_),@flow[ grep {$_ & 1} 1..$#flow ],$flow[-1]));
-	  my ($lon,$lat)= Geo::GDAL::ApplyGeoTransform($gT,$col_to+0.5,$row_to+0.5);
+	  my ($lon,$lat)= ApplyGeoTransform($gT,$col_to+0.5,$row_to+0.5);
 
 	  die <<END;
 
@@ -1923,6 +2077,7 @@ sub add_connectivity
 {
   my ($runSet, $cell_area)	= @_;
   my ($runIO,  $meta, $extent)	= @$runSet;
+  my  $julian_day= $$runIO{calendar}==360 ? \&calendar360_day : \&Time::JulianDay::julian_day;
 
 	############################################
 		###  Read or Build Cell Table
@@ -1938,8 +2093,8 @@ sub add_connectivity
   my  $igT		= $$extent{igTransform};
   die "Connectivity Database file does not exist-\n$input{File}\n\tAborting...\n\n"    unless -e $input{File};
   die "\nConnectivity data input block seems to be in a wrong format. Aborting...\n\n" unless
-		defined($input{File}) &&  defined($input{SkipLines});
-  my ($header,@table)   = read_table($input{File},$input{SkipLines});
+		defined($input{File}) && defined($input{SkipLines});
+  my ($header,@table)   = read_table($input{File}, {SKIP=>$input{SkipLines},CHECK_ASCII=>0});
   return (0,[pdl(),pdl(),pdl()],$cell_table,$up_area) unless scalar(@table);
 
 				### Convert PDL cell table to Perl array
@@ -1950,7 +2105,7 @@ sub add_connectivity
   my @route;			### Connectivity data
   my @missingYear_list;
   my @lockSkipYear_list;
-  my $lock_year		= isNumber($input{Lock_Year}) ? julian_day($input{Lock_Year},7,1) : 0;
+  my $lock_year		= isNumber($input{Lock_Year}) ? &$julian_day($input{Lock_Year},7,1) : 0;
   foreach my $row (@table)
   {
     next unless $$row[$$header{$input{Use}}];
@@ -1960,8 +2115,8 @@ sub add_connectivity
 			### Coords
     my @coord_from  = ($$row[$$header{$input{FromLon}}], $$row[$$header{$input{FromLat}}]);	# From Lon/Lat
     my @coord_to    = ($$row[$$header{$input{ToLon}}],   $$row[$$header{$input{ToLat}}]);	# To   Lon/Lat
-    my @colRow_from = map(POSIX::floor($_), Geo::GDAL::ApplyGeoTransform($igT,@coord_from));
-    my @colRow_to   = map(POSIX::floor($_), Geo::GDAL::ApplyGeoTransform($igT,@coord_to));
+    my @colRow_from = map(POSIX::floor($_), ApplyGeoTransform($igT,@coord_from));
+    my @colRow_to   = map(POSIX::floor($_), ApplyGeoTransform($igT,@coord_to));
 
 					# Check if coords are in bounds
     next if $colRow_from[0] < 0 || $colRow_from[0] >= $$extent{ncols} ||
@@ -1975,8 +2130,8 @@ sub add_connectivity
     my $PercentFlow = $$row[$$header{$input{PercentFlow}}]	|| 0;
     my $MinFlow     = $$row[$$header{$input{MinFlow}}]		|| 0;
     my $MaxFlow     = $$row[$$header{$input{MaxFlow}}]		|| 0;		# Default EndYear = 3000-12-31
-    my $StartYear   = $$row[$$header{$input{StartYear}}] =~ m/(\d{4}-\d{2}-\d{2})/ ? julian_day(split m/-/,$1) : 0;
-    my $EndYear     = $$row[$$header{$input{EndYear}}]   =~ m/(\d{4}-\d{2}-\d{2})/ ? julian_day(split m/-/,$1) : 0;
+    my $StartYear   = $$row[$$header{$input{StartYear}}] =~ m/(\d{4}-\d{2}-\d{2})/ ? &$julian_day(split m/-/,$1) : 0;
+    my $EndYear     = $$row[$$header{$input{EndYear}}]   =~ m/(\d{4}-\d{2}-\d{2})/ ? &$julian_day(split m/-/,$1) : 0;
 		### Use routes that are active on the Lock Year for all dates in the run, if requested
     ($StartYear, $EndYear) = $StartYear<$lock_year && $EndYear>$lock_year ? (1, 1e8) : (-1, -1) if $lock_year;
     if ($StartYear==0 || $EndYear==0) {
@@ -2179,7 +2334,7 @@ sub diversion_yr_total
 
 {
   my ($diversion,$rtDiv,$date,$runIO,$route,$dt) = @_;
-  return  unless $$runIO{ConnectivityNetwork};
+  return  unless $$runIO{ConnectivityNetwork} && ref($route) eq 'ARRAY';
 
 		### Create file directory
   my $dir_out	= $$runIO{Output_dir} . '/diversion';
@@ -2212,9 +2367,69 @@ sub diversion_yr_total
 sub aquifer_summary
 
 {
-  my ($aqfType, $aqf_data, $date, $runIO, $compP, $compIrr) = @_;
+  my ($aqfType, $aqf_data, $date, $runIO, $compP, $compIrr,$aIdx) = @_;
   return unless $aqfType;
-		# Removed from public domain
+  my $typeStr = $aqfType == 1 ? 'virtual' : 'lumped';
+
+		### Create file directory
+  my $dir_out	= $$runIO{Output_dir} . '/aquifer';
+#   unless (-e $dir_out) { mkpath($dir_out,0,0775) or die "Cannot create-\n$dir_out\n"; }
+
+	### Processing output for each aquifer (loop)
+  foreach my $aqf_ID (keys %$aqf_data) {
+
+		### Create file header
+    my $file	= "$dir_out/balance_"	. "$typeStr\_$aqf_ID.csv";
+    my $fileP	= "$dir_out/compP_"	. "$typeStr\_$aqf_ID.csv";
+    my $fileIrr	= "$dir_out/compIrr_"	. "$typeStr\_$aqf_ID.csv";
+    unless (-e $file) {
+      my @hdr	= qw(Date aqf_ID Storage_km3 Volume_km3 Storage_Frac Head Err Aqf_Num_Delta_m3
+	Recharge sinkIn IrrIn InfIn drnIn bflIn Discharge absOut sprOut drnOut bflOut Balance_m3);
+      open (FILE,">$file") or die "Couldn't open $file, $!";
+	print FILE join("\t",@hdr), "\n";
+      close FILE;
+    }
+    if ($compP->dims && !(-e $fileP)) {
+      my @hdr	= qw(Date aqf_ID Snow Glacial Rain Extra);
+      open (FILE,">$fileP") or die "Couldn't open $fileP, $!";
+	print FILE join("\t",@hdr), "\n";
+      close FILE;
+    }
+    if ($compIrr->dims && !(-e $fileIrr)) {
+      my  @hdr	= qw(Date aqf_ID Pristine Irrigation Dom_Ind_Lsk Relict);
+      pop @hdr if $compIrr(,,,($aIdx($aqf_ID)))->dim(2) == 3;		# Case of $compSwitch[3]
+      open (FILE,">$fileIrr") or die "Couldn't open $fileIrr, $!";
+	print FILE join("\t",@hdr), "\n";
+      close FILE;
+    }
+		### Prepare values to output
+    my $rechg	=  List::Util::sum(map($$aqf_data{$aqf_ID}{$_},qw(sinkIn IrrIn  InfIn  drnIn bflIn)));
+    my $disch	=  List::Util::sum(map($$aqf_data{$aqf_ID}{$_},qw(absOut sprOut drnOut bflOut)));
+    my $balance	= ($rechg - $disch) - ($$aqf_data{$aqf_ID}{Storage} - $$aqf_data{$aqf_ID}{StoragePREV});
+
+		### Save aquifer data
+    open (FILE,">>$file") or die "Couldn't open $file, $!";
+      print FILE join("\t", $date, $aqf_ID,
+	$$aqf_data{$aqf_ID}{Storage}*1e-9, $$aqf_data{$aqf_ID}{Volume}*1e-9,
+	$$aqf_data{$aqf_ID}{Storage} / $$aqf_data{$aqf_ID}{Capacity},
+	$$aqf_data{$aqf_ID}{Head},         $$aqf_data{$aqf_ID}{Err},      $$aqf_data{$aqf_ID}{numDelta}, $rechg,
+	map($$aqf_data{$aqf_ID}{$_},qw(sinkIn IrrIn  InfIn  drnIn bflIn)),$disch,
+	map($$aqf_data{$aqf_ID}{$_},qw(absOut sprOut drnOut bflOut)),     $balance), "\n";
+    close FILE;
+
+		### Save Primary components
+    if ($compP->dims) {
+      open (FILE,">>$fileP") or die "Couldn't open $fileP, $!";
+	print FILE join("\t", $date, $aqf_ID, $compP(,,,($aIdx($aqf_ID)))->list), "\n";
+      close FILE;
+    }
+		### Save Irrigation and Water use components
+    if ($compIrr->dims) {
+      open (FILE,">>$fileIrr") or die "Couldn't open $fileIrr, $!";
+	print FILE join("\t", $date, $aqf_ID, $compIrr(,,,($aIdx($aqf_ID)))->list), "\n";
+      close FILE;
+  } }
+  return 1;
 }
 
 #######################################################################
@@ -2375,7 +2590,7 @@ sub write_balance_files
   for (my $i=0; $i<scalar(@$files); $i++) {
     my  $irr_Flag	= $$files[$i]=~m/_Irrigation(_\d+)*\.csv$/ ? 1 : 0;
     map $$bal{$_.'_delta'}[$i] = $$bal{$_}[$i] - $$bal{$_.'_prev' }[$i], @$storages;
-    $$bal{Balance}[$i]	= List::Util::sum(map($$bal{$_.'_delta'}[$i], @$storages),
+    $$bal{Balance}[$i]	= List::Util::sum(0, map($$bal{$_.'_delta'}[$i], @$storages),
 	map($$bal{$_}[$i]*($_ eq 'Net' && $irr_Flag ? 0 : $fluxDir{$_}), @$fluxes));
 
     open (FILE,">>$$files[$i]") or die "Couldn't open $$files[$i], $!";
@@ -2391,6 +2606,7 @@ sub add_reservoirs
 {
   my ($runSet, $meta, $cell_area, $cell_ind, $save) = @_;
   my ($runIO,  $junk, $extent) =  @$runSet;
+  my  $julian_day= $$runIO{calendar}==360 ? \&calendar360_day : \&Time::JulianDay::julian_day;
 
   my(@reservoir, %resStack, $damID);
   my @resStack		= (-1);	# First dam does not exist (-1 row in the Cell Table)
@@ -2399,8 +2615,8 @@ sub add_reservoirs
   print "Initialization of datasets for reservoirs and dams...\n";
 
   my  @report	= ((0) x 10);			# Summary report
-  my  $startDate= julian_day(split m/-/,$$meta{Start_Date});
-  my  $endDate	= julian_day(split m/-/,$$meta{End_Date});
+  my  $startDate= &$julian_day(split m/-/,$$meta{Start_Date});
+  my  $endDate	= &$julian_day(split m/-/,$$meta{End_Date});
 
 	############################################
 		###  Read or Build Cell Table
@@ -2415,8 +2631,8 @@ sub add_reservoirs
 		### Read raw Dam Database
   die "\nReservoirs dam DB file does not exist:\n$input{File}\n\tAborting...\n\n"   unless -e $input{File};
   die "\nReservoir data input block seems to be in a wrong format. Aborting...\n\n" unless
-		defined($input{File}) &&  defined($input{SkipLines});
-  my ($header,@table)	= read_table($input{File},$input{SkipLines});
+		defined($input{File}) && defined($input{SkipLines});
+  my ($header,@table)	= read_table($input{File}, {SKIP=>$input{SkipLines},CHECK_ASCII=>0});
   die "\nNo Data in the Reservoirs dam DB file:\n\t$input{File}\nAborting...\n\n" unless @table;
 		### Read dam operating parameters
   my ($hdr,@parTable)	= read_table($input{damUseParams}) if $input{damUseParams};
@@ -2512,17 +2728,18 @@ sub add_reservoirs
     open (FILE_D,">$damSubsetFile_D") or die "Couldn't open $damSubsetFile_D, $!";
     print FILE_D   $hdr,"\tFilter\tDB_value\n";					# Print header
   }
-  my  $lock_year	= isNumber($input{Lock_Year}) ? julian_day($input{Lock_Year},7,1) : 0;
+  my  $lock_year	= isNumber($input{Lock_Year}) ? &$julian_day($input{Lock_Year},7,1) : 0;
   my  $search_mtch	= set_default($input{search_tolerance},	0.4);	# Tolerance to catchment mismatch
   my  $search_dist	= set_default($input{search_dist},	5.0);	# Default is 5 km radius search
   my  $search_pix	= floor($search_dist / sqrt($cell_area))->long->lclip(1);
 								### Convert search radius to pixels (1 pix min)
   foreach my $ROW (@table) {
+    $$ROW[$$header{$input{StartYear}}] = 0 unless $$ROW[$$header{$input{StartYear}}];	# StartYear default
 			### Data
       ($damID	= $$ROW[$$header{$input{ID}}]) =~ s/^\s+|\s+$//g;		# Dam ID (trim string)
     my @coord	=($$ROW[$$header{$input{Lon}}], $$ROW[$$header{$input{Lat}}]);	# Lon/Lat
 				# Check if coords are in bounds
-    my ($col,$row) = map(POSIX::floor($_), Geo::GDAL::ApplyGeoTransform($igT,@coord));
+    my ($col,$row) = map(POSIX::floor($_), ApplyGeoTransform($igT,@coord));
     if ($col < 0 || $col >= $$extent{ncols} ||
 	$row < 0 || $row >= $$extent{nrows} || $up_area($col,$row)->isbad->sum)
     {$report[0]++; next}
@@ -2537,9 +2754,9 @@ sub add_reservoirs
     my $upstr	= $$ROW[$$header{$input{CatchArea}}];			# Upstream area, km2
     my $capcty	= $$ROW[$$header{$input{Capacity}}] * 1e6;		# Capacity, m3
     my $sf_area	= $$ROW[$$header{$input{Area}}]     * 1e6;		# Surface area, m2
-    my $dateStr	= julian_day($$ROW[$$header{$input{StartYear}}],7,1);	# Start date
+    my $dateStr	= &$julian_day($$ROW[$$header{$input{StartYear}}],7,1);	# Start date
     my $dateEnd	= defined $input{EndYear} && $$ROW[$$header{$input{EndYear}}] > 0 ?
-       julian_day($$ROW[$$header{$input{EndYear}}],1,1) : 2816788;	# End date. Default (3000-01-01)
+       &$julian_day($$ROW[$$header{$input{EndYear}}],1,1) : 2816788;	# End date. Default (3000-01-01)
     my $purpose	= $$ROW[$$header{$input{Purpose}}] || 'Undefined';	# Perpose/Use of the dam
     if($capcty <= $min_capacity) {
       $report[2]++;
@@ -2565,7 +2782,7 @@ sub add_reservoirs
     if (exists $$header{ForceTo_Lon}  && exists $$header{ForceTo_Lat} &&
 	 $$ROW[$$header{ForceTo_Lon}] &&  $$ROW[$$header{ForceTo_Lat}]) {
       @coord		= ($$ROW[$$header{ForceTo_Lon}], $$ROW[$$header{ForceTo_Lat}]);	# Lon/Lat
-     ($col,$row)	= map(POSIX::floor($_), Geo::GDAL::ApplyGeoTransform($igT,@coord));
+     ($col,$row)	= map(POSIX::floor($_), ApplyGeoTransform($igT,@coord));
       die "ForceTo location for dam ID=\"$damID\" (Lon,Lat)=($coord[0],$coord[1]) is outside of the Network domain.\n" .
 	  "Aborting...\n\n"	if ($col < 0 || $col >= $$extent{ncols} ||
 				    $row < 0 || $row >= $$extent{nrows} || $up_area($col,$row)->isbad->sum);
@@ -2582,7 +2799,7 @@ sub add_reservoirs
 	my $r		= int $search[2]/$box_dim;		### $search[2] is minimum
 	my $c		= $search[2] -$r*$box_dim;
 	  ($col,$row)	=($col+$c-$radius, $row+$r-$radius);
-	  @coord		= Geo::GDAL::ApplyGeoTransform($$extent{gTransform},$col,$row);
+	  @coord		= ApplyGeoTransform($$extent{gTransform},$col,$row);
 	  @snappedTo	=(@coord, sprintf("%.1f",$up_area->at($col,$row)));
 			### Check if search is successful
 	if($search[0] > $search_mtch*$UPSTR) {			### Allow NN % difference
@@ -2682,7 +2899,8 @@ sub add_reservoirs
   my $resv_data	= long  ([map([@$_[3.. 7]], @reservoir)]);	# Reservoir Col, Row, Dates
   my $resv_pars	= double([map([@$_[8..21]], @reservoir)]);	# Rule parameters
 
-  save_ReservoirStats(\@reservoir, $extent, $endDate, $$runIO{spool}.fileBaseName($input{File})) unless $$runIO{noOutput};
+  save_ReservoirStats(\@reservoir,$extent,$endDate,substr($$meta{End_Date},0,4),$$runIO{spool}.fileBaseName($input{File}))
+	unless $$runIO{noOutput};
 
   return \@reservoir, [$resv_data,$resv_pars,long(\@resStack)], \%input;
 }
@@ -2795,7 +3013,7 @@ sub save_damOverlap
     map $overlap{$_} = $str,		@IDs;
   }
 		### Save dam overlap information to the file
-  my ($hdr, @dams)	= read_table($file);
+  my ($hdr, @dams)	= read_table($file, {CHECK_ASCII=>0});
   my  $header		= join "\t", sort({$$hdr{$a} <=> $$hdr{$b}} keys(%$hdr));
   open (FILE,">$file") or die "Couldn't open $file, $!";
     print FILE $header,"\n";
@@ -2810,9 +3028,8 @@ sub save_damOverlap
 
 sub save_ReservoirStats
 {
-  my ($damData, $extent, $jdate, $file)	= @_;
-  my  @date = inverse_julian_day($jdate);
-  $file    .= "_$date[0]";
+  my ($damData, $extent, $jdate, $year, $file)	= @_;
+  $file    .= "_$year";
   return if -e $file.'_count.tif';
 
   my ($rMethod, $rCount, $rCap, $rArea) = cumulative_Reservoir($damData, $jdate,
@@ -2845,6 +3062,20 @@ sub cumulative_Reservoir
 
 #######################################################################
 
+sub muskingum_Mask		# Storage mask for Muskingum routing
+{
+  my ($extent, $reservoir, $routingMethod) = @_;
+
+  return ones($$extent{ncols},$$extent{nrows})->copybad($$extent{mask})
+	if $routingMethod !~ m/Muskingum/;
+
+  my $mask = zeroes($$extent{ncols},$$extent{nrows})->copybad($$extent{mask});
+     $mask->index2d($$reservoir[0]->((0),),$$reservoir[0]->((1),)) .= 1	if $$reservoir[0]->dims;
+  return $mask;
+}
+
+#######################################################################
+
 sub add_DIN_WWPT
 	### Add Dissolved Inorganic Nitrogen (DIN) from Waste Water Treatment Plants (WWTP)
 {
@@ -2864,7 +3095,7 @@ sub add_DIN_WWPT
     my $t_level	= $$ROW[$$hdr{$$param{t_level}}];				# WWTP treatment technology level
     if ($popYear < 0) {$report[1]++; next}
 				# Check if coords are in bounds
-    my ($col,$row) = map(POSIX::floor($_), Geo::GDAL::ApplyGeoTransform($$extent{igTransform},@coord));
+    my ($col,$row) = map(POSIX::floor($_), ApplyGeoTransform($$extent{igTransform},@coord));
     if ($col < 0 || $col >= $$extent{ncols} ||
 	$row < 0 || $row >= $$extent{nrows} || $up_area($col,$row)->isbad->sum)
     {$report[0]++; next}	### Report-0: Out of bounds
@@ -2900,10 +3131,87 @@ sub springs_init
 
 {
   my($runSet, $aqf_type, $aqf_data)	= @_;
-  my(%spr_data, %snk_data);
+  my($runIO,  $junk,     $extent)	= @$runSet;
+  my @count	= ((0) x 8 );
 
 	### Initializations
-  return \%spr_data, \%snk_data, 0;	# Removed from public domain
+  return undef unless $$runIO{Springs};
+  print "Initialization of datasets for springs model...\n";
+  die "\nSprings sites attribute file does not exists-\n\t$$runIO{Springs}\n  Aborting...\n\n" unless -e $$runIO{Springs};
+
+	### Read Springs/Karst data. "Spr_File" header must be by convention (see Instructions)
+  my %spr_data	= read_table_hash($$runIO{Springs}, 'ID');
+	### Filter %spr_data by the simulation spatial domain
+  foreach my $site (keys %spr_data) {
+    my ($col, $row)	  = colRow($extent,$spr_data{$site}{Lon},$spr_data{$site}{Lat});
+    if ($col >= 0 && $col < $$extent{ncols} &&
+	$row >= 0 && $row < $$extent{nrows} && $$extent{mask}->($col,$row)->isgood) {
+     ($spr_data{$site}{Col}, $spr_data{$site}{Row}) =  ($col,$row);
+      $count[5]++; } else {
+      $count[0]++;	delete $spr_data{$site};
+  } }
+  unless ($count[5]) {
+    printf "Springs/Karst are NOT initialized due to lack of sites inside the spatial domain:
+	Sites outside of the spatial domain-	%d\n\n", $count[0];
+    return undef;
+  }
+	### Filter %spr_data by the aquifer spatial domain
+  foreach my $site (keys %spr_data) {
+    my  $Aqf_ID	= $$aqf_data{aquiferID}->at($spr_data{$site}{Col}, $spr_data{$site}{Row});
+    if ($Aqf_ID) {$spr_data{$site}{Aqf_ID} = $Aqf_ID;	}
+    else	 {$count[1]++;	delete $spr_data{$site};}
+  }
+	### Filter %spr_data by checking aquifer IDs for aquifer drain sites
+  foreach my $site (keys %spr_data) {
+    if (isNumber ( $spr_data{$site}{AquiferDrain}) ) {
+      if ($aqf_type == 3) { delete $spr_data{$site}; next; }			# No aquifer drains in ModFlow aquifers
+      $spr_data{$site}{AquiferDrain}	= int $spr_data{$site}{AquiferDrain};	# Convert to integer ID
+      unless ($spr_data{$site}{AquiferDrain} ~~ keys(%$aqf_data)) {		# Check if aquifer ID exists
+	$count[1]++;	delete $spr_data{$site};
+  } } }
+  unless (scalar(keys(%spr_data))) {
+    print "Springs/Karst are NOT initialized due to lack of spring sites over aquifers inside the spatial domain...\n\n";
+    return undef;
+  }
+
+	### Split %spr_data to springs and sinks
+	# assuming all negative discharge values in the springs table are Sinks TO the aquifer
+  my %snk_data;
+  foreach my $site (keys %spr_data) {
+    if ($spr_data{$site}{Discharge} < 0) {
+	$snk_data{$site}	=      $spr_data{$site};
+	$snk_data{$site}{Infil}	= -1 * $snk_data{$site}{Discharge};	# Infiltration, fraction
+	$snk_data{$site}{INFIL}	=  0;					# Infiltration, m3/sec
+	delete $snk_data{$site}{Discharge};
+	delete $spr_data{$site};
+  } }
+
+	### Calculate conductance from Discharge input for springs in Lumped aquifers
+  if ($aqf_type > 1) {
+    foreach my $site (keys %spr_data) {
+      my $aqf_top = $$aqf_data{$spr_data{$site}{Aqf_ID}}{BaseElev} + $$aqf_data{$spr_data{$site}{Aqf_ID}}{Thickness};
+      if($spr_data{$site}{Elevation} < $aqf_top) {
+	 $spr_data{$site}{Conduct}   = $spr_data{$site}{Discharge} / ($aqf_top - $spr_data{$site}{Elevation});
+      }
+      else { delete $spr_data{$site}; }
+  } }
+	$count[2]  = scalar(keys %spr_data);
+	$count[3]  = scalar(keys %snk_data);
+	$count[4]  = List::Util::sum(map(isNumber($spr_data{$_}{AquiferDrain}),keys(%spr_data)));
+	$count[5]  = List::Util::sum(@count[2..4]);
+  map	$count[6] += $spr_data{$_}{Discharge}, keys %spr_data;		# Total discharge
+	$count[7]  = $count[6] * 365 * 24 * 3600 * 1e-9;
+
+  printf "   Springs/Karst initialization summary:
+	Sites outside of the spatial domain-	%d
+	Sites outside of the aquifer domain-	%d
+	Sites for springs-			%d
+	Sites for aquifer sinks-		%d
+	Sites for aquifer drains-		%d
+	Total number  of sites-			%d
+	Total max discharge from sites-		%.2f m3/sec (%.2f km3/yr)\n\n", @count;
+
+  return \%spr_data, \%snk_data, $count[7];
 }
 
 #######################################################################
@@ -2911,8 +3219,92 @@ sub springs_init
 sub usgs_init
 
 {
+  my($runSet, $cell_ind)	= @_;
+  my($runIO,  $junk,  $extent)	= @$runSet;
+  my $run_start	= $$runIO{Spinup}{Start} && $$runIO{Spinup}{Start} lt $$runIO{Run_Start} && !$$runIO{Spinup}{State_ID} ?
+		  $$runIO{Spinup}{Start} :  $$runIO{Run_Start};
+  my $julian_day= $$runIO{calendar}==360 ? \&calendar360_day : \&Time::JulianDay::julian_day;
+  my $jdate	= &$julian_day(split(m/-/,   $run_start));
+  my @count	= ((0) x 6);
+
 	### Initializations
-  return undef;		# Removed from public domain
+  return undef unless $$runIO{USGS};
+  die "\nUSGS sites attribute file does not exists-\n\t$$runIO{USGS}\n  Aborting...\n\n" unless -e $$runIO{USGS};
+  print "Initialization of datasets for USGS data assimilation...\n";
+
+	### Read USGS data attributes. "USGS_ID_File" header must be by convention (see Instructions)
+  my %usgs_data	= read_table_hash($$runIO{USGS}, 'site_no');
+	### Filter %usgs_data by the simulation spatial domain
+  foreach my $site (keys %usgs_data) {
+    my ($col, $row)	  = colRow($extent,$usgs_data{$site}{pixLon},$usgs_data{$site}{pixLat});
+    if ($col >= 0 && $col < $$extent{ncols} &&
+	$row >= 0 && $row < $$extent{nrows} && $$extent{mask}->($col,$row)->isgood) {
+      if ($usgs_data{$site}{match}) {
+         ($usgs_data{$site}{Col}, $usgs_data{$site}{Row}) = ($col,$row);
+		$count[5]++; }
+      else {	$count[1]++;	delete $usgs_data{$site}; }
+    } else {	$count[0]++;	delete $usgs_data{$site}; }
+  }
+  unless ($count[5]) {
+    printf "USGS data are NOT initialized due to lack of sites inside the spatial domain:
+	Sites outside of the spatial domain and catchment mismatch- %d\n\n", $count[0]+$count[1];
+    return undef;
+  }
+
+	### Read USGS data
+  my $data_dir	= dirname($$runIO{USGS}).($$runIO{Output_TS} =~ m/daily\{/ ? '/hourly' : '/daily');
+SITE:
+  foreach my $site (keys %usgs_data) {
+    my $file	= "$data_dir/00060/$usgs_data{$site}{State}/$site.csv";
+    unless (-e $file) { $count[2]++;	delete $usgs_data{$site};	next; }
+
+    my %data;
+    my $text	= htm_template($file);
+    my @lines	= split m/\n/,$text;
+       @lines	= map [split "\t",$_], @lines;
+    foreach my $rec (@lines) {
+#     next unless $$rec[1] =~ m/$run_start/;		### Use this line for the retro-forecast mode only
+      next if $$rec[1]  lt  $run_start;				### Skip records by date
+      next unless isNumber($$rec[2]);				### Skip records if data is not numeric
+      if ( $$rec[2] < 0) {					### Yes, some USGS flows are negative (tides)
+	if(defined $$rec[3] && $$rec[3] =~ m/^A/) {
+	  $count[3]++;	delete $usgs_data{$site};	next SITE;
+	}
+	else { next; }
+      }
+      $data{$$rec[1]}	=  $$rec[2];				### Read it
+    }
+    if (%data)  { $usgs_data{$site}{data}  = \%data;
+		  $usgs_data{$site}{delta} = 0 ;
+		  $usgs_data{$site}{date}  = '';
+		  $usgs_data{$site}{jDate} = 0 ; }
+    else { delete $usgs_data{$site};	$count[2]++; }
+  }
+	### Filter USGS sites to allow only one (largest) site per cell
+  my %duplicate;
+  foreach my $site (keys %usgs_data) {
+    my $cell	= $usgs_data{$site}{Col} . '_' . $usgs_data{$site}{Row};
+    if (exists $duplicate{$cell}) {	push  @{$duplicate{$cell}},  $site;  }
+    else {					$duplicate{$cell} = [$site]; }
+  }
+  foreach my $cell (keys  %duplicate) {
+    my $SITE	= shift @{$duplicate{$cell}};
+    foreach my $site   (@{$duplicate{$cell}}) {
+      if ($usgs_data{$site}{Catchment} > $usgs_data{$SITE}{Catchment}) {
+		$count[4]++;	delete $usgs_data{$SITE};	$SITE = $site;
+      } else {	$count[4]++;	delete $usgs_data{$site}; }
+  } }
+  $count[5]  = scalar(keys %usgs_data);
+
+  printf "   USGS data initialization summary:
+	Sites outside of the spatial domain-	%d
+	Sites with catchment mismatch-		%d
+	Sites with no data-			%d
+	Sites with negative (A) flows		%d
+	Same cell duplicates-			%d
+	Total number of sites to use-		%d\n\n", @count;
+
+  return $count[5] ? \%usgs_data : undef;
 }
 
 #######################################################################
@@ -2920,14 +3312,34 @@ sub usgs_init
 sub update_usgs
 		### Update USGS data hash for this time step
 {
-			# Removed from public domain
+  my ($usgs_data, $date, $j_date, $usgsDecay) = @_;
+
+  foreach my $site (keys %$usgs_data) {
+	$$usgs_data{$site}{DISCH}	= 0;	# Reserved for WBM discharge before applying USGS assimilation
+    if ($$usgs_data{$site}{data}{$date}) {		# Case of USGS data for this date exists
+	$$usgs_data{$site}{date}	= $date;				# Last string date with USGS data
+	$$usgs_data{$site}{jDate}	= $j_date;				# Last Julian date with USGS data
+	$$usgs_data{$site}{disch}	= $$usgs_data{$site}{data}{$date};	# USGS discharge, m3/sec
+	$$usgs_data{$site}{delta}	= 0;					# Delta between USGS and WBM discharge
+    }
+    else {						# Case of USGS data for this date DOES NOT exists
+      my $days_delta			= $j_date - $$usgs_data{$site}{jDate};	# in days
+	$$usgs_data{$site}{disch}	= 0;
+	$$usgs_data{$site}{delta}      *= $days_delta < 0 || $days_delta > 14 ? 0 :	# Negative after spinup
+						$usgsDecay**($days_delta);	# Apply decay to the delta
+  } }
 }
 
 #######################################################################
 
 sub rehash_stack
 {
-			# Removed from public domain
+  my ($data, $data_keys, $site_CT, $stack_data, $stack) = @_;
+  foreach my $i (0 .. $stack->dim(0)-2) {
+    my  $site	= $$site_CT{$stack->at($i)};		# Site ID
+    my  @data	= $stack_data(,($i))->list;		# Data to re-hash
+    map $$data{$site}{$$data_keys[$_]} = $data[$_], 0 .. $#$data_keys;	# Re-hashing
+  }
 }
 
 #######################################################################
@@ -2939,7 +3351,20 @@ sub make_stack
   my @dataArray	= ([map 0,@$data_keys]);
   my @dataStack	= (-1);
 
-			# Removed from public domain
+  if ( defined $data && %$data ) {
+	### Create Stack hash to be sorted and converted to array in the next step
+    @dataArray	= ();	@dataStack = ();	# Reset these arrays to be populated with read data
+    my %dataStack;				# Keys are cell table row number; Values are data for that cell
+    foreach my $id (keys %$data) {
+      my @array	= map $$data{$id}{$_}, @$data_keys;
+      $dataStack{$$cell_ind{$$data{$id}{Col} . '_' . $$data{$id}{Row}}} = \@array;
+    }
+	### Make arrays of stack (cell table rows) and associated data values from the stack hash
+    map { push(@dataStack,  $_);
+	  push(@dataArray,  $dataStack{$_}) } sort {$a <=> $b} keys %dataStack;
+	  push @dataStack, -1;
+	  push @dataArray, [map 0,@$data_keys];
+  }
 
   return double(\@dataArray), long(\@dataStack);
 }
@@ -2962,21 +3387,25 @@ sub gl_scale
 
 	### Check grid resolutions (if same, no need for scaling)
   my($size,$gT)	= get_geo_transform($tmp_file);
-  return 1 if	abs($$size[0] - $$extent{cellsizeX}) < 0.0001 * abs($$size[0]) &&
-		abs($$size[1] - $$extent{cellsizeY}) < 0.0001 * abs($$size[1]);
-
+  if (	abs($$gT[1] - $$extent{cellsizeX}) < 0.0001 * abs($$gT[1]) &&
+	abs($$gT[5] + $$extent{cellsizeY}) < 0.0001 * abs($$gT[5]) ) {
+    unlink $tmp_file;
+    return 1;
+  }
 	### Calculate glacier melt scaling
   my $spool_file = $$runIO{spool} . $src_dataset->{ID} . '.glAreaFrac.tif';
   unless (-e $spool_file) {
     my $src_extent = get_extent($tmp_file);
     my $src_glArea = cell_area(lonLat($src_extent), $src_extent) * # Use first TS layer of the simulation
-	read_dateLayer($hr_dataset,$date,$src_extent,0,{DATE_SEARCH_OPT=>{YR_UP=>1}, RESAMPLE=>5})->clip(0, 0.99);
+	read_dateLayer($hr_dataset,$date,$src_extent,0,
+			{DATE_SEARCH_OPT=>{YR_UP=>1}, RESAMPLE=>5, NO_CACHING=>1})->clip(0, 0.99);
+	undef($hr_dataset->{data});			# Must be cleared up
 		# Save it to temporary file
     write_tif($src_extent, 'Float32', $spool_file, $src_glArea);
   }
 	### Calculate the scaling ratio
   my $src_glArea= read_GDAL($extent,$meta,0,$spool_file,1,0);
-  my $scale	= condition_slice($src_glArea > 0, $cell_area * $glArea / $src_glArea, 0);
+  my $scale	= condition_slice(($src_glArea > 0) & ($glArea > 1e-6), $cell_area * $glArea / $src_glArea, 0);
 
   unlink $tmp_file;
   return $scale;
@@ -2989,8 +3418,607 @@ sub gl_scale
 sub aquifer_init
 
 {
-  return (0,{},{gwtUseC=>0},0);
-	### Read Aquifer data		# Removed from public domain
+  my ($runSet, $lakeMask)	= @_;
+  my ($runIO,  $meta, $extent)	= @$runSet;
+  my (%aqf_data, %AQF_DATA, $aquiferID);
+  my  $aqf_type	=  0;
+  my  @count	=((0) x 4);
+  my  @sumKeys	= qw(sinkIn IrrIn InfIn drnIn bflIn absOut sprOut drnOut bflOut);
+  my  $dt	= 24 * 3600;
+  my  $cellArea	= cell_area(lonLat($extent), $extent);
+  my  $ones	= ones($$extent{ncols}, $$extent{nrows})->copybad($$extent{mask});
+
+  return (0,{},{gwtUseC=>0},0) unless $$runIO{Aquifers};
+	### Read Aquifer input keys
+  my %param	= read_param_str($runIO, 'Aquifers');
+	### Read some input data that is same for all aquifer types
+  my $infilt	= !exists $param{aqfInfiltFr}	? 0.5	:	# Fraction of surplus water to infilatrate,	fraction
+		  read_Layer($extent, $meta, $param{aqfInfiltFr},$$runIO{Input_MT},{PATCH_VALUE=>0.5});
+     $infilt   *= $ones;
+	### Create file directory
+  my $dir_out	= $$runIO{Output_dir} . '/aquifer';
+  unless (-e $dir_out || $$runIO{noOutput}) { mkpath($dir_out,0,0775) or die "Cannot create-\n$dir_out\n"; }
+  print "Initialization of datasets for aquifer module...\n";
+
+
+	###############################################################
+	### Case of "ModFlow" aquifers
+
+  if ($param{Type} eq 'ModFlow') {
+      $aqf_type = 3;
+
+    foreach my $key (qw(DEM Net_DEM Aqf_Thick)) {
+      die "\"Aquifers\" input for \"$key\" is required for Type => 'ModFlow'. Aborting...\n\n" unless $param{$key};
+    }
+    foreach my $key (qw(B H)) {
+      die "Only one input \"H_DEM_$key\" or \"H_DEPTH_$key\" is allowed in the \"Aquifers\" block. Aborting...\n\n"
+	if $param{"H_DEM_$key"} && $param{"H_DEPTH_$key"};
+    }
+		### Read Aquifer properties
+ 	# Required								   RESAMPLE by average (5)
+    my $DEM	= read_Layer($extent, $meta, $param{DEM},	$$runIO{Input_MT},{RESAMPLE=>5}	  )->double;	# m
+    my $Net_DEM	= read_Layer($extent, $meta, $param{Net_DEM},	$$runIO{Input_MT}		  )->double;	# m
+    my $thick	= read_Layer($extent, $meta, $param{Aqf_Thick},	$$runIO{Input_MT},{PATCH_VALUE=>0})->double;	# m
+
+	# Optional
+    my $H_DEM_B	= $param{H_DEM_B}		?		# Head elevation ASL				m
+		  read_Layer($extent, $meta, $param{H_DEM_B},	$$runIO{Input_MT},{PATCH_VALUE=>0})->hclip($DEM) :
+		  $param{H_DEPTH_B}		?    $DEM +
+		  read_Layer($extent, $meta, $param{H_DEPTH_B},	$$runIO{Input_MT},{PATCH_VALUE=>0}) :  $Net_DEM;
+    my $H_DEM_T	= $param{H_DEM_T}		?		# Head elevation ASL				m
+		  read_Layer($extent, $meta, $param{H_DEM_T},	$$runIO{Input_MT},{PATCH_VALUE=>0})->hclip($DEM) :
+		  $param{H_DEPTH_T}		?    $DEM +
+		  read_Layer($extent, $meta, $param{H_DEPTH_T},	$$runIO{Input_MT},{PATCH_VALUE=>0}) :  $Net_DEM;
+    my $thickCnf= !exists $param{Conf_Thick}	? 0	:	# Thickness of confining layer,			m
+		  read_Layer($extent, $meta, $param{Conf_Thick},$$runIO{Input_MT},{PATCH_VALUE=>0});
+    my $Sy_B	= !exists $param{Aqf_Sy}	? 0.1	:	# Specific yield of unconfined aquifer,		unitless
+		  read_Layer($extent, $meta, $param{Aqf_Sy},	$$runIO{Input_MT},{PATCH_VALUE=>0.1});
+    my $Sy_BC	= !exists $param{Aqf_SyCnfd}	? 0.01	:	# Storage coeff. of confined aquifer,		unitless
+		  read_Layer($extent, $meta, $param{Aqf_SyCnfd},$$runIO{Input_MT},{PATCH_VALUE=>0.01});
+    my $Ph_B	= !exists $param{Aqf_Ph}	? -13.1	:	# Near surface horiz. permeablility,		Log10 m2
+		  read_Layer($extent, $meta, $param{Aqf_Ph},	$$runIO{Input_MT},{PATCH_VALUE=>-13.1});
+    my $Kh_B	= !exists $param{Aqf_Kh}	? 10.6	:	# Confined horizontal conductivity,		m/d
+		  read_Layer($extent, $meta, $param{Aqf_Kh},	$$runIO{Input_MT},{PATCH_VALUE=>10.6});
+    my $Kv_B	= !exists $param{Aqf_Kv}	? 1.6	:	# Cofined vertical conductivity,		m/d
+		  read_Layer($extent, $meta, $param{Aqf_Kv},	$$runIO{Input_MT},{PATCH_VALUE=>1.6});
+    my $Kh_T	= !exists $param{Aqf_KhConf}	? 0.008	:	# Confining horizontal conductivity,		m/d
+		  read_Layer($extent, $meta, $param{Aqf_KhConf},$$runIO{Input_MT},{PATCH_VALUE=>0.008});
+    my $Kv_T	= !exists $param{Aqf_KvConf}	? 0.0008:	# Confining vertical conductivity,		m/d
+		  read_Layer($extent, $meta, $param{Aqf_KvConf},$$runIO{Input_MT},{PATCH_VALUE=>0.0008});
+    my $eFold	= !exists $param{eFolding}	? 120	:	# E-folding depth,				m
+		  read_Layer($extent, $meta, $param{eFolding},	$$runIO{Input_MT},{PATCH_VALUE=>120});
+
+		### Read Aquifer full mask (including pixels outside of the Network)
+    my $EXTENT	= fill_extent($extent);			# Extent without nodata
+    my $mask_A	= read_Layer($EXTENT, $meta, $param{Aqf_Thick},	$$runIO{Input_MT}, {PATCH_VALUE=>0}) > 0;
+
+		### Read River and riverbed properties
+    my $BRes	= !exists $param{BRes}		? 10	:		# Riverbed resistance (day)
+		  read_Layer($extent, $meta, $param{BRes},	$$runIO{Input_MT}, {PATCH_VALUE=>10});
+    my $SLE	= set_default($param{SLE},	  0);		# "Sea Level Elevation"				m
+       $SLE	= $Net_DEM->min if $SLE =~ m/^min/i;
+    my $bndFlx	= set_default($param{Aqf_BndFlx}, 0);		# Flag to allow fluxes to adjacent aquifers
+    my $clump	= set_default($param{Aqf_Clump},  0);		# Flag to clump virtual/lumped aquifers to one
+    my $wellMax	= set_default($param{wellMax},  1e6);		# Max well depth  for aquifer water abstractions
+    my $N_steps	= set_default($param{MF_steps},   1);		# Number of steps for EFDM solver
+
+    ### Check and convert all to be PDL
+    map { $_ = $_ * $ones if ref($_) ne 'PDL'; }	# must check PDL type to keep aliase of $H_DEM_T/B to $Net_DEM
+	$DEM,$Net_DEM,$thick,$thickCnf,$H_DEM_B,$H_DEM_T,$Sy_B,$Sy_BC,$Ph_B,$Kh_B,$Kv_B,$Kh_T,$Kv_T,$eFold,$BRes;
+
+		### Fix some possible odd values in the input datasets
+       $Sy_B ->inplace->hclip(0.33);
+       $eFold->inplace->hclip(120);
+       $BRes ->inplace->lclip(1);
+       $wellMax=$thick->hclip($wellMax);
+
+		#######################################################
+		### Apply lake mask to aquifer geometry
+    my $lakeMaskSeg = $lakeMask->setbadtoval(0)->cc8compt;	# Connected 8-component labeling (segmentation)
+    foreach my $id (1 .. $lakeMaskSeg->uniq->list) {
+      my $idx	= whichND($lakeMaskSeg == $id);
+      my $level	= $Net_DEM->indexND($idx)->avg;
+      $Net_DEM->indexND($idx) .= $level;	# Set lake level to be flat;	NB- $Net_DEM can be an alias to $H_DEM_T/B
+          $DEM->indexND($idx) .= $level;	# Set elevation to the lake level
+    }
+		#######################################################
+		### Generate Aquifer geometry parameters
+	# Top layer (confining aquifer)
+    my $H_T	= $thickCnf * ($thick > 0);		# Thickness (must be within bottom layer bounds)
+    my @DEM_T	=($DEM - $H_T, $DEM);			# (Bottom,Top)
+    my $mask_T	= $H_T > 0;				# Mask
+    my $idx_T	= whichND($mask_T);
+	# Bottom layer (unconfined aquifer, and confined where Top layer present)
+    my $H_B	= $thick;				# Thickness
+    my @DEM_B	=($DEM - $thick, $DEM_T[0]);		# (Bottom,Top)
+    my $mask_B	= $H_B > 0;				# Mask
+    my $mask_S	= $mask_B - $mask_T;			# Mask for the bottom layer on the surface
+    my $idx_B	= whichND($mask_B);
+    my $idx_S	= whichND($mask_S);
+
+		### Find aquifer boundary pixels for
+		###	coast (flux out), land (no flux), and external aquifer(flux in/out)
+
+    my($bnd_CoastT, $bnd_CoastB, $bnd_LandT, $bnd_LandB, $bnd_AqfT, $bnd_AqfB) =
+		aqf_boundary($mask_T, $mask_B, $mask_A, $bndFlx, $extent);
+
+		### Set simulation geometry parameters
+    my($cX,$cY)	= cellGeometry($extent);			# Cell longitudal and latitudal length, m
+    my @alphaWE	= avg_dir($cY / $cX);
+    my @alphaNS	= avg_dir($cX / $cY);
+    my @alpha	= (@alphaWE[0,0], @alphaNS[2,3]);		# Ratio of cell width orthogonal to flow intercell distance
+    my $dz	=($H_T + $H_B) / 2;				# Vertical   distance between cells
+    my $m_2_m3	= $cellArea * 1e6;				# Conversion coef. m->m3
+
+	# Set Sy for 2-layer domain (confined/unconfined aquifers)
+    my $Sy_T	= condition($mask_T, $Sy_B, 1);
+       $Sy_B	= condition($mask_B, $Sy_B, 1);
+       $Sy_B->indexND($idx_T) .= $Sy_BC->indexND($idx_T);
+
+	# Set horizontal hydraulic conductivity (m/day)
+    my $P_2_K	= log10(pdl(6.47e6 *  $dt)); # at T = 5 Celsius: https://www.sedgeochem.uni-bremen.de/perm_kf_en.html
+       $Kh_B->indexND($idx_S) .= 10**($Ph_B->indexND($idx_S) + $P_2_K);
+    my @Kh_B	= avg_dir($Kh_B);
+    my @Kh_T	= avg_dir($Kh_T);
+   map $Kh_B[$_]->indexND($$bnd_CoastB[$_]) .= $Kh_B->indexND($$bnd_CoastB[$_]), 0..3;	# No averaging at the coast
+   map $Kh_T[$_]->indexND($$bnd_CoastT[$_]) .= $Kh_T->indexND($$bnd_CoastT[$_]), 0..3;
+
+	# Vertical conductance (m2/day)   # Kv weighted average         # e-folding factor    #flow area #flow distance
+    my $Cvi	= condition_slice($mask_T,($Kv_T*$H_T+$Kv_B*$H_B)/$thick*(1- exp(-$H_T/$eFold))*$cellArea*2/$thick, 0)
+		->indexND($idx_T);
+
+	# Set beta parameter for PDE solution stability check
+    my $beta	= 1e-6 / $cellArea / $Sy_B->lclip($Sy_T);
+
+		### Set simulation initial condition for the head and storage
+    my $ih_T	= $H_DEM_T->clip($DEM_T[0], $DEM);			# m ASL (above sea level) input
+    my $ih_B	= $H_DEM_B->clip($DEM_B[0], $DEM);			# m ASL (above sea level) input
+    my $h_T	= condition($ih_T == $DEM_T[0], $ih_T + 0.01 * $thickCnf, $ih_T );
+    my $h_B	= condition($ih_B == $DEM_B[0], $ih_B + 0.01 * $thick   , $ih_B );
+    my $Strg_T	= ($h_T - $DEM_T[0]) * $Sy_T * $m_2_m3;			# m3
+    my $Strg_B	= ($h_B - $DEM_B[0]) * $Sy_B * $m_2_m3;			# m3
+
+		### Report stats on fixing initial dry_cells
+    my $n_init_dc_T = ($mask_T & ($ih_T == $DEM_T[0]))->sum;
+    my $n_init_dc_B = ($mask_B & ($ih_B == $DEM_B[0]))->sum;
+    if($n_init_dc_T) {
+      my $dh_T	= $h_T  - $ih_T;
+      my $dS_T	=($dh_T * $Sy_T * $m_2_m3)->sum;  # m3 added
+      my $dc	= $dh_T->where($dh_T > 0);
+	printf "   Dry cells encountered in initial heads in Top aquifer.
+	   Added (min mean max) %0.2f %0.2f %0.2f m of head
+	   totalling %0.2f km3 in %d pixels (1%% of thickness)\n\n",
+	$dc->min,$dc->avg,$dc->max,$dS_T*1e-9,$n_init_dc_T; }
+    if($n_init_dc_B) {
+      my $dh_B	= $h_B  - $ih_B;
+      my $dS_B	=($dh_B * $Sy_B * $m_2_m3)->sum;  # m3 added
+      my $dc	= $dh_B->where($dh_B > 0);
+	printf "   Dry cells encountered in initial heads in Bottom aquifer.
+	   Added (min mean max) %0.2f %0.2f %0.2f m of head
+	   totalling %0.2f km3 in %d pixels (1%% of thickness)\n\n",
+	$dc->min,$dc->avg,$dc->max,$dS_B*1e-9,$n_init_dc_B; }
+
+		### Save aquifer masks and network re-sampled and lake readjusted DEMs
+    unless ( $$runIO{noOutput} ) {
+    write_tif($extent, 'Int16',   "$dir_out/mask_B.tif",	$mask_B)  unless -e "$dir_out/mask_B.tif";
+    write_tif($extent, 'Int16',   "$dir_out/mask_T.tif",	$mask_T)  unless -e "$dir_out/mask_T.tif";
+    write_tif($extent, 'Float32', "$dir_out/DEM.tif",		$DEM)	  unless -e "$dir_out/DEM.tif";
+    write_tif($extent, 'Float32', "$dir_out/Net_DEM.tif",	$Net_DEM) unless -e "$dir_out/Net_DEM.tif";
+    write_tif($extent, 'Float32', "$dir_out/Aqf_thickness.tif",	$thick)	  unless -e "$dir_out/Aqf_thickness.tif";
+    write_tif($extent, 'Float32', "$dir_out/initialHead_T.tif",	$h_T)	  unless -e "$dir_out/initialHead_B.tif";
+    write_tif($extent, 'Float32', "$dir_out/initialHead_B.tif",	$h_B)	  unless -e "$dir_out/initialHead_B.tif";
+    }
+		#######################################################
+		### Set derived Lumped aquifer parameters for the ModFlow aquifer type
+
+    if ($param{Aqf_ID_File} && !$clump) {
+      die "\"Aqf_ID_File\" does not exist:\n\t$param{Aqf_ID_File}\nAborting...\n\n" unless -e $param{Aqf_ID_File};
+      $aquiferID = $mask_B * read_Layer($extent,$meta,$param{Aqf_ID_File},$$runIO{Input_MT},{RESAMPLE=>0,PATCH_VALUE=>0});
+      die "\"Aqf_ID_File\" does not match aquifer extents. Aborting...\n\n"
+		unless $mask_B->sum == ($aquiferID > 0)->sum; }
+    else {
+      $aquiferID = $clump ? $mask_B : $mask_B->setbadtoval(0)->
+	cc4compt->copybad($$extent{mask});	# Connected 4-component labeling of a binary image (segmentation)
+    }
+    my    @aquiferID	=   $aquiferID->uniq->list;
+    shift @aquiferID unless $aquiferID[0];		# Remove aquifer with ID=0 (not an aquifer)
+
+		### Calculate/populate derived Lumped aquifer parameters
+    my $capacity = $m_2_m3 * ($Sy_T * $H_T		+ $Sy_B*($H_T + $H_B));
+    my $storage  = $m_2_m3 * ($Sy_T *($h_T - $DEM_T[0])	+ $Sy_B*($h_B - $DEM_B[0]));
+    foreach my  $Aqf_ID (@aquiferID) {
+      my $aqf_mask = $aquiferID    ==  $Aqf_ID;
+      $aqf_data{$Aqf_ID}{idx}	    =  whichND($aqf_mask);		# Indexes of the aquifers
+      $aqf_data{$Aqf_ID}{Capacity}  = ($aqf_mask  *  $capacity)->sum->at(0);		# m3
+      $aqf_data{$Aqf_ID}{Storage}   = ($aqf_mask  *  $storage )->sum->at(0);		# m3
+      $aqf_data{$Aqf_ID}{Area}	    = ($aqf_mask  *  $cellArea)->sum->at(0);		# km2
+      $aqf_data{$Aqf_ID}{TopElev}   =  $DEM  ->where($aqf_mask)->pct(0.9)->at(0);	# All below: for Lumped aquifer functions
+      $aqf_data{$Aqf_ID}{Thickness} =  $thick->where($aqf_mask)->max;
+      $aqf_data{$Aqf_ID}{BaseElev}  =  $aqf_data{$Aqf_ID}{TopElev} - $aqf_data{$Aqf_ID}{Thickness};
+      $aqf_data{$Aqf_ID}{Volume}    =  $aqf_data{$Aqf_ID}{Storage};
+      # $aqf_data{$Aqf_ID}{InfiltFrac}=  $infilt->indexND( $aqf_data{$Aqf_ID}{idx} );	# moved to %AQF_DATA
+      $aqf_data{$Aqf_ID}{Head}	    =  'N/A';
+  map $aqf_data{$Aqf_ID}{$_}	    = 0, qw(StoragePrev Delta numDelta Err), @sumKeys;
+    }
+
+		#######################################################
+		### Package aquifer data to be returned; Note- must add $lakeMask as it can be time series
+    @count	= ( scalar(keys %aqf_data), $capacity->sum * 1e-9, $storage->sum * 1e-9, 0 );
+    %AQF_DATA	= (   lakeMask => $lakeMask,DEM=> $DEM,  Net_DEM => $Net_DEM, eFold => [avg_dir($eFold)], SLE => $SLE,
+	idx_T  => $idx_T, BRes => $BRes, alpha => \@alpha, beta  => $beta,   m_2_m3 => $m_2_m3, FSC => 0,
+	idx_B  => $idx_B,  Cvi => $Cvi, mask_S => $mask_S, idx_S => $idx_S, N_steps => int($N_steps), wellMax => $wellMax,
+	Strg_T => $Strg_T, h_T => $h_T, mask_T => $mask_T, DEM_T => \@DEM_T, Sy_T => $Sy_T, Kh_T => \@Kh_T,
+	Strg_B => $Strg_B, h_B => $h_B, mask_B => $mask_B, DEM_B => \@DEM_B, Sy_B => $Sy_B, Kh_B => \@Kh_B,
+	bnd_CoastT => $bnd_CoastT,   bnd_LandT => $bnd_LandT, bnd_AqfT => $bnd_AqfT,
+	bnd_CoastB => $bnd_CoastB,   bnd_LandB => $bnd_LandB, bnd_AqfB => $bnd_AqfB);
+  }
+
+	###########################################
+	### Case of "Virtual" or "Lumped" aquifers
+  elsif ($param{Type}	=~ m/Virtual|Lumped/) {
+    %aqf_data	= read_table_hash($param{Aqf_Par_File}, 'ID');
+    $aqf_type	= $param{Type} eq 'Virtual' ? 1 : 2;
+
+    if ($param{Aqf_ID_File}) {
+      die "\"Aqf_ID_File\" does not exist:\n\t$param{Aqf_ID_File}\nAborting...\n\n" unless -e $param{Aqf_ID_File};
+
+	    $aquiferID	= read_Layer($extent,$meta,$param{Aqf_ID_File},$$runIO{Input_MT},{RESAMPLE=>0,PATCH_VALUE=>0});
+      my    @aquiferID	= $aquiferID->uniq->list;
+      shift @aquiferID	unless $aquiferID[0];		# Remove aquifer with ID=0 (not an aquifer)
+
+	  ### Filter %aqf_data by the aquifer spatial domain
+      foreach my $id (keys %aqf_data) {
+	if ($id ~~ @aquiferID)	{
+	  $aqf_data{$id}{Area}	 = $cellArea->where($aquiferID == $id)->sum;		# Aquifer area, km2
+	  $aqf_data{$id}{Capacity} = virtAquiferCap($aqf_data{$id}, $aqf_data{$id}{Area});
+	  $count[0]++; $count[1]  += $aqf_data{$id}{Capacity} * 1e-9;
+	} else		{ delete     $aqf_data{$id}; }
+      }
+    } else {
+      map { delete $aqf_data{$_} unless $_ == 1; } keys %aqf_data;
+      die "\"Aqf_Par_File\" must contain parameters for the aquifer with ID=1:\n\t$param{Aqf_Par_File}\nAborting...\n\n"
+	  unless exists $aqf_data{1};
+      $aquiferID		= $$extent{mask}->isgood;
+      $aqf_data{1}{Area}	= $cellArea->sum;			# Aquifer area, km2
+      $aqf_data{1}{Capacity}	= virtAquiferCap($aqf_data{1}, $aqf_data{1}{Area});
+      $count[0]++; $count[1]	= $aqf_data{1}{Capacity}     * 1e-9;	# km3
+    }
+    unless ($count[0]) {
+      print "Aquifers are not initialized due to lack of them inside the spatial domain...\n\n";
+      return (0,{},{gwtUseC=>0},0);
+    }
+	  ### Calculate/Populate aquifer parameters
+    foreach my  $Aqf_ID (keys %aqf_data) {
+      $aqf_data{$Aqf_ID}{idx}	     = whichND($aquiferID == $Aqf_ID);	  # Indexes of the aquifers
+      $aqf_data{$Aqf_ID}{Storage}    = 1.0 * $aqf_data{$Aqf_ID}{Capacity};# m3	# Initiate as 100 % of Capacity
+      $aqf_data{$Aqf_ID}{Volume}     = 1.0 * $aqf_data{$Aqf_ID}{Capacity};# Needed for Lumped aquifer functions
+      $aqf_data{$Aqf_ID}{Head}	     = 'N/A';
+  map $aqf_data{$Aqf_ID}{$_}	     = 0, qw(StoragePrev Delta numDelta Err), @sumKeys;
+    }
+    $count[2] = 1.0 * $count[1];
+  }
+  else { die "Unknown Aquifer type. Aborting...\n\n"; }
+
+  $count[3]	= 100 * $count[2] / $count[1];				# Storage as % of Capacity
+  $AQF_DATA{sumKeys} = \@sumKeys;					# Add SumKeys to the aquifer data hash
+  $AQF_DATA{gwtUseC} = set_default($param{gwtUseCoeff}, 1);		# Shallow groundater use coefficient/fraction
+  $AQF_DATA{InfiltFrac} = $infilt;					# Aquifer infiltration fraction
+  $AQF_DATA{aquiferID}	= $aquiferID;					# Aquifer IDs layer
+  write_tif($extent, 'Int16', "$dir_out/aquiferID.tif", $aquiferID)	# Save aquifer IDs to a file
+	unless $$runIO{noOutput};
+
+  my $warning	= (ref $$runIO{wbmParam} ? $$runIO{wbmParam}{compBalance}:0) &&
+	List::Util::max(map(log10($aqf_data{$_}{Storage}?$aqf_data{$_}{Storage}:1) > 12 ? 1:0, keys(%aqf_data))) ?
+	"\tWARNING:\n\tLumped aquifer size is too large and may affect tracking balances.\n" .
+	"\tReducing the size of lumped aquifers is recommended.\n" : '';
+  printf "   Aquifer initialization summary:
+	Aquifer model type-		$param{Type}
+	Shallow groundwater use-	%.1f %%
+	Total number   of aquifers-	%d
+	Total capacity of aquifers-	%.2f km3
+	Total storage  of aquifers-	%.2f km3 (%.1f %% of Capacity)\n$warning\n", $AQF_DATA{gwtUseC}*100, @count;
+
+  return $aqf_type, \%aqf_data, \%AQF_DATA, $count[1],$aquiferID;
+}
+
+sub virtAquiferCap {
+  my ($param, $areaSum) = @_;
+
+  return $$param{Capacity} if $$param{Capacity};
+  return $$param{Thickness} * $$param{Sy} * $areaSum * 1e6;	# H(m) * Sy * Area(m2) = Volume(m3)
+}
+
+#######################################################################
+
+sub Aqf_Storage_2_Head
+	### Updates groundwater head from known aquifer storage
+{
+  my $d = shift;
+
+  $$d{h_B}->indexND($$d{idx_B}) .= ($$d{DEM_B}[0] + $$d{Strg_B} / $$d{Sy_B} / $$d{m_2_m3})->indexND($$d{idx_B});
+  $$d{h_T}->indexND($$d{idx_T}) .= ($$d{DEM_T}[0] + $$d{Strg_T} / $$d{Sy_T} / $$d{m_2_m3})->indexND($$d{idx_T});
+}
+
+#######################################################################
+
+sub Aqf_Well_Storage
+	### Usable aquifer storage for abstractions
+{
+  my ($d, $A_dQ) = @_;
+
+  my $Strg_W = ($$d{h_B} - ($$d{DEM}-$$d{wellMax}))->clip(0,$$d{DEM}-$$d{DEM_B}[0]) * $$d{Sy_B} * $$d{m_2_m3};
+  return condition($$d{mask_T}, $Strg_W, $Strg_W + $A_dQ)->lclip(0);
+}
+
+#######################################################################
+
+sub ModFlow_EFDM
+		### ModFlow fluid dynamics solver by EFDM method
+{
+  my ($data, $dt) = @_;
+		### Decode data hash to variables
+  my ( $h_T,		$h_B		) = ( $$data{h_T},		$$data{h_B}	  );
+  my ( $Strg_T,		$Strg_B		) = ( $$data{Strg_T},		$$data{Strg_B}	  );
+  my ( $Kh_T,		$Kh_B		) = ( $$data{Kh_T},		$$data{Kh_B}	  );
+  my ( $DEM_T,		$DEM_B		) = ( $$data{DEM_T},		$$data{DEM_B}	  );
+  my ( $DEM,		$SLE		) = ( $$data{DEM},		$$data{SLE}	  );
+  my ( $bnd_LandT,	$bnd_LandB	) = ( $$data{bnd_LandT},	$$data{bnd_LandB} );
+  my ( $bnd_CoastT,	$bnd_CoastB	) = ( $$data{bnd_CoastT},	$$data{bnd_CoastB});
+  my ( $bnd_AqfT,	$bnd_AqfB	) = ( $$data{bnd_AqfT},		$$data{bnd_AqfB}  );
+  my ( $mask_T,		$mask_B		) = ( $$data{mask_T},		$$data{mask_B}	  );
+  my ( $alpha,		$beta		) = ( $$data{alpha},		$$data{beta}	  );
+  my ( $eFold,		$idx_T		) = ( $$data{eFold},		$$data{idx_T}	  );
+  my ( $Cvi				) = ( $$data{Cvi}				  );
+
+		### Calculate horizontal conductivity for all cell sides
+			# Wetted layer bounds relative to land surface (bottom,top)
+  my @wetDEM_T	= wetDEM($h_T, $DEM, @$DEM_T, $bnd_CoastT);
+  my @wetDEM_B	= wetDEM($h_B, $DEM, @$DEM_B, $bnd_CoastB);
+			# Transmissivity
+  my @Th_T	= map $$Kh_T[$_]*$$eFold[$_]*(exp(-$wetDEM_T[1][$_]/$$eFold[$_])- exp(-$wetDEM_T[0][$_]/$$eFold[$_])),0..3;
+  my @Th_B	= map $$Kh_B[$_]*$$eFold[$_]*(exp(-$wetDEM_B[1][$_]/$$eFold[$_])- exp(-$wetDEM_B[0][$_]/$$eFold[$_])),0..3;
+			# Conductivity
+  my @Ch_T	= map $$alpha[$_]*$Th_T[$_], 0..3;
+  my @Ch_B	= map $$alpha[$_]*$Th_B[$_], 0..3;
+			# PDE solution/convergence stability check by Frederick's criteria (FSC)
+  my $FSC	= List::Util::max(map(($Ch_T[$_]->lclip($Ch_B[$_])*$beta*$dt)->max, 0,2),	# Horizontal fluxes
+			($Cvi*$beta->indexND($idx_T)*$dt)->max);				# Vertical   fluxes
+  $$data{FSC}	= $FSC if $FSC > $$data{FSC};
+  die "\nEFDM PDE sover for ModFlow is not stable for this domain (FSC > 0.5). Aborting...\n\n" if $FSC >= 0.5;
+
+		### Horizontal flow (Top and Bottom layers)
+  my($Qh_T, $F_T) = flux_h($Strg_T, $h_T, \@Ch_T, $mask_T, $bnd_CoastT, $bnd_LandT, $bnd_AqfT, $SLE, $dt);
+  my($Qh_B, $F_B) = flux_h($Strg_B, $h_B, \@Ch_B, $mask_B, $bnd_CoastB, $bnd_LandB, $bnd_AqfB, $SLE, $dt);
+		### Vertical flow (Top and Bottom layers)
+  my $Qv	  = flux_v($Strg_T, $h_T, $h_B, $$Qh_T[0], $Cvi, $idx_T, $dt);
+		### Combine horizontal and vertical fluxes
+  my($Q_T, $Q_B)  = ($$Qh_T[0] - $Qv, $$Qh_B[0] + $Qv);
+
+		### Fluxes and Dry cells to be used for an output
+  $$data{QhT_U}	+= ($$Qh_T[1] + $$Qh_T[3]) / 2;		# Top-	East-West   average flux, m3/sub-day
+  $$data{QhT_V}	+= ($$Qh_T[2] + $$Qh_T[4]) / 2;		#	North-South average flux, m3/sub-day
+  $$data{QhB_U}	+= ($$Qh_B[1] + $$Qh_B[3]) / 2;		# Botm-	East-West   average flux, m3/sub-day
+  $$data{QhB_V}	+= ($$Qh_B[2] + $$Qh_B[4]) / 2;		#	North-South average flux, m3/sub-day
+  $$data{Qv}	+=   $Qv;
+  $$data{DC_T}	.=  $$Qh_T[5] | !$Strg_T;		# Top-	Dry cells (mask)
+  $$data{DC_B}	.=  $$Qh_B[5] | !$Strg_B;		# Botm-	Dry cells (mask)
+
+  return [$Q_B, $Q_T], [$F_B, $F_T];
+}
+
+#######################################################################
+
+sub flux_h
+		### Explicit Forward Difference Method (EFDM) for PDE
+{
+  my ($Strg,  $h,  $Ch, $mask, $bnd_Coast, $bnd_Land, $bnd_Aqf, $SLE, $dt) = @_;
+  my  $zeroes	=  zeroes(double,$h->dims);
+  my ($Q, $F)	= map $zeroes->copy, 0..1;
+  my  @q	= map $zeroes->copy, 0..3;
+  my  $DC_coef	=   0;		# Flux slow down factor for Drying cells (zero shuts them up)
+  my  @slc	= ('1:,', ':-2,', ',1:', ',:-2');
+  my  @edg	= ('0,',   '-1,', ',0',   ',-1');
+
+		### Prepare Dry cell variables
+  my  @Ch = map $_->copy, @$Ch;
+  my ($idxDC, $n) = (pdl([])->dummy(0,2), 0);
+  my  $dry_cells  =  $zeroes->copy;		# Zeroes
+
+	### Calculate head gradient and apply boundary conditions to it
+  my @dh   =  map $_*$mask, delta_dir($h);
+
+	### Correct head gradient by boundary conditions
+  foreach my $i (0..3) {
+    $dh[$i]->indexND($$bnd_Coast[$i]   ) .= $SLE - $h->indexND($$bnd_Coast[$i]);	# Coast   boundary
+    $dh[$i]->indexND($$bnd_Land [$i]   ) .= 0;						# Land    boundary
+    $dh[$i]->indexND($$bnd_Aqf  [$i][0]) .= $dh[$i]->indexND($$bnd_Aqf[$i][1])/2;	# Adjacent aquifer boundary
+  }
+	### Shut Dry Cells
+  foreach my $i (0 .. 3) {	my $j = $i % 2 ? $i-1 : $i+1;
+    $Ch[$i]->($edg[$i])->where(($Strg($edg[$i])	== 0) & ($dh[$i]->($edg[$i]) < 0)) .= 0;	# Edges
+    $Ch[$j]->($edg[$j])->where(($Strg($edg[$j])	== 0) & ($dh[$j]->($edg[$j]) < 0)) .= 0;
+    my $idxDC =        whichND(($Strg($slc[$i])	== 0) & ($dh[$i]->($slc[$i]) < 0));		# Middles
+    $Ch[$i]->($slc[$i])->indexND($idxDC)	.= 0;
+    $Ch[$j]->($slc[$j])->indexND($idxDC)	.= 0;
+  }
+  do {
+		# Slow down Drying Fluxes
+    if ($n) {
+      foreach my $i (0 .. 3) {	my $j = $i % 2 ? $i-1 : $i+1;
+	$Ch[$i]->($edg[$i])->where((($Strg($edg[$i]) + $Q($edg[$i])) < 0) & ($dh[$i]->($edg[$i]) < 0)) *= $DC_coef;
+	$Ch[$j]->($edg[$j])->where((($Strg($edg[$j]) + $Q($edg[$j])) < 0) & ($dh[$i]->($edg[$j]) < 0)) *= $DC_coef;
+	my $idxDC = whichND(       (($Strg($slc[$i]) + $Q($slc[$i])) < 0) & ($dh[$i]->($slc[$i]) < 0));
+	$Ch[$i]->($slc[$i])->indexND($idxDC)	*= $DC_coef;
+	$Ch[$j]->($slc[$j])->indexND($idxDC)	*= $DC_coef;
+    } }
+		# Flux in horizontal direction
+    map set_to_zero($_, $zeroes), $Q, $F;
+    foreach my $i (0..3) {
+      $q[$i] .= $Ch[$i] * $dh[$i] *  $dt;		# Flux!
+      $Q     += $q [$i];
+      $F->indexND($$bnd_Coast[$i]   ) += $q[$i]->indexND($$bnd_Coast[$i]   );	# Flow to the ocean out of GW domain
+      $F->indexND($$bnd_Aqf  [$i][0]) += $q[$i]->indexND($$bnd_Aqf  [$i][0]);	# Flow to/from the adjacent aquifer
+    }
+		### Check for "dry cells"
+    $dry_cells->where     (($Strg + $Q) <= 0) .= 1;
+    $idxDC = whichND($Q & (($Strg + $Q) <  0));
+    die "Dry cell problem in \"flux_h\" function...\n" if $n++ > 1000 && $idxDC->dim(1);
+  } while (  $idxDC->dim(1)  );
+
+  return [$Q, @q, $dry_cells], $F;
+}
+
+#######################################################################
+
+sub flux_v
+		### Explicit Forward Difference Method (EFDM) for PDE
+{
+  my($Strg, $ht, $hb, $q, $Cvi, $idx, $dt) = @_;
+
+	### Initialization
+  my $Q  = zeroes(double,$ht->dims);		# Flow direction is Down
+  my $dh = $ht->indexND($idx) - $hb->indexND($idx);
+	### Calculation			# "hclip" is for Dry cell problem
+  $Q->indexND($idx) .= ($Cvi * $dh * $dt)->hclip($Strg->indexND($idx) + $q->indexND($idx));
+
+  return $Q;
+}
+
+#######################################################################
+
+sub wetDEM
+{
+  my($h, $DEM, $h_B, $h_T, $bnd_Coast)  = @_;
+  my @bot	= map zeroes(double,$h->dims),1..4;		# bottom
+  my @top	= map zeroes(double,$h->dims),1..4;		# top
+
+  my ($pix_T, $pix_B)	= ($h->clip($h_B,$h_T)->setbadtoval(0), $h_B->setbadtoval(0));	# Wetted layer bounds
+
+	### Locate top and bottom elevations of the wetted layer
+  $bot[0]->(1:-1,:) .= $pix_B(0:-2,:)->lclip($pix_B(1:-1,:));		# max of 2 bottoms
+  $top[0]->(1:-1,:) .= $pix_T(0:-2,:)->lclip($pix_T(1:-1,:));		# max of 2 tops
+  $bot[1]->(0:-2,:) .= $pix_B(1:-1,:)->lclip($pix_B(0:-2,:));
+  $top[1]->(0:-2,:) .= $pix_T(1:-1,:)->lclip($pix_T(0:-2,:));
+  $bot[2]->(:,1:-1) .= $pix_B(:,0:-2)->lclip($pix_B(:,1:-1));
+  $top[2]->(:,1:-1) .= $pix_T(:,0:-2)->lclip($pix_T(:,1:-1));
+  $bot[3]->(:,0:-2) .= $pix_B(:,1:-1)->lclip($pix_B(:,0:-2));
+  $top[3]->(:,0:-2) .= $pix_T(:,1:-1)->lclip($pix_T(:,0:-2));
+
+	### Convert elevation to depth
+  my  @DEM	 = avg_dir($DEM);
+  my  @depth	 = map(($DEM[$_]- $top[$_])->lclip(0),	0 .. 3);
+  map $bot[$_]	.= $depth[$_]   + $top[$_] - $bot[$_],	0 .. 3 ;
+  map $top[$_]	.= $depth[$_],				0 .. 3 ;
+     # @bot	= map  $depth[$_] + $top[$_] - $bot[$_],0 .. 3 ;
+     # @top	= @depth;
+
+	### Add aquifer to coastal pixels
+  map $top[$_]->indexND($$bnd_Coast[$_]) .= 0,    0..3;
+  map $bot[$_]->indexND($$bnd_Coast[$_]) .= $pix_T->indexND($$bnd_Coast[$_]) - $pix_B->indexND($$bnd_Coast[$_]), 0..3;
+
+  return \@bot, \@top;
+}
+
+#######################################################################
+
+sub aqf_boundary
+{
+  my($mask_T, $mask_B, $mask_A, $flag_A, $extent) = @_;
+  my(@bnd_CoastT, @bnd_CoastB, @bnd_LandT, @bnd_LandB, @bnd_AqfT, @bnd_AqfB);
+  my @shft	= (pdl(1,0), pdl(-1,0), pdl(0,1), pdl(0,-1));
+  my $idx_0	=  pdl([])->dummy(0,2);
+
+  my $landMask	= $$extent{mask}->isgood->setbadtoval(0);	# Land/Network mask
+  my $outletMask= $$extent{mask} == 0;				# Outlet mask
+
+  my @bound_T	= mask_boundary($mask_T);		# Boundary mask, Top    layer
+  my @bound_B	= mask_boundary($mask_B);		# Boundary mask, Bottom layer
+  my @bound_A	= mask_boundary($mask_A);		# Boundary mask, Adjacent aquifers beyond Network
+  my @bound_Lnd	= mask_boundary($landMask);		# Boundary mask, Land/Network
+
+		### Find aquifer boundaries
+  foreach my $i (0..3) {
+			### at coast
+    $bnd_CoastT[$i]	= whichND($bound_T[$i] & ($bound_T[$i] == $bound_Lnd[$i]) & $outletMask);
+    $bnd_CoastB[$i]	= whichND($bound_B[$i] & ($bound_B[$i] == $bound_Lnd[$i]) & $outletMask);
+					# Remove coast boundary from "search" copy
+    $bound_T[$i]->indexND($bnd_CoastT[$i]) .= 0;
+    $bound_B[$i]->indexND($bnd_CoastB[$i]) .= 0;
+			### at addjacent aquifer
+    if ($flag_A) {
+      $bnd_AqfT[$i][0]	= whichND($bound_T[$i] & ($bound_T[$i] != $bound_A[$i]));
+      $bnd_AqfB[$i][0]	= whichND($bound_B[$i] & ($bound_B[$i] != $bound_A[$i]));
+      $bnd_AqfT[$i][1]	=   $bnd_AqfT[$i][0]   +  $shft[$i];
+      $bnd_AqfB[$i][1]	=   $bnd_AqfB[$i][0]   +  $shft[$i];
+    } else {
+      $bnd_AqfT[$i]	= [ $idx_0, $idx_0 ];
+      $bnd_AqfB[$i]	= [ $idx_0, $idx_0 ];
+    }				# Remove aquifer boundary from "search" copy
+    $bound_T[$i]->indexND($bnd_AqfT[$i][0]).= 0;
+    $bound_B[$i]->indexND($bnd_AqfB[$i][0]).= 0;
+			### at land (whatever is left in the "search" copy)
+    $bnd_LandT[$i]	= whichND($bound_T[$i]);
+    $bnd_LandB[$i]	= whichND($bound_B[$i]);
+  }
+  return \@bnd_CoastT, \@bnd_CoastB, \@bnd_LandT, \@bnd_LandB, \@bnd_AqfT, \@bnd_AqfB;
+}
+
+#######################################################################
+
+sub delta_dir
+{
+  my ($p, $b)	= @_;
+  my  $P	= $p->setbadtoval(defined $b ? $b : 0);
+  my($pW,$pE,$pN,$pS) = map zeroes(double,$p->dims),1..4;
+
+  $pW(1:-1,:) .= $P(0:-2,:) - $P(1:-1,:);
+  $pE(0:-2,:) .= $P(1:-1,:) - $P(0:-2,:);
+  $pN(:,1:-1) .= $P(:,0:-2) - $P(:,1:-1);
+  $pS(:,0:-2) .= $P(:,1:-1) - $P(:,0:-2);
+
+  return map $_->copybad($p), $pW,$pE,$pN,$pS;
+}
+
+#######################################################################
+
+sub avg_dir
+{
+  my ($p, $b)	= @_;
+  my  $P	= $p->setbadtoval(defined $b ? $b : 0);
+  my ($pW,$pE,$pN,$pS)	= map $P->copy,1..4;
+
+   $pW(1:-1,:) .= 0.5*($P(1:-1,:) + $P(0:-2,:));
+   $pE(0:-2,:) .= 0.5*($P(1:-1,:) + $P(0:-2,:));
+   $pN(:,1:-1) .= 0.5*($P(:,1:-1) + $P(:,0:-2));
+   $pS(:,0:-2) .= 0.5*($P(:,1:-1) + $P(:,0:-2));
+
+  return map $_->copybad($p), $pW,$pE,$pN,$pS;
+}
+
+#######################################################################
+
+sub mask_boundary
+{
+  my $msk  = pad_2D(shift()->setbadtoval(0));
+  my @mask = map zeroes($msk->dims),1..4;
+
+  $mask[0]->(1:-1, :) .= ($msk(1:-1, :) - $msk(0:-2, :)) == 1;	# West boundary
+  $mask[1]->(0:-2, :) .= ($msk(0:-2, :) - $msk(1:-1, :)) == 1;	# East boundary
+  $mask[2]->(:, 1:-1) .= ($msk(:, 1:-1) - $msk(:, 0:-2)) == 1;	# North boundary
+  $mask[3]->(:, 0:-2) .= ($msk(:, 0:-2) - $msk(:, 1:-1)) == 1;	# South boundary
+
+  return map $_(1:-2,1:-2)->sever, @mask;	# Unpad 2D
+}
+
+#######################################################################
+
+sub pad_2D
+{
+  my $pdl = shift;
+  my $PDL = zeroes(map $_+=2, $pdl->dims);
+     $PDL(1:-2,1:-2) .= $pdl;
+
+  return $PDL;
 }
 
 #######################################################################
@@ -3077,8 +4105,8 @@ sub hash_to_keys
 sub arr_to_hash
 {
   my ($arr, $keys, $hash, $row) = @_;
-#     $hash = {} unless defined $hash;	# Uncomment if want overloading this function
-#     $row  = -1 unless defined $row;	# Uncomment if want overloading this function
+#     $hash //= {};		# Uncomment if want overloading this function
+#     $row  //= -1;		# Uncomment if want overloading this function
       $row++;
   foreach my $i (0 .. $#$arr) {
     if (ref($$arr[$i])) {
@@ -3094,16 +4122,19 @@ sub change_meta
 	### Changes WBM output metadata for daily and monthly time series
 {
   my ($flag,$meta) = (shift,dclone(shift));
+  my  $calendar	   = get_calendar($meta);
+  my  $days_in	   = $calendar==360 ? \&calendar360_DaysInMonth :
+		     $calendar==365 ? \&calendar365_DaysInMonth : \&Time::DaysInMonth::days_in;
 
   die "Unknown Time Series to run. Aborting...\n\n"
 	unless $$meta{Time_Series} =~ m/^(daily|monthly)/i;
 
 		### Daily TS
-  if ($flag == 0 && $$meta{Time_Series} =~ s/monthly$/daily/i) {
+  if ($flag == 0 && $$meta{Time_Series} =~ s/monthly$/$$meta{Run_Step}/i) {
     $$meta{Start_Date}	=~ s/00$/01/;
-    $$meta{End_Date}	=~ s/00$/days_in(split(m%-%,substr($$meta{End_Date},0,7)))/e;
+    $$meta{End_Date}	=~ s/00$/&$days_in(split(m%-%,substr($$meta{End_Date},0,7)))/e;
   }		### Monthly TS
-  if ($flag == 1 && $$meta{Time_Series} =~ s/daily$/monthly/i) {
+  if ($flag == 1 && $$meta{Time_Series} =~ s/$$meta{Run_Step}$/monthly/i) {
     $$meta{Start_Date}	=~ s/01$/00/;
     $$meta{End_Date}	=~ s/\d{2}$/00/;
   }
@@ -3119,9 +4150,12 @@ sub add_spinup_dates
   my ($j_date_list, $date_list, $runIO, $metaDaily) = @_;
   return 0 unless $$runIO{Spinup}{Loops};
 
+  my $days_in	= $$runIO{calendar}==360 ? \&calendar360_DaysInMonth :
+		  $$runIO{calendar}==365 ? \&calendar365_DaysInMonth : \&Time::DaysInMonth::days_in;
+
 	### Make spinup dates for one cycle
   my @start_SP	= split(m/-/,$$runIO{Spinup}{Start}); $start_SP[2] = 1;
-  my @end_SP  	= split(m/-/,$$runIO{Spinup}{End});   $end_SP[2]   = days_in(@end_SP[0,1]);
+  my @end_SP  	= split(m/-/,$$runIO{Spinup}{End});   $end_SP[2]   = &$days_in(@end_SP[0,1]);
 
   my $start_date= sprintf "%04d-%02d-%02d",@start_SP;		# Daily
   my $end_date	= sprintf "%04d-%02d-%02d",@end_SP;		# Daily
@@ -3332,7 +4366,7 @@ printf "\\nDataCube aggregation started for \%d WBM output variables (\%d forks)
 #################################################################
 
 foreach my \$param \(\@param) {
-  \$pm->start and next;			### Run fork processes/net/nfs/zero/home/scripts/perl/
+  \$pm->start and next;			### Run fork processes
 
   if (\$temporal_agg) {
 	# Hourly -> Daily
@@ -3378,7 +4412,7 @@ foreach my \$param \(\@param) {
       next if \$monthly             && (\$suff=~m/_(h|d)\$/);
       next if \$TA_depth eq 'day'   && (\$suff=~m/_(m|y)/);
       next if \$TA_depth eq 'month' && (\$suff=~m/_y/);
-      next if !\$temporal_agg && ((\$hourly && \$suff ne '_h') || (!\$hourly && \$suff ne '_d'));
+      next if !\$temporal_agg && ((\$hourly && \$suff ne '_h') || (!\$hourly && !\$monthly && \$suff ne '_d'));
       my \$flag  = \$rm;
       if (\$suff =~ m/c\$/) {
 	next unless \$climatology;
@@ -3418,7 +4452,7 @@ END
 sub make_build_spool
 	### WBM build spool files script
 {
-  my ($runIO, $dates) = @_;
+  my ($runIO, $dates, $mDays) = @_;
   return if $$runIO{SB_script} eq 'None';
 
   die "\nPP_Perl_path is missing or wrong. Aborting...\n\n" unless $path{PP_Perl_path} && -e $path{PP_Perl_path};
@@ -3426,13 +4460,17 @@ sub make_build_spool
 
 	### Make build spool command list
   my @list;
+ (my $fst_date	 = $$dates[0]) =~ s/^(.+-)(\d{2})/$1.sprintf("%02d",$2+1-$mDays)/e;	# NB- non-redundancy spool
   my $spool_list = delete $$runIO{spool_list};		# Must be deleted from runIO for idump to work later
   foreach my $rec (@$spool_list){
       $$rec[1]{PATCH_VALUE}	= $$rec[1]{PATCH_VALUE}->{ID} if ref($$rec[1]{PATCH_VALUE});
     my $date	 = $$rec[0]->climatology ? sprintf("-sd %s -ed %s",$$rec[0]{dateList}[0],$$rec[0]{dateList}[-1]) :
-					     "-sd $$dates[0] -ed $$dates[-1]";
+					     "-sd $fst_date -ed $$dates[-1]";
        $date	 =~ s/(-\d{2})-\d{2}/$1-00/g	if $$rec[0]->monthly;
        $date	 =~ s/-\d{2}-\d{2}/-00-00/g	if $$rec[0]->yearly;
+       $date	.= " -spDelta"			if $$rec[0]->{spDelta};
+#      $date	.= " -md $1"			if $$rec[0]->daily && $$rec[0]->{MT_attrib}{Name} =~ m/crop/i &&
+#			  $$runIO{MT_Code_Name}{Time_Series} =~ m/(\[[\d,]+lastDay\])/;	# NB- non-redundancy spool
     my $resample = exists($$rec[1]{RESAMPLE})     ? "-r $$rec[1]{RESAMPLE}"     : '';
     my $patch	 = length($$rec[1]{PATCH_VALUE})  ? "-p $$rec[1]{PATCH_VALUE}"  : '';
     my $PATCH	 = exists($$rec[1]{PPATCH_VALUE}) ?"-pp $$rec[1]{PPATCH_VALUE}" : '';
@@ -3462,7 +4500,7 @@ use Getopt::Long;
 #######################################################################
 #############   Process and check command line inputs   ###############
 
-my (\$help,\$quiet,\$nc,\$forks) = (0,0,0,8);
+my (\$help,\$quiet,\$nc,\$forks) = (0,0,0,12);
 			# Get command line options
 usage() if !GetOptions( 'h'=>\\\$help, 'q'=>\\\$quiet, 'nc'=>\\\$nc, 'f=i'=>\\\$forks ) or \$help;
 
@@ -3472,10 +4510,10 @@ usage() if !GetOptions( 'h'=>\\\$help, 'q'=>\\\$quiet, 'nc'=>\\\$nc, 'f=i'=>\\\$
 my \@list = (
 $list
 );
-map(s/_FORKS_/\$forks/,	\@list);		# Set forks
-map(s/ -v / -v  -nc /,	\@list) if \$nc;	# Add nc output,  if needed
+map(s/_FORKS_/\$forks/,	\@list);			# Set forks
+map(s/ -v / -v  -nc /,	\@list) if \$nc;		# Add nc output,  if needed
 map(s/ -v //,		\@list) if \$quiet;	# Remove verbose, if needed
-map(s/\\s+/ /g,		\@list);		# Remove extra spaces
+map(s/\\s+/ /g,		\@list);			# Remove extra spaces
 
 print "\\n" unless \$quiet;
 
@@ -3598,6 +4636,24 @@ sub url_encode {	# Taken from here- https://www.perlmonks.org/?node_id=1179436
   $rv =~ s/([^a-z\d\Q.-_~ \E])/sprintf("%%%2.2X", ord($1))/geix;
   $rv =~ tr/ /+/;
   return $rv;
+}
+
+#######################################################################
+
+sub rm_tmp_files
+{
+  my($dir, $options) =  @_;
+     $dir     //= '/dev/shm';  $dir =~ s/\/$//;			# Remove trailing slash
+  my $prefix	= set_default( $$options{PREFIX}, 'file');
+  my $suffix	= set_default( $$options{SUFFIX},    '*');
+  my $ext	= set_default( $$options{EXT},       '*');
+  my $age	= set_default( $$options{AGE},1/24*10/60);	# Age in days. Set to 10 minutes
+  my $count	= 0;
+	### Clean the files of this owner (-O) and age (-C) of $age in days
+  foreach my $file (<$dir/$prefix$suffix.$ext>) {
+    if (  -O $file && -C _ > $age ) { unlink $file; $count++; }
+  }
+  return $count;
 }
 
 #######################################################################
