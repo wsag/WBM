@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl
 
 #######################################################################
 #
@@ -6,7 +6,7 @@
 #      intellectual property of the copyright holder.
 #      Any partial or complete reproduction, redistribution or modification
 #      without approval of the authors is strictly prohibited.
-#      (C) University of New Hampshire and Water Systems Analysis Group 2008-2021
+#      (C) University of New Hampshire and Water Systems Analysis Group 2008-2023
 #
 #######################################################################
 
@@ -113,7 +113,7 @@
 #	January 2021	Fixed	Soil moisture function in sub-daily runs. Conservative DIN. Some small improvements.
 #	March 2021	Added	Water reuse cycles in Irrigation tracking. Number of small additions.
 #	April 2021	Added	Coastal segmentaiton mask of exorheic outlets. Some non-critical bug fixes.
-#				Runtime temporal aggregaton.
+#				Runtime temporal aggregation.
 #	May 2021	Change	Format of spinup input. Added "Force_ID_Date" parameter to "Spinup" block.
 #	July 2021	Added	Utility "build_spool_batch.pl" to create spool files. Improves performance of WBM.
 #	August 2021	Added	Initial head depth in ModFlow aquifer inputs. Removed Proj4 module dependencies.
@@ -121,31 +121,30 @@
 #	September 2021	Added	RIMS::WBM
 #	December 2021	Added	Option to determine endorheic basins by Network flow dir of -1 at their mouth.
 #	January 2022	Change	Transition to a new version of PDL. Fixed a bug in TWS calculation.
+#			Added	New output vars for reused human return water. Option for double precision output.
+#	February 2022	Added	Option to save output vars during spinup to validate stabilization.
+#	March 2022	Added	New flag "-noStateID" to resume interrupted spinup for cases with State_ID in use.
+#	April 2022	Added	Multi-day time steps.
+#	May 2022	Change	Muskingum routing to work with water withdrawals. Reversing ricePaddyStrg off-split.
+#	June 2022	Fixed	Multiple issues with multi-day time steps. ModFlow RIV additions.
+#			Change	Transition to GDAL FFI interface. Fixed minor bug in ModFlow RIV (min riv area).
+#	October 2022	Added	Inline C functions for tracking in ModFlow and Lumped aquifers.
+#			Fixed	Major problem of memory leak in case of ModFlow multi-aquifer ID mask and tracking.
+#	November 2022	Change	Non-redundancy spool.
+#	December 2022	Fixed	Bug: missing scaling of output vars in run-time aggregations and ice water equivalent.
+#			Fixed	Bug in rain rice paddy tracking in case of multi-day runs.
+#			Added	New output vars. Input parameter AqfCoeff is renamed to ExtraAqfCoeff.
+#	June 2023	Added	Run-time build spool option (-bldSpool); non-ASCII char check in most of input files.
+#	July 2023	Fixed	Crop&LC hash sorting for run consistency. Fixed bug in build spool batch option. Etc.
 #
-#######################################################################
-#
-#	NB-	This is Public domain version that does not contain any unpublished or development features
-#		The full version is WSAG UNH domain has the following additional fuctionality/features:
-#			1. Lumped/Virtual deep groundwater aquifers
-#			2. Replicated MODFLOW deep groundwater aquifers dynamics
-#			3. Springs and Sinks linked to deep groundwater aquifers
-#			4. Endorheic lakes
-#			5. USGS data assimilation
-#
-#		Users who are interested in the WSAG UNH domain version with full set of features should contact
-#		Dr. R. Lammers (WSAG director).
-#
-#
-#######################################################################
-#
-#	Version-		
-use constant WBM_VERSION =>	'1.0.0';	# first open source release version
-#						
+#	Version-		(YY.M.#)	# Number is zero-based
+use constant WBM_VERSION =>	'23.9.0';	# If this month is not listed in the notes above-
+#						#	this version has small bug fixes or minor changes.
 #
 # Debugging errors: >perl -Mdiagnostics wbm.pl -v ...
 #######################################################################
 
-BEGIN {				# Load optional user defined module directory path
+BEGIN {		### Load optional user defined module directory path
  (my $conf_file	= $0) =~ s/[\w\.]+$/WBM.conf/;		# Look it up in ./WBM.conf
   if (-e $conf_file) {
     open(F,$conf_file); my @f=grep(!/^\s*#/,<F>); close F; @f=grep(/^\s*lib_dir/,@f);
@@ -153,13 +152,14 @@ BEGIN {				# Load optional user defined module directory path
     die "\nError in reading lib_dir: $@\n\n" if $@;
     unshift @INC,$dir if $dir;
 } }
-my $module_v = 'WSAG/RIMS modules:';
+my $t5	     = '     ';
+my $module_v = "WSAG/RIMS modules:\n$t5";
 
 use strict;
 use Benchmark;
 use Cwd qw/abs_path/;
 use Data::Dumper;
-use Geo::GDAL;
+use Geo::GDAL::FFI;
 use Getopt::Long;
 use FileHandle;
 use File::Basename;
@@ -169,21 +169,18 @@ use File::Temp;
 use List::Util;
 use Math::Trig qw/pi/;
 use PDL;
-use PDL::Char;
-use PDL::GSL::MROOT;
-use PDL::Image2D;
 use PDL::IO::FlexRaw;
 use PDL::Math;
-use PDL::NetCDF;
 use PDL::NiceSlice;
 use Fcntl;
 use Inline qw/Pdlpp/;
 use Time::JulianDay;
 use Time::DaysInMonth;
-use version;				### WSAG UNH module set
-use RIMS;		$module_v .= ' RIMS v.'		.$RIMS::VERSION.	 ';';
-use RIMS::DataSet;	$module_v .= ' RIMS::DataSet v.'.$RIMS::DataSet::VERSION.';';
-use RIMS::WBM;		$module_v .= ' RIMS::WBM v.'	.$RIMS::WBM::VERSION.	 ';';
+use version;
+use warnings;				### WSAG UNH module set
+use RIMS;	   $module_v.= sprintf "RIMS           %-9s=> %s\n$t5",$RIMS::VERSION,         $INC{"RIMS.pm"};
+use RIMS::DataSet; $module_v.= sprintf "RIMS::DataSet  %-9s=> %s\n$t5",$RIMS::DataSet::VERSION,$INC{"RIMS/DataSet.pm"};
+use RIMS::WBM;	   $module_v.= sprintf "RIMS::WBM      %-9s=> %s",     $RIMS::WBM::VERSION,    $INC{"RIMS/WBM.pm"};
 
 no if $] >= 5.017011, warnings => 'experimental::smartmatch';
 # use PDL::Graphics::PGPLOT;	### PGPLOT graphics for debugging (<imag>)
@@ -193,28 +190,49 @@ no if $] >= 5.017011, warnings => 'experimental::smartmatch';
 die "\nPDL version (v.".$PDL::VERSION.") is not compatible with this code. Aborting...\n\n"
 	unless $PDL::VERSION >= 2.063;
 
+	### GDAL Utility version (set environment variables)
+my  $GDAL_VERSION		= &{sub{$_=get_file_path->{gdalinfo}.' --version';$_=qx($_);chomp;return($_)}};
+$ENV{GDAL_VERSION_CODE}		= $GDAL_VERSION		 =~ m/GDAL ([\w\.]+)/ ? $1 : 'Unknown';
+$ENV{GDAL_VERSION_NUM}		= $ENV{GDAL_VERSION_CODE}=~ m/(\d+\.\d+)/     ? $1 : 'Unknown';
+$ENV{GDAL_PERL_BINDINGS_OK}	= 1;	# Temporary fix for GDAL < 3.5 where bindings will be replaced with FFI
+
+	### GDAL API version
+my $GDAL_API_VERSION		= Geo::GDAL::FFI::GDALVersionInfo('–version');
+my $GDAL_API_VERSION_CODE	= $GDAL_API_VERSION	 =~ m/GDAL ([\w\.]+)/ ? $1 : 'Unknown';
+my $GDAL_API_VERSION_NUM	= $GDAL_API_VERSION_CODE =~ m/(\d+\.\d+)/     ? $1 : 'Unknown';
+
 #######################################################################
 #############   Process and check command line inputs   ###############
 
+my $runID = scalar(@ARGV) == 1 ? $ARGV[0] : pop();
+
 my ($help,$verbose,$bMarkD,$bMarkY,$bMarkM,$remove,$rmSpool,$noOutput,$noState,$threads,$thrSize,$slice,$saveDams) =
-   (  0,      0,      0,      0,      0,      0,      0,       0,        0,       4,       1,       0,      0    );
-my ($idump,$errors,$dState,$test,$noRun,$spool_dir,$run_state_dir) =
-   (  1,      0,      0,     0,     0,       0,           0      );
+   (  0,      0,      0,      1,      0,      0,      0,       0,        0,       4,       1,       0,      0    );
+my ($idump,$errors,$dState,$test,$noRun,$spool_dir,$run_state_dir,$noStateID,$bldSpool) =
+   (  1,      0,      0,     0,     0,       0,           0,           0,       []    );
 my ($MT_file, $credits);
 						# Get command line options
 GetOptions(
-	'h'=>\$help, 'v'=>\$verbose, 'bd'=>\$bMarkD, 'by'=>\$bMarkY, 'bm'=>\$bMarkM, 'rm'=>\$remove,
-	'rmSpool'=>\$rmSpool, 'noOutput'=>\$noOutput, 'noState'=>\$noState, 't=i'=>\$threads, 'tz=i'=>\$thrSize,
-	'sl'=>\$slice, 'saveDams'=>\$saveDams, 'err'=>\$errors, 'dState'=>\$dState, 'test'=>\$test, 'noRun'=>\$noRun,
-	'spoolDir=s'=>\$spool_dir, 'stateDir=s'=>\$run_state_dir) or exit();	usage() if $help;
+	'h'=>\$help, 'v'=>\$verbose, 'bd'=>\$bMarkD, 'bm'=>\$bMarkM, 'rm'=>\$remove, 'rmSpool'=>\$rmSpool,
+	'noOutput'=>\$noOutput, 'noState'=>\$noState, 't=i'=>\$threads, 'tz=i'=>\$thrSize, 'sl'=>\$slice,
+	'saveDams'=>\$saveDams, 'err'=>\$errors, 'dState'=>\$dState, 'test'=>\$test, 'noRun'=>\$noRun,
+	'spoolDir=s'=>\$spool_dir, 'stateDir=s'=>\$run_state_dir, 'noStateID'=>\$noStateID,
+	'bldSpool=s{1,2}'=>\@$bldSpool) or exit();	usage() if $help || !$runID;
+
+die "\n\"-bldSpool\" option is not allowed with \"-test\" or \"-noOutput\" options. Aborting...\n\n"
+	if scalar(@$bldSpool)    && ($noOutput || $test);
+die "\nNumber of forks in the -bldSpool option must be an integer number. Aborting...\n\n"
+	if scalar(@$bldSpool)    && $$bldSpool[0] !~ m/^\d+$/;
+die "\nNC in the -bldSpool option can only take 1, true/false, or NC as values. Aborting...\n\n"
+	if scalar(@$bldSpool)==2 && $$bldSpool[1] !~ m/^false|true|1|NC$/i;
+	if(scalar(@$bldSpool)==2) { $$bldSpool[1] =~ s/^false/0/i; }
 
 #######################################################################
 #############   Read this run settings and parameters   ###############
 
-my $runID  = shift() or usage();
 my %runIO  = isInitFile($runID) ? read_init(  $runID,{CHECK_ARR=>wbm_reqParams(), MAKE_ARR=>wbm_params()}) :
 				  read_attrib({get_conf}->{runIO_list},$runID,'ID',{EVAL_KEYS=>1});
-   $runIO{Spinup}	= spinup_param_init( \%runIO, $dState );	# Read and check spinup inputs
+   $runIO{Spinup}	= spinup_param_init( \%runIO, $dState, $noStateID );	# Read and check spinup inputs
 my %path   = get_paths();	# Get WBM dir/file paths from (1) conf; (2) WBM init file; (3) command line inputs
 
 	### Make MT metadata for this WBM run
@@ -249,8 +267,14 @@ my @list_out		= make_list_out(\%runIO);		# List of WBM variables to output
 my %wbmParam		= read_param_str(\%runIO, 'wbmParam');	# Custom WBM parameters
    $wbmParam{saveEndorhMask}= 0	if	 $test;			# Disable saving files in test mode
    $runIO{NC4}		= set_default($wbmParam{NC4}, 1);	# Use NetCDF v.4 for output files (compressed)
-my $days_in		= $runIO{calendar}==365 ?		# Calendar functions
-			  \&calendar365_DaysInMonth : \&Time::DaysInMonth::days_in;
+my $ncVarType		= $wbmParam{ncDouble}?\&double:\&float;	# Type of output vars in NetCDF files
+								# Calendar functions
+my $julian_day		= $runIO{calendar}==360 ? \&calendar360_day         : \&Time::JulianDay::julian_day;
+my $inverse_julian_day	= $runIO{calendar}==360 ? \&calendar360_inverse_day : \&Time::JulianDay::inverse_julian_day;
+my $days_in		= $runIO{calendar}==360 ? \&calendar360_DaysInMonth :
+			  $runIO{calendar}==365 ? \&calendar365_DaysInMonth : \&Time::DaysInMonth::days_in;
+my $is_leap		= $runIO{calendar}==360 ? \&calendar360_is_leap     :
+			  $runIO{calendar}==365 ? \&calendar365_is_leap     : \&Time::DaysInMonth::is_leap;
 die "\nWBM is not coded for 360 calendar. Aborting...\n\n" if $runIO{calendar}==360;
 
 	### Check input compatibility with older versions
@@ -265,7 +289,7 @@ die "Wrong muli-threading options...\n" if $threads < 1 && $thrSize < 0;
 $threads = 8 if $threads > 8;
 
 set_autopthread_targ($threads);	# Number of CPU threads
-set_autopthread_size($thrSize);	# Piddle size lower limit (in Meg) for multi-threading
+set_autopthread_size($thrSize);	# Piddle size lower limit (in Mb) for multi-threading
 set_err() if $errors;
 
 #######################################################################
@@ -284,6 +308,7 @@ unlink  $runIO{Output_MT}	unless	$noOutput;
 rmtree  $runIO{spool}	 	if	$rmSpool;
 rmtree  $runIO{Output_dir}	if 	$remove;
 unlink <$run_state_file.*>	if 	$remove;
+rm_tmp_files();					# Remove unlikely leftover tmp files from GDAL functions
 
 	### Make changes for "no output" case
 if ($noOutput) {
@@ -310,18 +335,21 @@ if ($bMarkM) {
 }
 
 print  "\nThe job started on $time_start_str.\n$module_v\n";
-printf "WBM-TrANS version: %s\n", WBM_VERSION;
-printf "WBM-TrANS  run ID: %s\n", $runIO{ID}. ($test ? '  (Test Mode)' : '');
-printf "WBM-TrANS  run MT: %s\n", $noOutput ? 'No Output' : $runIO{Output_MT};
+printf "WBM  model version: %-9s=> %s\n", WBM_VERSION, abs_path($0);
+printf "GDAL API   version: %s\n", $GDAL_API_VERSION_CODE;
+printf "GDAL Util  version: %s\n", $ENV{GDAL_VERSION_CODE};
+printf "GDAL FFI   version: %s\n", $Geo::GDAL::FFI::VERSION;
+printf "WBM  model run  ID: %s\n", $runIO{ID}. ($test ? '  (Test Mode)' : '');
 
 	### Make Global attributes for the output NetCDF files
 my $global_attrib = [
-	['title',		'WBM-TrANS data'],
+	['title',		'WBM data'],
 	['Projection',		$runIO{Projection}],
 	['WBM_VERSION',		WBM_VERSION],
 	['PDL_VERSION',		$PDL::VERSION],
 	['PERL_VERSION',	$]],
-	['GDAL_VERSION',	&{sub{$_=get_file_path->{gdalinfo}.' --version';$_=qx($_);chomp;return($_)}}],
+	['GDAL_Util_VERSION',	$GDAL_VERSION],
+	['GDAL_API_VERSION',	$GDAL_API_VERSION],
 	['WBM_RUN_ID',		$runIO{ID}],
 	['WBM_RUN_Init',	$runID],
 	['WBM_Start_time',	$time_start_str],
@@ -336,7 +364,7 @@ foreach my $unwated (qw(runIO_ID runIO_Projection runIO_NC4 runIO_spool_list)) {
 }
 	### Global attributes: Convert hash parameters to strings
 foreach my $attrib (@$global_attrib) {
-  $$attrib[1] = '' unless defined($$attrib[1]);
+  $$attrib[1] //= '';
   if (ref($$attrib[1])) {
     my $dumper = Data::Dumper->new( [$$attrib[1]] );
     $dumper->Purity(1)->Deepcopy(1)->Quotekeys(0)->Sortkeys(1)->Indent(0);
@@ -344,15 +372,15 @@ foreach my $attrib (@$global_attrib) {
 }}
 	### Make Global attributes for the output NetCDF files of runtime aggregations
 my $RT_global_attrib = [
-	['title',		'WBM-TrANS data of runtime aggregations'],
+	['title',		'WBM data of runtime aggregations'],
 	['Projection',		$runIO{Projection}],
 	['WBM_VERSION',		WBM_VERSION],
 	['references',		'https://www.wsag.unh.edu']
 ];
 	### GDAL test to check NetCDF files are read correctly
 my $GDAL_test	= GDAL_test($path{gdal_test_dir});
-printf "GDAL NetCDF test : %s\n", $GDAL_test ? 'Good' : 'Not Performed';
-print  "System           : $path{SYSTEM}\n\n";
+printf "GDAL NetCDF   test: %s\n", $GDAL_test ? 'Good' : 'Not Performed';
+print  "System            : $path{SYSTEM}\n\n";
 
 #######################################################################
 #########     Process/Prepare Run & Output metadata        ############
@@ -375,7 +403,7 @@ my $output_dir	= substr(dirname($dataSet{run}->{fileList}[0][0]), 7).'/';
 	### Make lists of daily dates
 my $metaDaily	= change_meta(0,$runAttr);
 my($j_date_list, $date_list) = make_date_list($$metaDaily{Start_Date},$$metaDaily{End_Date},$metaDaily);
-my $jDate_1900	= julian_day(1900,1,1);
+my $jDate_1900	= &$julian_day(1900,1,1);
 
 	### Spinup Initialization (dates)
 my $n_SP	= add_spinup_dates($j_date_list,$date_list,\%runIO,$metaDaily);
@@ -384,7 +412,7 @@ my $n_spinup	= $runIO{Spinup}{Loops} * $n_SP;
 #######################################################################
 	### Input- WBM Geographical Extent (taken from Network file)
 
-my $extent	= get_extent($runIO{Network}, $runIO{Projection});
+my $extent	= get_extent($runIO{Network}, $runIO{Projection}, {INDEX=>1});
 my $network	= $$extent{mask};	# This is not really needed.
 my($lon, $lat)	= lonLat($extent);
 my $grid	= [$lon, $lat, $$extent{gTransform}, $$extent{projection}];
@@ -406,27 +434,32 @@ my $zeroes	= zeroes(double,$$extent{ncols},$$extent{nrows})->copybad($$extent{ma
 my $ones	= ones  (double,$$extent{ncols},$$extent{nrows})->copybad($$extent{mask});
 my $CELL_AREA	= cell_area($lon, $lat, $extent);	### Full cell area in km^2
 
-			### Sub-daily variables
+			### Time variables
 		# Note- notation "sub-daily interval" or "dt" is referred as the model time step (e.g. flux in mm/dt units)
-my $subDi	= $$runAttr{Time_Series} =~ m/daily\{(\d+)}/ ? $1 : 1;	# Sub-daily intervals in a day
-my $subDh	= 24/$subDi;						# Sub-daily interval, hours
-my $subDf	=  1/$subDi;						# Sub-daily interval, day
-my $hr_flag	=    $subDi > 1;					# Flag for sub-daily run
-my $last_hr	=  $hr_flag ? 24-$subDh : 0;				# Last hour of sub-daily cycle
-die "\nBad number of sub-daily intervals. Aborting...\n\n" unless grep $subDi==$_, (1,2,3,4,6,8,12,24);
+my $mDays	= $$metaDaily{Time_Series} =~ m/daily\[(\d+)/ ? $1 : 1;	# Multi-day intervals
+my $subDi	= $$metaDaily{Time_Series} =~ m/daily\{(\d+)}/? $1 : 1;	# Sub-daily intervals in a day
+my $md_flag	= $mDays > 1;						# Flag for multi-day run
+my $hr_flag	= $subDi > 1;						# Flag for sub-daily run
+   $subDi	= 1/$mDays	if $md_flag;
+my($subDh,								# Sub-daily interval, hours
+   $subDf,								# Sub-daily interval, day
+   $dt)		= time_vars($subDi);					# Time step, sec.
+my($j_date_prev,  $mDate);						# Previous date (needed for multi-day runs)
+my $last_hr	= $hr_flag ? 24-$subDh : 0;				# Last hour of sub-daily cycle
+die "\nBad number of sub-daily intervals. Aborting...\n\n" if $hr_flag && !(grep $subDi==$_, (1,2,3,4,6,8,12,24));
 
-			### Time step, etc.
-my $dt		= 3600*$subDh;			### Time step, sec.
+			### Miscellaneous
 my $dL		= sqrt($CELL_AREA) *		### Cell river reach length, km
 	condition(($network==1)|($network==4)|($network==16)|($network==64), 1, 1/sin(pi/4));
 
 			### Start/End of the year conditions
-my $yearBeg	= '01-01'					. ($hr_flag ? 'T00'		: '');
+my $mnthBeg	= sprintf("%02d", $mDays)			. ($hr_flag ? 'T00'		: '');
 my $yearEnd	=($runIO{calendar} == 360 ? '12-30' : '12-31')	. ($hr_flag ? 'T'.(24-$subDh)	: '');
+my $yearBeg	= '01-' . $mnthBeg;
 
 			### Active and soil areas (km2), and conversion coefficients
 my $M3_2_MM	= 1e-3  /  $CELL_AREA;			# conversion: m3 -> mm  over full cell area
-my($cell_area, $soil_area, $mm_2_KM3, $mm_2_km3, $mm_2_m3, $m3_2_mm) = area_layers( $CELL_AREA, 0, 0, 0, $subDf );
+my($cell_area, $soil_area, $mm_2_KM3, $mm_2_km3, $mm_2_m3, $m3_2_mm) = area_layers( $CELL_AREA, 0, 0, 0 );
 my			 ( $MM_2_KM3, $MM_2_km3, $MM_2_m3 )	     = map $_*$subDf, $mm_2_KM3,$mm_2_km3,$mm_2_m3;
 			#  $MM_2_KM3	- conversion of mm/day to sub-daily km3 (active area)
 			#  $MM_2_km3	- conversion of mm/day to sub-daily km3 (soil area)
@@ -454,21 +487,7 @@ my %cell_ind = map(($cell_table->at(3,$_).'_'.$cell_table->at(4,$_) => $_), 0..$
 $runIO{Routing} = {'method' => 'LRR'} unless $runIO{Routing};	# Default routing method is LRR
 my %routing	= $runIO{Routing} =~ m/^\w+$/ ? ('method'=>$runIO{Routing}) : read_param_str(\%runIO, 'Routing');
 my $routingMethod = $routing{method};
-die "Unknown Routing Method: $routingMethod...\n" unless $routingMethod =~ m/Muskingum|LRR|Flush/i;
-
-	### Warning for switching Routing
-	###	TBD- Add abstractions to Muskingum method (as per discussions with Balazs)
-if (($runIO{ConnectivityNetwork} || $runIO{WaterDemand} || $runIO{Irrigation} || $runIO{openWaterEvap}) &&
-	$routingMethod =~ m/Muskingum/) {
-  print <<EOF;
-Warning- Muskingum routing is not compatible with:
-	Inter-basin water transfer;
-	Water demands and Irrigation;
-	Water evaporation from river channels.
-Linear Reservoir Routing (LRR) is used instead.\n
-EOF
-  $routingMethod = 'LRR';
-}
+die "Unknown Routing Method: $routingMethod...\n" unless $routingMethod =~ m/Muskingum|LRR|Flush/;
 
 #######################################################################
 ################   Dataset Inputs/Initialization   ####################
@@ -480,9 +499,12 @@ my ($damData,$reservoir,$resInput) = add_reservoirs($runSet,$metaDaily,$CELL_ARE
 
 			### Initial Storage (units- m3) is 60 % of reservoir/lake Capacity
 my @resStorage	= ($cell_table->addReservoirs(@$reservoir, 0.6, $$j_date_list[0], $network->dims));
-my $spillDam	= which($$reservoir[0]->((4),) == 0) if @$damData;	# Spillway   dam indices
-my $irrigDam	= which($$reservoir[0]->((4),) == 4) if @$damData;	# Irrigation dam indices
-my $obsDam	= which($$reservoir[0]->((4),) == 7) if @$damData;      # Observed outflow dams
+my $spillDam	= which($$reservoir[0]->((4),) == 0)		if @$damData;	# Spillway   dam indices
+my $irrigDam	= which($$reservoir[0]->((4),) == 4)		if @$damData;	# Irrigation dam indices
+my $obsDam	= which($$reservoir[0]->((4),) == 7)		if @$damData;	# Observed outflow dams
+my $damCapacity	= List::Util::sum(map($$_[8],@$damData))*1e-9	if @$damData;	# Reservoir capacity, km3
+my $muskMask	= muskingum_Mask($extent,$reservoir, $routingMethod);		# Storage mask for Muskingum routing
+my $damMask	=!muskingum_Mask($extent,$reservoir, 'Muskingum');		# Storage mask for Muskingum routing
 
 			### Irrigation demand daily frequency to control irrigation reservoir water use
 if ($$resInput{IrrFrequency}) {
@@ -497,6 +519,7 @@ my $smResCpcty	= $$resInput{smReservoirFile} ?		# in m3
 my $smResArea	= $smResCpcty / 2;			# in m2 assuming SIR depth = 2 m
    $smResCpcty /= $mm_2_m3;				# Convert SIR capacity to mm
 my @smResStrg	= (0.6 * $smResCpcty);			# SIR storage, mm
+my $sirEvap	= $smResFlag ? $zeroes->copy : $zeroes;	# Evaporation from SIR, mm/day
 
 			### Endorheic lakes
 my $endoStrg	= $zeroes->indexND($$outletIdx{ENDORHEIC})->sever;
@@ -558,7 +581,8 @@ else {
 			### Other climate drivers
 my $OWEC_flag  =  $runIO{openWaterEvap} =~ m/Calculate/i;	# Flag to calculate open water evaporation
 my $waterTemp  =  m/_twt$/ ~~ @list_out;			# Flag to calculate water temperature
-if($runIO{PET} =~ m/^FAO-56|Penman-Monteith$/ || $waterTemp || $OWEC_flag) {
+   check_PET_str(\%runIO);					# Read/check PET input
+if($runIO{PET}{method} =~ m/^FAO-56|Penman-Monteith$/ || $waterTemp || $OWEC_flag) {
   print "Initialization of datasets for required additional climate drivers...\n";
   die "\"MT_cloudFr\"	input is required for this WBM setup. Aborting...\n\n" unless $runIO{MT_cloudFr};
   die "\"MT_windU\"	input is required for this WBM setup. Aborting...\n\n" unless $runIO{MT_windU};
@@ -598,7 +622,7 @@ if($runIO{PET} =~ m/^FAO-56|Penman-Monteith$/ || $waterTemp || $OWEC_flag) {
   die "\n\"Elevation\" dataset is required in case of Specific Humidity is used in the \"MT_humidity\" input. Aborting...\n\n"
 	if $dataSet{humidity}->{MT_attrib}{Units} eq 'kg/kg' && !$runIO{Elevation};
 }
-if ($runIO{PET} eq 'Penman-Monteith' || $waterTemp) {
+if ($runIO{PET}{method} eq 'Penman-Monteith' || $waterTemp) {
   die "\"canopyHt\"	input is required for this WBM setup. Aborting...\n\n" unless $runIO{canopyHt};
   die "\"MT_LAI\"	input is required for this WBM setup. Aborting...\n\n" unless $runIO{MT_LAI};
 } die "\"Elevation\"	input is required for this WBM setup. Aborting...\n\n" if    !$runIO{Elevation} && $OWEC_flag;
@@ -606,11 +630,10 @@ if ($runIO{PET} eq 'Penman-Monteith' || $waterTemp) {
 			### PET
 my @grossRad =((0) x  365);
 my @dayLen;	###  For Hamon PET- dayLen is fraction of day (24 hours) with daylight
-       $runIO{PET} =    'Hamon' unless $runIO{PET};
-if (   $runIO{PET} =~ m/^Hamon$/) { @dayLen	= map dayLength($lon,$lat,$_), 0..364; }
-elsif ($runIO{PET} =~ m/^FAO-56|Penman-Monteith$/) {
-  print "Initialization of datasets for $runIO{PET} PET model...\n";
-  die "\"MT_albedo\"	input is required for $runIO{PET} PET method. Aborting...\n\n" unless $runIO{MT_albedo};
+if (   $runIO{PET}{method} =~ m/^Hamon$/) { @dayLen	= map dayLength($lon,$lat,$_), 0..364; }
+elsif ($runIO{PET}{method} =~ m/^FAO-56|Penman-Monteith$/) {
+  print "Initialization of datasets for $runIO{PET}{method} PET model...\n";
+  die "\"MT_albedo\"	input is required for $runIO{PET}{method} PET method. Aborting...\n\n" unless $runIO{MT_albedo};
 
   $dataSet{albedo}	  = new RIMS::DataSet(attrib($runIO{MT_albedo}{Primary},	$MagicT,'MT_albedo->Primary'));
   $dataSet{albedo_Ptch}	  = new RIMS::DataSet(attrib($runIO{MT_albedo}{Secondary},	$MagicT,'MT_albedo->Secondary'))
@@ -623,7 +646,7 @@ elsif ($runIO{PET} =~ m/^FAO-56|Penman-Monteith$/) {
   $wbmParam{CLeafMax}	 = set_default($wbmParam{CLeafMax}, 6);	# Maximum Leaf Conductance, Dingman, 2008, Table (7-5)
   $wbmParam{CLeafMax}	 = read_Layer($extent,\%meta, $wbmParam{CLeafMax}, $MagicT, {KEY=>'CLeafMax'});
 }
-else { die "Unknown PET method: \"$runIO{PET}\". Aborting...\n\n"; }
+else { die "Unknown PET method: \"$runIO{PET}{method}\". Aborting...\n\n"; }
 
 			### Free-Water, Lake, and Wetland Evaporation
 if ($runIO{openWaterEvap} && !$OWEC_flag) {
@@ -647,13 +670,15 @@ my ($glMelt, $glArea, $glVolume) = ($zeroes->copy, $zeroes->copy, $zeroes->copy)
 my  $glScale = 1;
 if ($runIO{Glaciers}) {
   print "Initialization of datasets for Glacier inputs...";
-  my %param		= read_param_str(\%runIO, 'Glaciers');
-  $dataSet{glMelt}	= new RIMS::DataSet(attrib($param{glMelt},  $MagicT, 'Glaciers->glMelt'));
-  $dataSet{glArea}	= new RIMS::DataSet(attrib($param{glArea},  $MagicT, 'Glaciers->glArea')); if (exists $param{glVolume}){
+  my %param		= read_param_str(\%runIO, 'Glaciers');      if (exists   $param{glVolume}) {
+  $dataSet{glVolume}	= new RIMS::DataSet(attrib($param{glVolume},$MagicT, 'Glaciers->glVolume'))}
+  $dataSet{glMelt}	= new RIMS::DataSet(attrib($param{glMelt},  $MagicT, 'Glaciers->glMelt'  ));
+  $dataSet{glArea}	= new RIMS::DataSet(attrib($param{glArea},  $MagicT, 'Glaciers->glArea'  ));
+  my $glMeltExt		= get_extent($dataSet{glMelt}->{fileList}[0][0],	{MASK =>0});
+  my $glAreaExt		= get_extent($dataSet{glArea}->{fileList}[0][0],	{MASK =>0});if(exists $param{glVolume}){
+  my $glVolumeExt	= get_extent($dataSet{glVolume}->{fileList}[0][0],	{MASK =>0});
   $dataSet{glVolume}	= new RIMS::DataSet(attrib($param{glVolume},$MagicT),	{UNITS=>'m3'});
-    my $glMeltExt	= get_extent($dataSet{glMelt}  ->{fileList}[0][0],	{MASK =>0});
-    my $glVolumeExt	= get_extent($dataSet{glVolume}->{fileList}[0][0],	{MASK =>0});
-    die "Mismatch in \"glVolume\" and \"glMelt\" dataset spatial resolutions (presently required). Aborting...\n\n"
+    die "\n\nMismatch in \"glVolume\" and \"glMelt\" dataset spatial resolutions (presently required). Aborting...\n\n"
 	if abs($$glMeltExt{cellsizeX} - $$glVolumeExt{cellsizeX}) > 0.0001 * $$glVolumeExt{cellsizeX} ||
 	   abs($$glMeltExt{cellsizeY} - $$glVolumeExt{cellsizeY}) > 0.0001 * $$glVolumeExt{cellsizeY};
 
@@ -661,13 +686,17 @@ if ($runIO{Glaciers}) {
   push @{$runIO{spool_list}},	[$dataSet{glMelt},   {RESAMPLE=>0,PATCH_VALUE=>0}],
 				[$dataSet{glArea},   {RESAMPLE=>5,PATCH_VALUE=>0}];
 
-  $glArea = read_dateLayer($dataSet{glArea},$$date_list[0],$extent,$runIO{spool},
+  $glArea		= read_dateLayer($dataSet{glArea},$$date_list[0],$extent,$runIO{spool},
 			{DATE_SEARCH_OPT=>{YR_UP=>1}, RESAMPLE=>5})->clip(0, 0.99);
+  die "\n\nMismatch in \"glArea\" and \"glMelt\" dataset spatial resolutions (presently required). Aborting...\n\n"
+	if abs($$glMeltExt{cellsizeX} - $$glAreaExt{cellsizeX}) > 0.0001 * $$glAreaExt{cellsizeX} ||
+	   abs($$glMeltExt{cellsizeY} - $$glAreaExt{cellsizeY}) > 0.0001 * $$glAreaExt{cellsizeY};
   die "\n\nGlacier Area dataset must be in land/area fraction units. Aborting...\n\n"
 	unless $dataSet{glArea}->{MT_attrib}{Units} =~ m/frac/i;
 			### Calculate glacier melt scaling factor due to difference resolutions of source and Network grids
+
   $glScale	= gl_scale($dataSet{glMelt}, $dataSet{glArea}, $glArea, $CELL_AREA, $$date_list[0], $runSet);
-  printf " Avg scaling = %.4f\n", ref($glScale) ? $glScale->where($glScale > 0)->avg : $glScale;
+  printf " Median scaling = %.3f\n", ref($glScale) ? $glScale->where($glScale > 0)->median : $glScale;
 }
 			### Bias correction for climate simulation data (e.g. IPCC AR5)
 my @precip_bias	= read_climate_bias($dataSet{precip}, $runIO{WM_mod_precip},$runIO{WM_obs_precip},$runSet,$MagicT);
@@ -690,7 +719,8 @@ if ($waterTemp) {
   $bflowScl		= 0.59;	# Baseflow/groundwater temperature scaling factor
   @grossRad		= map grossRadiation($lon,$lat,$_),0..364 unless ref $grossRad[0] || $hr_flag;
 	 $waterTemp	= 1;
-} else { $waterTemp	= 0; } # Do not run water Temperature unless wanted in the output
+} else { $waterTemp	= 0;	# Do not run water Temperature unless wanted in the output
+	 $grndWaterTw	= pdl(); }
 
 #######################################################################
 		### Dissolved Inorganic Nitrogen (DIN) Drivers
@@ -703,8 +733,7 @@ if (m/^DIN/ ~~ @list_out) {
 
   my %param		= read_param_str(\%runIO, 'DIN');
   $dataSet{luSub}	= init_DSet($extent,\%meta,$param{luSub},	$MagicT);	# Fraction developed
-  $dataSet{luAgr}	= init_DSet($extent,\%meta,$param{luAgr},	$MagicT,	# Fraction agriculture
-	{DATASET_OPT=>{START_YEAR_CLIP=>1800}});
+  $dataSet{luAgr}	= init_DSet($extent,\%meta,$param{luAgr},	$MagicT);	# Fraction agriculture
   $DIN_param{scale}	= set_default($param{scale},	12.200);	# Spread of logistic function
   $DIN_param{asym}	= set_default($param{asym},	 1.400);	# Maximum (e.g. peak) DIN conc from human land-use/development
   $DIN_param{asym_ag}	= set_default($param{asym_ag},4.800) if $runIO{Irrigation};	# Optional Maximum DIN conc from agricultural land # Note: Irrigation is needed because that is where when we save out cropAreaFrac
@@ -840,8 +869,8 @@ my $MDInfiltrationFrac	= set_default($wbmParam{infiltrFrac},	0.5);	# Can be a nu
 my $MDGroundWatBETA	= set_default($wbmParam{groundWatBETA},	0.0167);
    $MDGroundWatBETA	= $ones * read_Layer($extent, \%meta, $MDGroundWatBETA,    $MagicT, {PATCH_VALUE=>0.0167});
 my $HBV_Beta		= set_default($wbmParam{HBV_Beta},	60);
-my $RhRt2		= set_default($wbmParam{RhRt2},		0.56);	### Runoff storage release (R_hole/R_tank)^2
-   $RhRt2		= $ones * read_Layer($extent, \%meta, $RhRt2,		   $MagicT, {PATCH_VALUE=>0.56});
+my $RhRt2		= set_default($wbmParam{RhRt2},		0.2);	### Runoff storage release unitCoeff*(R_hole/R_tank)^2
+   $RhRt2		= $ones * read_Layer($extent, \%meta, $RhRt2,		   $MagicT, {PATCH_VALUE=>0.2});
 my $G2			= 2 * 9.80665;					### 2 * acceleration of gravity, m/sec2
 my $irrGm               = set_default($wbmParam{irrGm},         0);     ### Flag to simulate stage 2 soil gamma AET
                                                                         ###   in irrigated crop areas
@@ -915,9 +944,10 @@ my @snkStack    = make_stack($snk_data, ['Infil','Aqf_ID','INFIL'], \%cell_ind);
 my $spr_flag	= keys(%$spr_data) ? 1 : 0;				# Flag to use springs
 my $snk_flag	= $snkStack[1]->dim(0) > 1;				# Flag to use sinks
 my $snk_idx	= $cell_table(3:4,$snkStack[1]->(:-2))	if $snk_flag;	# 2D indices of sink locations
-my $aquiferID	= aqf_ID_mask($aqf_data, $extent)	if $aqfType;	# 2D mask of aquifer IDs
-my @aqf_IDs	= sort keys %$aqf_data			if $aqfType;	# Sorted aquifer IDs
-my $AQF_IDs	= $aqfType ? pdl(@aqf_IDs) : pdl();			# PDL object of the above
+my @aqf_IDs	= sort {$a<=>$b} keys %$aqf_data	if $aqfType;	# Numerically(!) sorted aquifer IDs
+my $aquiferID	= $aqfType ? delete($$AQF_DATA{aquiferID}) : pdl();	# 2D mask of aquifer IDs
+my $aIdx	= $aqfType ? aqf_Idx(\@aqf_IDs)		   : pdl();	# Aquifer ID index table
+my $wStreamMin	= $CELL_AREA*1e3 / $lStream		if $aqfType==3;	# Min riverbed width for ModFlow RIV,	m
 my $spr_dschT_y	= 0;							# Annual total discharge from springs,	km3
 my $snk_inflT_y	= 0;							# Annual total inflows from sinks,	km3
 foreach my $aqf_ID (@aqf_IDs) { map $$aqf_data{$aqf_ID}{$_.'_y'} = 0, @{$$AQF_DATA{sumKeys}}; }	# Initialization
@@ -1005,7 +1035,7 @@ my $cEndoP	= $compSwitch[2] ?($endoComp?$zeroes_4->copy:$zeroes_4):pdl();	#	non-
    $cStreamP[0]->(,,2) .= 1				if $compSwitch[2];	# Rain = 1
    $cSoilP	 (,,2) .= 1				if $compSwitch[2];
    $cSIR_P	 (,,2) .= 1				if $compSwitch[2];
-my %cAqWaterP = map(($_=>$px4c->copy), @aqf_IDs)	if $compSwitch[2];
+my $cAqWaterP	= $compSwitch[2] ? pdl(map($px4c->copy,0..$#aqf_IDs)) : pdl();
 
 	# Bucket # 3: 0- Relict/Unsustainable water; 1- Pristine; 2- Dom/Ind/Stk use return; 3+ - Irrigation return
 my $cRffStgIrr	= $compSwitch[3] ? $zeroes_N->copy : pdl();
@@ -1018,7 +1048,7 @@ my $cGrWaterIrr	= $compSwitch[3] ? $zeroes_N->copy : pdl();			#	non-zero initial
    $cStreamIrr[0]->(,,0) .= 1				if $compSwitch[3];	# Relict = 1
    $cSoilIrr	   (,,0) .= 1				if $compSwitch[3];
    $cSIR_Irr	   (,,0) .= 1				if $compSwitch[3];
-my %cAqWaterIrr= map(($_=>$pxNd->copy), @aqf_IDs)	if $compSwitch[3];
+my $cAqWaterIrr	= $compSwitch[3] ? pdl(map($pxNd->copy,0..$#aqf_IDs)) : pdl();
 
 	# Bucket # 4: Water Temperature
 my $cRunoffTw	= $compSwitch[4] ? zeroes(double,$network->dims) : pdl();
@@ -1043,6 +1073,8 @@ my $cStmConDIN	= $compSwitch[6] ? zeroes(double,$network->dims) : pdl();	# Conse
 my %land	= land_init(@$runSet);
 my $irrCropList	= delete $land{irrCrop}{cropList};
 my $landPatch	= delete $land{patch};
+my @lnd		= sort keys %land;				# Sorted land cover groups
+my %tp		= map(($_=>[sort keys %{$land{$_}}]), @lnd);	# Sorted land cover types in a group
 my @sMoist	= ($zeroes->copy);
 my $sMoistFrac	= 0.5 * $ones;		# Initial soil moisture fraction
 my(%sMoistGr, %sMoistGrET, %sMoistET);	# BW/GW additions-
@@ -1050,7 +1082,8 @@ my(%sMoist,   %sMoistPrev,   %sMoistFrac);
 my(%sMoistVs, %sMoistPrVs,   %sMoistFrVs);	### Virtual soil for irrigated crops to track potential Irr demand
 my(%cropMask, %cropMaskPrev, %irr_demand, %irr_appRte, %irr_demVs, %irr_demVrt, %irrigation, %irrTech);
 my @irrVIS	= ($zeroes->copy);		### Virtual Irrigation Storage to simulate daily irrigation use
-my $irrEqpArea	= 0;	my $cropAreaFrac;
+my $irrEqpArea	=  $zeroes->copy if $runIO{Irrigation};
+my $cropAreaFrac=  $zeroes->copy if $runIO{Irrigation};
 
 		### Irrigation parameters
 my $irrEfficiencyData;
@@ -1069,14 +1102,15 @@ my $irrEvapDeliv_y  =   0;			### Annual Delivery    Irr water evaporation
 my $SW_ratio;					### Surface to Groundwater ratio for irrigation water intake
 my %irrParam        = read_param_str(\%runIO, 'Irrigation');
    $irrParam{IrrSearchDist}	= $irrParam{SearchDist} if exists $irrParam{SearchDist}; # Backward compatibility
+   $irrParam{ExtraAqfCoeff}	= $irrParam{AqfCoeff}   if exists $irrParam{AqfCoeff};   # Backward compatibility
 my $irrEfficiency   = set_default($irrParam{IrrEfficiency},1);	### Irrigation efficiency
 my $dailyIrr	    = set_default($irrParam{dailyIrr},	 0  );	### 0- by crop depletion factor;    1- daily Irr
 my $useVIS	    = set_default($irrParam{useVIS},	 1  );	### 0- no VIS, Virtual Irr Storage; 1- use VIS
 my $irrAppRate	    = set_default($irrParam{irrAppRate}, 50 );	### Max Irr application rate, mm/day
 my $irrOrder	    = set_default($irrParam{Order},	 1  );	### Irr Order: 0- Grnd Water; 1- Stream priority;
 my $irrReturnCoef   = set_default($irrParam{ReturnCoeff},1.0);	### Irrigation return partitioning
-my $irrExtraCoeff   = set_default($irrParam{ExtraCoeff}, 1.0);	### Factor of unsustainable water withdrawal
-my $irrAqfCoeff     = set_default($irrParam{AqfCoeff},   1.0);	### Factor of water withdrawal from aquifers
+my $irrExtraCoeff   = set_default($irrParam{ExtraCoeff}, 1.0);	### Factor of UGW withdrawal over non-aquifer areas
+my $irrAqfCoeff     = set_default($irrParam{ExtraAqfCoeff},1.0);### Factor of UGW withdrawal over     aquifer areas
 my $irrSearchDist   = set_default($irrParam{IrrSearchDist},100);	### Search distance for stream water, km
    $irrSearchDist   = floor($irrSearchDist/sqrt($CELL_AREA))->long;	### Convert search distance to pixels
 my $irrGrwthRefYr   = set_default($irrParam{irrGrwthRefYr},0);	### Irrigated area growth reference year
@@ -1101,10 +1135,15 @@ my($irrArea,	  $nonIrrArea,
    $irrUseSIR,	  $irrUseGrwt,	 $irrUseAqf,			### Irr water use from SIR: groundwater storages
    $irrUseExtra,  $irrVIS_delta)	= ((0) x 14);		### Irr water use from unsustanable groundwater
 								### Irr water re-use from tracking (line below)
-my($UseReuseOutGross_irr, $IrrReuseInGross_irr, $IrrReuseInGrossFlow_irr, $IrrReuseInGrossGrwt_irr, $IrrReuseInGrossAqf_irr,$IrrReuseOutNet_irr, $IrrReuseOutNonben_irr,$irrFracInGross);
+my($UseReuseOutGross_irr, $IrrReuseInGross_irr, $IrrReuseInGrossFlow_irr, $IrrReuseInGrossGrwt_irr, $IrrReuseInGrossAqf_irr, $IrrReuseOutNet_irr, $IrrReuseOutNonben_irr, $irrFracInGross, $UseReuseInGross_use, $IrrReuseInGross_use);
+map{$compBalFlag = 1 if $_ ~~ @list_out}	# Flag to run tracking component balance - exception of these vars
+	qw(UseReuseOutGross_irr IrrReuseInGross_irr IrrReuseInGrossFlow_irr IrrReuseInGrossGrwt_irr IrrReuseInGrossAqf_irr IrrReuseOutNet_irr IrrReuseOutNonben_irr irrFracInGross UseReuseInGross_use IrrReuseInGross_use);
 
+my  %Kc_par = ('generalLand' => {'land' => $ones}, 'fallow' => {'land' => $ones});
+my (%landFrac, %awCap, %crpDF, %ricePaddyWater, %ind);
 if ($runIO{Irrigation}) {
   $dataSet{CropAreaFrac} = delete $land{allCropFr};
+  @lnd = sort keys %land;  delete   $tp{allCropFr};		### Redo the sorted arrays
 		### Find/Set reference and first/last year for total CropAreaFrac dataset [time series]
   my $isTS	 = ref($dataSet{CropAreaFrac}) =~ m/DataSet/ && !$dataSet{CropAreaFrac}{climatology};
   $crpGrwthRefYr = 0 if $isTS;
@@ -1114,7 +1153,7 @@ if ($runIO{Irrigation}) {
 	if !$isTS && ($crpGrwthRefYr == 0 && $crpAreaGrwth != 0);
 		### Find/Set reference and first/last year for each Irr CropAreaFrac dataset [time series]
   my($ldFr, $check, $fstYr, $lstYr) = ('LandFraction', undef, 0, 0);
-  foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (keys %{$land{$lnd}}) {
+  foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (@{$tp{$lnd}}) {
     my $isTS	   = ref($land{$lnd}{$tp}{$ldFr}) =~ m/DataSet/ && !$land{$lnd}{$tp}{$ldFr}{climatology} ? 1 : 0;
     $irrGrwthRefYr = 0 if $isTS;
     $land{$lnd}{$tp}{$ldFr}{fstYear} = $isTS ? substr($land{$lnd}{$tp}{$ldFr}{dateList}[ 0],0,4) : 0;	# Fist TS year
@@ -1122,8 +1161,13 @@ if ($runIO{Irrigation}) {
     die "Parameter 'irrGrwthRefYr' must be set for this WBM simulation. Aborting...\n\n"
 	if !$isTS && (!$irrGrwthRefYr && $irrAreaGrwth);
     die "Irrigated crop fraction must be time series or static for all crops...\n" if defined $check && $check != $isTS;
-   ($check,$fstYr,$lstYr) = ($isTS, $land{$lnd}{$tp}{$ldFr}{fstYear}, $land{$lnd}{$tp}{$ldFr}{lstYear});
-    $sMoist{$lnd}{$tp}	  = 0;	# This needs to be initialized
+   ($check,$fstYr,$lstYr)=($isTS, $land{$lnd}{$tp}{$ldFr}{fstYear}, $land{$lnd}{$tp}{$ldFr}{lstYear});
+    $sMoist  {$lnd}{$tp} = $zeroes->copy;			# Required initializations
+    $sMoistGr{$lnd}{$tp} = $zeroes->copy if $BwGwFlag;
+    $landFrac{$lnd}{$tp} = $zeroes->copy;
+    $cropMask{$lnd}{$tp} = $zeroes->copy;   $cropMaskPrev{$lnd}{$tp} = $zeroes->copy;
+    $Kc_par  {$lnd}{$tp} = $zeroes->copy;
+    $crpDF	   {$tp} = $zeroes->copy if $lnd eq 'irrCrop';
   }}
 		### Irrigation Efficiency can be file or time series (defined in the Magic table)
   $irrEfficiencyData = init_DSet($extent,\%meta,$irrEfficiency,$MagicT,{PATCH_VALUE=>100});
@@ -1162,15 +1206,13 @@ if ($runIO{Irrigation}) {
 }
 		### Land Fraction and awCap initialization for Non-Crops
 		### + Initialization of dataset slices
-my (%landFrac, %awCap, %crpDF, %ricePaddyWater, %ind);
-foreach my $lnd (keys %land) {				next if $lnd =~ /crop/i;
-  foreach my $tp (keys %{$land{$lnd}}) {
+foreach my $lnd (@lnd) {				next if $lnd =~ /crop/i;
+  foreach my $tp (@{$tp{$lnd}}) {
     $awCap{$lnd}{$tp}	 = $land{$lnd}{$tp}{awCap};	next if $lnd =~ /fallow/i;
 
     $landFrac{$lnd}{$tp} = $land{$lnd}{$tp}{LandFraction}->copy; # copy- will be modified by croplands
     $ind{$lnd}{$tp}	 = whichND($landFrac{$lnd}{$tp} > 0);
 }}
-my %Kc_par = ('generalLand' => {'land' => $ones}, 'fallow' => {'land' => $ones});
 
 #######################################################################
 	### Water Demand for domestic, industrial, and livestock consumption
@@ -1221,7 +1263,7 @@ if ($runIO{WaterDemand}) {
 	### Make post-processing script
 my $run_PP	= post_processing(\%runIO, $runAttr, \%path, \@list_out);
 my %Agg_var	= map(($_ => {				### Runtime aggregation datasets, cumulatives, etc.
-	dSet => { day  => $run_daily ?
+	dSet => { day  => $run_TS eq 'hourly' ?
 			  new RIMS::DataSet(attrib($idPrfx.$_.'_d', $runIO{Output_MT})) : '',
 		  month=> new RIMS::DataSet(attrib($idPrfx.$_.'_m', $runIO{Output_MT})),
 		  year => new RIMS::DataSet(attrib($idPrfx.$_.'_y', $runIO{Output_MT}))},
@@ -1234,7 +1276,9 @@ my @Agg_off =   ( 0,      30/2,     366/2);	# Time series day offset for aggrega
 
 #######################################################################
 	### Make build spool script	Note, it must be before "idump"
-make_build_spool(\%runIO, $date_list);
+
+$idump = !$noStateID;		# $idump is an obsolete varibale
+make_build_spool(\%runIO, $date_list, $mDays) if $idump;
 
 #######################################################################
 		### Dump initialization parameters to files
@@ -1277,12 +1321,13 @@ if (-e $state_file.'.dat' && !$noState) {
 
  ($last_j_date, $mDischargeK, @mDischargeN) = $list->list;			# unpack perl variables
   if ($runIO{Spinup}{Force_ID_Date} && $state_file eq $run_state_dir.$runIO{Spinup}{State_ID}) {
-    $last_j_date = julian_day(split(m/-/, $runIO{Spinup}{Force_ID_Date}));	# Forse date of the state data
+    $last_j_date  = &$julian_day(split(m/-/, $runIO{Spinup}{Force_ID_Date}));	# Forse date of the state data
   } elsif ($state_file =~ m/\.spinup$/) { 
     $n_count_done = $n_spinup;
     $last_j_date  = $$j_date_list[$n_count_done]-1;
   } else {
-    $n_count_done = $last_j_date < 0 ? -$last_j_date : $n_spinup + $last_j_date - $$j_date_list[$n_spinup] + 1;
+    $n_count_done = $last_j_date < 0 ? -$last_j_date : $md_flag ? find_done($last_j_date,$n_spinup,$j_date_list) :
+		    $n_spinup + $last_j_date - $$j_date_list[$n_spinup] + 1;
     $last_j_date  = $$j_date_list[$n_count_done-1]	if $last_j_date < 0;
   }
 	### Bucket components
@@ -1299,7 +1344,7 @@ if (-e $state_file.'.dat' && !$noState) {
   $snowBand = [readflex($state_file.'.snowBand.dat')] if $runIO{snowBands};
 
 	### Landcover/Crop parameters (soil moisture)
-  foreach my $lnd (keys %land) { foreach my $tp (keys %{$land{$lnd}}) {
+  foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
     $sMoist    {$lnd}{$tp} = readflex($state_file.".sM.$lnd.$tp.dat");
     $sMoistVs  {$lnd}{$tp} = readflex($state_file.".Vs.$lnd.$tp.dat")	if $lnd eq 'irrCrop' && $vs_flag;
     $sMoistGr  {$lnd}{$tp} = readflex($state_file.".Gr.$lnd.$tp.dat")	if $BwGwFlag;	### BW/GW addition
@@ -1312,8 +1357,21 @@ if (-e $state_file.'.dat' && !$noState) {
     $sMoistPrVs{$lnd}{$tp} = $sMoistVs{$lnd}{$tp}->copy		if exists $sMoistVs{$lnd}{$tp};
   }}
 	### Aquifer data
-  if ( $aqfType ) {}		# Removed from public domain
-
+  if ( $aqfType ) {
+		### ModFlow aquifers
+    if ($aqfType == 3) {
+      readState($state_file.'.ModFlow.dat', $$AQF_DATA{Strg_B}, $$AQF_DATA{Strg_T});
+      Aqf_Storage_2_Head($AQF_DATA);
+    }
+		### All aquifers
+    my $AQFDATA;
+    eval(htm_template($state_file.'.aqf_data.json'));		# No 2D PDL data in the JSON file
+    foreach my $aqf_ID (@aqf_IDs) {				# Update aquifer data with non-2D-PDL data
+      map $$aqf_data{$aqf_ID}{$_} = $$AQFDATA{$aqf_ID}{$_}, keys %{$$AQFDATA{$aqf_ID}};
+    }
+    $cAqWaterP   .= readflex($state_file.".cAqWaterP.dat")	if $cAqWaterP->dims;
+    $cAqWaterIrr .= readflex($state_file.".cAqWaterIrr.dat")	if $cAqWaterIrr->dims;
+  }
 		### End of year balances
   my ($ALL, $domXW_y, $indXW_y, $stkXW_y);	### Use all variables listed in "Reset annual totals to zero" section!!!
   eval(htm_template($state_file.'.yr_data.json'));
@@ -1327,14 +1385,14 @@ if (-e $state_file.'.dat' && !$noState) {
   @stkXW_y = @$stkXW_y;
 
 		### USGS assimilation data
-  if ($usgs_data) {}		# Removed from public domain
-
-		### Component tracking data
-  if ($compBalFlag) {
-    my $COMPBAL;
-    eval(htm_template($state_file.'.compBal.json'));
-    %compBal	= %{$COMPBAL};
-  }
+  if ($usgs_data) {
+    my $USGS_DATA;
+    eval(htm_template($state_file.'.usgs_data.json'));
+	# Re-mapping $USGS_DATA->$usgs_data below is done just in case, if "USGS" input has changed
+    foreach my $site (keys %$USGS_DATA) {
+      next  unless  exists $$usgs_data{$site};
+      map   $$usgs_data{$site}{$_} = $$USGS_DATA{$site}{$_}, keys %{$$USGS_DATA{$site}};
+  } }
 		### Reset spinup tracking, if requested
   reset_spinup_tracking(2,3) if $wbmParam{resetSpinupTracking} && $state_file eq $run_state_dir.$runIO{Spinup}{State_ID};
 
@@ -1345,7 +1403,7 @@ if (-e $state_file.'.dat' && !$noState) {
     exit;
   }
   printf "Previous run state files are read! Resume date is %04d-%02d-%02d.\n",
-	inverse_julian_day($last_j_date+1);
+	&$inverse_julian_day($last_j_date+1);
   $init_flag = 0;
 }
 
@@ -1353,11 +1411,13 @@ if (-e $state_file.'.dat' && !$noState) {
 #######################################################################
 
 print  "\n";
-printf "Output directory:   %s\n", $noOutput	? 'No Output' : $runIO{Output_dir}. '/';
-printf "Output var scaling: %s\n", $outputScale	? 'Full cell area' : 'None';
+printf "Output directory:   %s\n", $noOutput ? 'No Output' : $runIO{Output_dir}. '/';
+printf "WBM model run MT:   %s\n", $noOutput ? 'No Output' : $runIO{Output_MT};
 printf "Build spool batch:  %s\n", $runIO{SB_script};
 printf "Post-Processing:    %s\n", $runIO{PostProcessing} ? $runIO{PP_script} : 'None';
-printf "PET     method:     %s\n", $runIO{PET};
+printf "Spool directory:    %s\n", $runIO{spool};
+printf "Output var scaling: %s\n", $outputScale	? 'Full cell area' : 'None';
+printf "PET     method:     %s\n", $runIO{PET}{method};
 printf "Routing method:     %s\n",($routingMethod !~ m/LRR/i) ? $routingMethod : 'Linear Reservoir Routing (LRR) with '.
 	($velMethod eq 'Constant' ? sprintf("%.2f km/hr",$flowSpeed) : 'AASH') . ' flow velocity';
 printf "Infiltration model: %s\n", $Infiltration;
@@ -1367,6 +1427,21 @@ printf "Component tracking: %s\n", length( $cString)	? $cString : 'None';
 printf "WBM Network cells:  %d: %.1f %% in (%dx%d) layer\n", $nCells, 100*$nCells/$network->nelem, $network->dims; if ($noRun){
 print  "No run mode- WBM initialization and auxilary files are done!\n\n"; $date_list = []; } else {
 print  "WBM starts now!\n\n"; }
+
+	###############################################################
+	###   Run pre-processing script (build spool)
+if ( $$bldSpool[0] && !$noOutput ) {
+     $$bldSpool[1] //= 0;
+ (my $pp_log = $runIO{SB_script}) =~ s/pl$/log/;
+  my $nc     = $$bldSpool[1] ? '-nc' : '';
+  die "\n\"build_spool.pl\" utility is not found. Aborting...\n\n" unless -e $path{PP_Perl_path}.'/build_spool.pl';
+
+  system("perl -w $runIO{SB_script} -f $$bldSpool[0] $nc > $pp_log &");
+  print	"Spool pre-processing script has started as a separate system process with $$bldSpool[0] forks.\n",
+  	"Progress log file: $pp_log\n",
+	"Stopping   command: pkill -f build_spool\n",
+	"Monitoring command: tail  -f $pp_log\n\n";
+}
 
 #######################################################################
 ###############      The Water Balance Model        ###################
@@ -1382,10 +1457,11 @@ foreach my $date (@$date_list)
 
   my @date	= split(m/-/,$date);
   my $hour	= $date[2] =~ s/T(\d{2}).+// ? int($1) : 0;
-  my $j_date	= julian_day(@date);			# Line below- $jDay is this year 365 day index
-  my $jDay	= $j_date-julian_day($date[0],1,1) - (is_leap($date[0]) && $date[1]>2 ? 1:0);
+  my $j_date	= &$julian_day(@date);			# Line below- $jDay is this year 365 day index
+  my $jDay	= $j_date-&$julian_day($date[0],1,1) - (&$is_leap($date[0]) && $date[1]>2 ? 1:0);
   my $yrBegCond	= $date =~ m/^\d{4}-$yearBeg/;		# Start of year  condition
   my $yrEndCond	= $date =~ m/^\d{4}-$yearEnd/;		# End   of year  condition
+  my $mnBegCond = $date[2] ==  $mnthBeg;		# Start of month condition
   my $mnEndCond = $date[2] == &$days_in(@date[0,1]);	# End   of month condition
   my $doOutput	= $n_count > $n_spinup && !$noOutput;	# Flag to write output files
      $$extent{spool_writes} = 0;			# Reset spool writes counter
@@ -1396,6 +1472,17 @@ foreach my $date (@$date_list)
   bMarkMap( 2, $bMarkM, 'Read climate data');
   bMarkMap( 3, $bMarkM, 'Read basic data');
 
+		### Time variables, if needed (multi-day runs)
+  if ($md_flag) {
+    my $days	  = defined($j_date_prev) && $n_count != $n_spinup+1 && $j_date > $j_date_prev ?
+		    $j_date - $j_date_prev : $mDays;
+    $mDate	  =[map sprintf("%04d-%02d-%02d", &$inverse_julian_day($_)), $j_date-$days+1 .. $j_date];
+    $subDi	  = 1/$days;
+   ($subDh, $subDf, $dt) = time_vars($subDi);
+   ($MM_2_KM3, $MM_2_km3, $MM_2_m3) = map $_*$subDf, $mm_2_KM3,$mm_2_km3,$mm_2_m3;
+    $flowCoeff	  = 1/(1 + $dL*3600/$flowSpeed/$dt)->copybad($network);
+    $j_date_prev  = $j_date;
+  }
 	###############################################################
 	###############################################################
 	#####   Read Climate Data for this date
@@ -1405,36 +1492,57 @@ foreach my $date (@$date_list)
   my $run_file	= $dataSet{run}->dateLayer($date,1) if $run_save && $n_count > $n_spinup;
 
 		### Temperature, Celsius
-  my $airT = exists $dataSet{airT} ?
-		read_dateLayer($dataSet{airT},   $date,$extent,$runIO{spool},{PATCH_VALUE=>$dataSet{airT_Ptch}}) : 0.5*(
-		read_dateLayer($dataSet{airTmin},$date,$extent,$runIO{spool}) +
-		read_dateLayer($dataSet{airTmax},$date,$extent,$runIO{spool}));
+  my $airT = $md_flag ?
+	(exists $dataSet{airT} ?
+		read_dateLayers($dataSet{airT},   $mDate,$extent,$runIO{spool},{PATCH_VALUE=>$dataSet{airT_Ptch}}) : 0.5*(
+		read_dateLayers($dataSet{airTmin},$mDate,$extent,$runIO{spool}) +
+		read_dateLayers($dataSet{airTmax},$mDate,$extent,$runIO{spool}))) :
+	(exists $dataSet{airT} ?
+		read_dateLayer ($dataSet{airT},   $date, $extent,$runIO{spool},{PATCH_VALUE=>$dataSet{airT_Ptch}}) : 0.5*(
+		read_dateLayer ($dataSet{airTmin},$date, $extent,$runIO{spool}) +
+		read_dateLayer ($dataSet{airTmax},$date, $extent,$runIO{spool})));
      $airT = $airT - readflex($airT_bias[$jDay]) if scalar  @airT_bias;  # DO NOT use PDL overloaded operators -= or +=
      $airT = $airT + $lapseDelta		 if defined $lapseDelta; # It will modify reused monthly values
 
 		### Precipitation, mm/day
-  my $precip =  read_dateLayer($dataSet{precip},$date,$extent,$runIO{spool},{PATCH_VALUE=>$dataSet{precipPtch}});
+  my $precip = $md_flag ?
+		read_dateLayers($dataSet{precip},$mDate,$extent,$runIO{spool},{PATCH_VALUE=>$dataSet{precipPtch}}):
+		read_dateLayer ($dataSet{precip},$date, $extent,$runIO{spool},{PATCH_VALUE=>$dataSet{precipPtch}});
      $precip = ($precip - readflex($precip_bias[$jDay]))->lclip(0) if scalar @precip_bias;	# Bias correction
-     $precip =  $precip * read_dateLayer($dataSet{precipFrac},$date,$extent,$runIO{spool},{RESAMPLE=>0, PATCH_VALUE=>0})
-		if $dataSet{precip}->monthly;				# Monthly->daily conversion
+     $precip =  $precip * ( $md_flag ?
+		read_dateLayers($dataSet{precipFrac},$mDate,$extent,$runIO{spool},{RESAMPLE=>0, PATCH_VALUE=>0}) :
+		read_dateLayer ($dataSet{precipFrac},$date, $extent,$runIO{spool},{RESAMPLE=>0, PATCH_VALUE=>0}))
+			if $dataSet{precip}->monthly;			# Monthly->daily conversion
      $precip*=  $precip_scale;						# Unit conversion (to mm/day) and scaling
 
 		### PET & Water Temperature Drivers (we assume these are all daily data)
   my ($cloudFr, $windSpeed, $rHumidity, $albedo, $grossRad, @LAI_set);
-  if ($runIO{PET} =~ m/^FAO-56|Penman-Monteith$/ || $waterTemp || $OWEC_flag) {
-     $rHumidity	= get_relHumidity([ $dataSet{humidity},   $date,$extent,  $runIO{spool},
+  if ($runIO{PET}{method} =~ m/^FAO-56|Penman-Monteith$/ || $waterTemp || $OWEC_flag) {
+     my $DATE	=  $md_flag ? $mDate : $date;
+     $rHumidity	= get_relHumidity([ $dataSet{humidity},    $DATE, $extent,  $runIO{spool},
 				{PATCH_VALUE=>$dataSet{humidity_Ptch}} ], $airT, $elevation);
-     $windSpeed	= sqrt(	read_dateLayer($dataSet{windU},   $date,$extent,  $runIO{spool},
+     $windSpeed	= $md_flag ?
+		   sqrt(read_dateLayers($dataSet{windU},   $mDate,$extent,  $runIO{spool},
 				{PATCH_VALUE=>$dataSet{windU_Ptch}})**2 +
-			read_dateLayer($dataSet{windV},   $date,$extent,  $runIO{spool},
+			read_dateLayers($dataSet{windV},   $mDate,$extent,  $runIO{spool},
+				{PATCH_VALUE=>$dataSet{windV_Ptch}})**2):
+		   sqrt(read_dateLayer ($dataSet{windU},   $date, $extent,  $runIO{spool},
+				{PATCH_VALUE=>$dataSet{windU_Ptch}})**2 +
+			read_dateLayer ($dataSet{windV},   $date, $extent,  $runIO{spool},
 				{PATCH_VALUE=>$dataSet{windV_Ptch}})**2);
-     $cloudFr	=	read_dateLayer($dataSet{cloudFr}, $date,$extent,  $runIO{spool},
+     $cloudFr	= $md_flag ?
+			read_dateLayers($dataSet{cloudFr}, $mDate,$extent,  $runIO{spool},
+				{PATCH_VALUE=>$dataSet{cloudFr_Ptch}}):
+			read_dateLayer ($dataSet{cloudFr}, $date, $extent,  $runIO{spool},
 				{PATCH_VALUE=>$dataSet{cloudFr_Ptch}});
-     $albedo	=	read_dateLayer($dataSet{albedo},  $date,$extent,  $runIO{spool},
+     $albedo	= $md_flag ?
+			read_dateLayers($dataSet{albedo},  $mDate,$extent,  $runIO{spool},
+				{PATCH_VALUE=>$dataSet{albedo_Ptch}}) :
+			read_dateLayer ($dataSet{albedo},  $date, $extent,  $runIO{spool},
 				{PATCH_VALUE=>$dataSet{albedo_Ptch}})  if ref $dataSet{albedo};
      $grossRad	=  $hr_flag ? grossRadiation($lon,$lat,$jDay,$hour,$subDh) : $grossRad[$jDay];	# MJ/m2/day
   }
-  my $dayLen	=  $hr_flag ? dayLength($lon,$lat,$jDay,$hour,$subDh) : $dayLen[$jDay] if $runIO{PET} eq 'Hamon';
+  my $dayLen	=  $hr_flag ? dayLength($lon,$lat,$jDay,$hour,$subDh) : $dayLen[$jDay] if $runIO{PET}{method} eq 'Hamon';
   my @PM_set	= ($airT, $windSpeed, $cloudFr, $albedo, $rHumidity, $grossRad, $elevation, \%wbmParam);
 
 		### Leaf Area Indices (needed for Land Cover types only)
@@ -1486,7 +1594,8 @@ foreach my $date (@$date_list)
     $glArea	= read_dateLayer($dataSet{glArea},  $date,$extent,$runIO{spool},
 		{DATE_SEARCH_OPT=>{YR_UP=>1}, RESAMPLE=>5, PATCH_VALUE=>0})->clip(0, 0.99 - $rmArea);
     $glVolume	= read_dateLayer($dataSet{glVolume},$date,$extent,$runIO{spool},
-		{DATE_SEARCH_OPT=>{YR_UP=>1},RESAMPLE=>0,PATCH_VALUE=>0})->lclip(0) * $glScale if defined $dataSet{glVolume};
+		{DATE_SEARCH_OPT=>{YR_UP=>1}, RESAMPLE=>0, PATCH_VALUE=>0})->lclip(0)*$glScale	# In water equivalent
+			if defined $dataSet{glVolume};						# Volume water/ice=0.917
     map $_     *= $landMask, $glMelt,$glArea,$glVolume;		# Apply land mask to the glacier data layers
   }
 		### Update and save cell area layers (annual time series)
@@ -1519,13 +1628,15 @@ foreach my $date (@$date_list)
   bMarkMap(3, $bMarkM, 'PET and Open Water Evap.');
 
 	#####   PET - Potential Evapotranspiration by different methods
-  my $pet = $runIO{PET} eq 'Hamon'		? PET_Hamon		($airT, $dayLen)	:
-	    $runIO{PET} eq 'Penman-Monteith'	? PET_PenmanMonteith	(@PM_set, @LAI_set)	:
-	    $runIO{PET} eq 'FAO-56'		? PET_FAO_56		(@PM_set, $LAI    )	:
+  my $pet = $runIO{PET}{method} eq 'Hamon'		? PET_Hamon		($airT, $dayLen)	:
+	    $runIO{PET}{method} eq 'Penman-Monteith'	? PET_PenmanMonteith	(@PM_set, @LAI_set)	:
+	    $runIO{PET}{method} eq 'FAO-56'		? PET_FAO_56		(@PM_set, $LAI    )	:
 	    die "Unknown PET method. Aborting...\n\n";
 	#####   Open Water, Lake, and Wetland Evaporation
   my $waterEvap	= $OWEC_flag			? calc_openWaterEvap	(@PM_set)		:
-		  $runIO{openWaterEvap}		? read_dateLayer($dataSet{waterEvap},$date,$extent,$runIO{spool}) :
+		  $runIO{openWaterEvap}		?($md_flag ?
+			read_dateLayers($dataSet{waterEvap},$mDate,$extent,$runIO{spool}) :
+			read_dateLayer ($dataSet{waterEvap},$date, $extent,$runIO{spool}))	:
 						  $openWtrCoeff * $pet;		# Note "coeff*$pet" is better than nothing
 
 	###############################################################
@@ -1539,7 +1650,7 @@ foreach my $date (@$date_list)
     $snowMelt *= 0;	# Reset these vars (NB- they have children slices)
     for (my $i=0; $i<=$#$indxBand; $i++) {
       my @balance  = snow_balance($$snowBand[$i], $airT->indexND($$indxBand[$i])+$$airTBand[$i],
-		$precip->indexND($$indxBand[$i]), $MDSnowFallThreshold, $MDSnowMeltThreshold, $subDf);
+		$precip->indexND($$indxBand[$i]), $MDSnowFallThreshold, $MDSnowMeltThreshold);
       $$sFall[$i] += $balance[0] * $$elevBand[$i];
       $$sMelt[$i] += $balance[1] * $$elevBand[$i];
     }
@@ -1553,7 +1664,7 @@ foreach my $date (@$date_list)
 				#######################################
   else {			########### No snow bands option   ####
     ($snowFall, $snowMelt, $sPackChg) =			# mm/day
-	snow_balance($snowPack, $airT, $precip, $MDSnowFallThreshold, $MDSnowMeltThreshold, $subDf);
+	snow_balance($snowPack, $airT, $precip, $MDSnowFallThreshold, $MDSnowMeltThreshold);
   }
 	###############################################################
 	#####   Routing excess snow downstream to avoid snow accumulation problem
@@ -1583,7 +1694,8 @@ foreach my $date (@$date_list)
   my $canopyET	  = ($waterEvap * $IStrgFrac**(2/3))->clip(0, $InterceptionStorage);	# mm/day
   my $throughFall = ($rainFall  + $InterceptionStorage - $canopyET - $ICap)->lclip(0);	# mm/day
 
-  my $interceptChg	=($rainFall - $throughFall - $canopyET) * $subDf;		# mm/dt
+  my $interceptChg	= $runIO{MT_LAI} ?	# Must do it due to rounding problem for multi-day cases
+			 ($rainFall - $throughFall - $canopyET) * $subDf : $zeroes;	# mm/dt
   $InterceptionStorage += $interceptChg;						# mm
 
   my $waterIn	 = $throughFall + $snowMelt;	### Liquid water on the ground		# mm/day
@@ -1633,9 +1745,169 @@ foreach my $date (@$date_list)
      $Aqf_RIV_dsch,		# ModFlow aquifer discharge to   surface streams
      $spr_dischargeT,		# Total discharge from springs	(needed for Global balances)
      $riv_exchangeT)	=	# Total RIV exchange		(needed for Global balances)
-	(map($zeroes->copy, 1..6), $MDInfiltrationFrac->copy, ($aqfType==3 ? map($zeroes->copy,1..4) : ((0)x4)), 0,0);
+    (map($zeroes->copy, 1..6), $MDInfiltrationFrac->copy, ($aqfType==3 ? map($zeroes->copy,1..4) : ((0)x4)), 0,0);
 
-  if($aqfType) {}		# Removed from public domain
+  if($aqfType) {
+    bMarkMap(2, $bMarkM, 'Aquifer Processing # 1');
+
+		### Aquifer infiltration coefficient (fraction)
+		### It is simplified version of the code removed on 2022-10-26 below
+    my $inf_mask = $aqfType < 3 ? 1 : condition( $$AQF_DATA{mask_S},		# Aquifer infiltration mask
+	$$AQF_DATA{h_B} < $$AQF_DATA{DEM_B}[1], $$AQF_DATA{h_T} < $$AQF_DATA{DEM_T}[1] );
+    $Aqf_infiltFrac .= $inf_mask * $MDInfiltrationFrac * $$AQF_DATA{InfiltFrac};
+    $GWt_infiltFrac -= $Aqf_infiltFrac;
+    $GWt_infiltFrac->inplace->lclip(0);
+# $$AQF_DATA{wellMax} = ($$AQF_DATA{DEM}-$$AQF_DATA{DEM_B}[0])->hclip(150+3*($date[0]-1990)) if $aqfType == 3; # DELETE
+
+    foreach my $aqf_ID (@aqf_IDs) {
+  map $$aqf_data{$aqf_ID}{$_}		= 0,@{$$AQF_DATA{sumKeys}};
+      $$aqf_data{$aqf_ID}{StoragePREV}	=     $$aqf_data{$aqf_ID}{Storage};
+      $$aqf_data{$aqf_ID}{MF_out}	= 0;
+		### Aquifer infiltration coefficient (fraction)
+		#	Keep commented out code:
+		#	Removed on 2022-10-26 as it causes memory leak as OS keeps parent object
+		#	for the children in the loop, but sometimes misses GC the parent piddle (!)
+		#	To restore it, we need a PP function that does the same, but in parent piddle
+		###
+      # my   $idx		= $$aqf_data{$aqf_ID}{idx};
+      # if  ($aqfType==3 || $$aqf_data{$aqf_ID}{Storage}    < $$aqf_data{$aqf_ID}{Capacity}) {
+	# my $fracton	= $$AQF_DATA{InfiltFrac}->indexND($idx) * $MDInfiltrationFrac->indexND($idx) *
+	  # ($aqfType==3  ? $inf_mask->indexND($idx) : 1);
+	# $Aqf_infiltFrac->indexND($idx) .= $fracton;	# it must be less than $MDInfiltrationFrac = 0.5
+	# $GWt_infiltFrac->indexND($idx) -= $fracton;
+	# $GWt_infiltFrac->inplace->lclip(0);
+      # }
+
+	####################################################################
+	###	Springs and Drains
+
+	# Calculate aquifer balance for lumped aquifers
+      if($spr_flag && $aqfType > 1) {
+	bMarkMap(3, $bMarkM, 'Aquifer Springs # 1');
+
+	# Create sub set of springs hash for this aquifer
+	my @aqf_spr_ids = map $$spr_data{$_}{Aqf_ID} == $aqf_ID ? $_ : (), keys %$spr_data;
+	if (@aqf_spr_ids) {
+	  my %aqf_sprgs; @aqf_sprgs{@aqf_spr_ids} = @$spr_data{ @aqf_spr_ids }; # slice out this aquifers springs
+
+	  my $volumePrev	= $$aqf_data{$aqf_ID}{Volume};
+	  my $deltaPrev		= $$aqf_data{$aqf_ID}{Delta};
+	  my $flowOut		= 0;
+
+	  my ($Volume, $Discharge, $head, $Err) = aqf_balance( $$aqf_data{$aqf_ID}{Volume},aqf_head($$aqf_data{$aqf_ID}{Capacity},$$aqf_data{$aqf_ID}{Thickness},$$aqf_data{$aqf_ID}{BaseElev}),
+						 \&sum_spr_outflow, $$aqf_data{$aqf_ID}{Delta}, \%aqf_sprgs, $dt) ;
+	  foreach my $site (@aqf_spr_ids) {
+	      $$spr_data{$site}{Discharge} = $$Discharge{$site};		# calculated in m3/s
+	      $flowOut			  += $$Discharge{$site}*$dt;
+	  }
+	  $$aqf_data{$aqf_ID}{Volume} = $volumePrev+$deltaPrev-$flowOut; # not using Volume ... eliminate error
+	  $$aqf_data{$aqf_ID}{Head}	= $head;
+	  $$aqf_data{$aqf_ID}{Err}	= $Err;
+      } }					# Delta is needed for Lumped aquifers only (?)
+	  $$aqf_data{$aqf_ID}{Delta}	= 0;	# Reset time-step Delta to 0 m3/dt # Storage and Volume off by Discharge at subsequent timesteps.
+    }
+    bMarkMap(3, $bMarkM, 'Aquifer Springs # 2') if keys(%$spr_data);
+
+		#######################################################
+		###	Add spring water to surface flows (via $resStorage[0])
+    foreach my $site (keys %$spr_data) {
+      my $aqf_ID = $$spr_data{$site}{Aqf_ID};
+      my $idx	 = $$aqf_data{$aqf_ID}{idx};
+      my @colRow =($$spr_data{$site}{Col}, $$spr_data{$site}{Row});
+      my $dsch	 = List::Util::min($$spr_data{$site}{Discharge}*$dt, $$aqf_data{$aqf_ID}{Storage}); # V already always > than Q for lumped
+      next unless $dsch;
+
+	### Add spring water if it flows
+      if ($$spr_data{$site}{AquiferDrain}) {
+      #  to downgradient aquifer
+	my $aqf_ID_to	= $$spr_data{$site}{AquiferDrain};
+	$$aqf_data{$aqf_ID}   {Storage}	-= $dsch;		# m3
+	$$aqf_data{$aqf_ID}   {drnOut}	+= $dsch;
+	$$aqf_data{$aqf_ID_to}{Delta}	+= $dsch;
+	$$aqf_data{$aqf_ID_to}{drnIn}	+= $dsch;
+	$$aqf_data{$aqf_ID_to}{Storage}	+= $dsch;
+
+		#######################################################
+		###	Update component tracking in Virtual/Lumped aquifers
+	compUpdate_Aquifer($cAqWaterP,  $aqf_data, $aqf_ID, $aqf_ID_to, $dsch)		if $compSwitch[2];
+	compUpdate_Aquifer($cAqWaterIrr,$aqf_data, $aqf_ID, $aqf_ID_to, $dsch)		if $compSwitch[3];
+
+      } else {
+      #  or to river
+	$spr_dischargeT			+= $dsch * 1e-9;	# km3
+	$resStorage[0]->(@colRow)	+= $dsch;		# m3
+	$$aqf_data{$aqf_ID}{sprOut}	+= $dsch;
+	$$aqf_data{$aqf_ID}{Storage}	-= $dsch;
+		### ModFlow aquifer case
+	if ( $aqfType == 3 ) {		# Subtract spring discharge evenly from the aquifer where it has storage.
+	  my $Aqf_dsch = $Aqf_dQ->indexND($idx);	# NB $Aqf_dQ is negative
+	  my $previous = $Aqf_dsch->sum->at(0);		# Repeat until all required discharge is subtracted
+	  my $current  = 0;
+	  while (abs($current - $dsch) > 1e-3) {
+	    my $strg = condition($$AQF_DATA{mask_T}, $$AQF_DATA{Strg_T}, $$AQF_DATA{Strg_B})->indexND($idx) + $Aqf_dsch;
+	    my $IDX  = which($strg > 0);
+	    $Aqf_dsch->index($IDX) -= ((($dsch-$current)/$IDX->nelem)*ones($IDX->nelem))->hclip($strg->index($IDX));
+	    $current = $previous - $Aqf_dsch->sum->at(0);
+	} }
+		#######################################################
+		###	Update component tracking in stream storage
+	my $cAqW_P = $cAqWaterP  (,,,($aIdx($aqf_ID)))	if $compSwitch[2];
+	my $cAqW_I = $cAqWaterIrr(,,,($aIdx($aqf_ID)))	if $compSwitch[3];
+	my @volume = ($resStorage[0]	 ->(@colRow) -$dsch, $dsch);
+	compUpdate_Springs($streamAge	   (@colRow), pdl(1),			@volume,{C=>0})	if $compSwitch[0];
+	compUpdate_Springs($cStream[0]	 ->(@colRow), $px4d,			@volume)	if $compSwitch[1];
+	compUpdate_Springs($cStreamP[0]	 ->(@colRow), $cAqW_P,			@volume)	if $compSwitch[2];
+	compUpdate_Springs($cStreamIrr[0]->(@colRow), $cAqW_I,			@volume)	if $compSwitch[3];
+	compUpdate_Springs($cStreamTw	   (@colRow), $grndWaterTw(@colRow),	@volume,{C=>0})	if $compSwitch[4];
+	compUpdate_Springs($cStreamMsk[0]->(@colRow), $rnffMask(@colRow),	@volume)	if $compSwitch[5];
+	compUpdate_Springs($cStreamDIN	   (@colRow), pdl(0),			@volume,{C=>0})	if $compSwitch[6];
+	compUpdate_Springs($cStmConDIN	   (@colRow), pdl(0),			@volume,{C=>0})	if $compSwitch[6];
+    } }
+
+	###############################################################
+	###	Aquifer <-> Streams fluxes (RIV module for ModFlow aquifers)
+
+    if ($aqfType == 3) {
+      bMarkMap(3, $bMarkM, 'RIV for ModFlow aquifers');
+
+		### Aquifer discharge/recharge from difference in river and head elevations
+      my $Sy	= condition($$AQF_DATA{mask_T},	$$AQF_DATA{Sy_T},   $$AQF_DATA{Sy_B});
+      my $Q_lim = condition($$AQF_DATA{mask_T},	$$AQF_DATA{Strg_T}, $$AQF_DATA{Strg_B}) + $Aqf_dQ;
+      my $conductance	 =  $$AQF_DATA{mask_B} *
+		  condition($$AQF_DATA{lakeMask}, $CELL_AREA*1e6 * $Sy,		# BRes = 1 at lakes
+	    $wStream->lclip($wStreamMin) * $lStream /	$$AQF_DATA{BRes});	# m2/day
+      my $Qriv	= ($subDf * $conductance * condition(	$$AQF_DATA{mask_T},	# m3
+					  ($$AQF_DATA{Net_DEM} - $$AQF_DATA{h_T}),
+# 					  ($$AQF_DATA{Net_DEM} - $$AQF_DATA{h_B}))->clip(-0.005,0.005))->lclip(-$Qlimit);
+					  ($$AQF_DATA{Net_DEM} - $$AQF_DATA{h_B}))->hclip($yStream))->lclip(-$Q_lim);
+
+		### Aquifer discharge from overfilled aquifers
+      my $strg	= condition(      $$AQF_DATA{mask_T},  $$AQF_DATA{Strg_T},$$AQF_DATA{Strg_B}) + $Qriv + $Aqf_dQ;
+      my $delta	= condition_slice($$AQF_DATA{mask_T},
+			$$AQF_DATA{DEM_T}[0] + $strg / $$AQF_DATA{Sy_T} / $$AQF_DATA{m_2_m3},
+			$$AQF_DATA{DEM_B}[0] + $strg / $$AQF_DATA{Sy_B} / $$AQF_DATA{m_2_m3}) - $$AQF_DATA{DEM};
+         $Qriv -= condition($delta>0, $delta * $Sy   * $$AQF_DATA{m_2_m3}, 0);
+	 $Qriv->inplace->hclip($resStorage[0]);
+
+      $Aqf_dQ		+= $Qriv;
+      $resStorage[0]	-= $Qriv;			# m3
+      $Aqf_RIV_rech	+= $Qriv*($Qriv > 0)/$dt;	# m3/sec
+      $Aqf_RIV_dsch	-= $Qriv*($Qriv < 0)/$dt;	# m3/sec
+      $riv_exchangeT	-= $Qriv->sum * 1e-9;		# km3
+
+      bMarkMap(3, $bMarkM, 'ModFlow/Lumped aquifers stats and tracking');
+
+		#######################################################
+		### Update Lumped aquifers for springs and tracking
+      my $aqfArr	= pdl(map([0,0,$$aqf_data{$_}{Delta},$$aqf_data{$_}{Storage}], @aqf_IDs));
+	 $aqfArr->reshape(4,scalar(@aqf_IDs));		# Works inplace: https://metacpan.org/pod/PDL::Core#reshape
+
+		### Inline C version to replace Perl code in this place of WBM v.21.10.0
+      $aqfArr->aqf_RIV_update($Qriv,$resStorage[0],$grndWaterTw,$rnffMask,$cSwitch,$streamAge,$cStream[0],$cStreamP[0],$cStreamIrr[0],$cStreamTw,$cStreamMsk[0],$cStreamDIN,$cStmConDIN,$cAqWaterP->squeeze,$cAqWaterIrr->squeeze,$aquiferID,$aIdx);
+      arr_to_hash(unpdl_data($aqfArr,{REF=>1}), [\@aqf_IDs,[qw(bflOut bflIn Delta Storage)]], $aqf_data, -1);
+    }
+  }
+#   compBalance_springs($resStoragePrev);		# Internal flux- Not yet used (no need) for reporting
 
   bMarkMap(2, $bMarkM, 'Miscellaneous and Non-soil runoff');
 	###############################################################
@@ -1685,13 +1957,13 @@ foreach my $date (@$date_list)
 			### Combined flush water from all non-soil areas
   my $flushWater =($lakeWater + $imprWater)  * $subDf;				# m3
      $waterIn   *= $landMask;							# mm/day
- map $_		 = undef, $rainFall,$throughFall,$ICap,$WATERIN;		# Destroy to save memory
+ map $_		 = undef, $rainFall,$throughFall,$ICap,$IStrgFrac,$WATERIN;	# Destroy to save memory
 
 	###############################################################
 	#####   Active layer water capacity (awCap) and Kc by land cover type
 
   if ($runIO{LandCover} && !$hour) {
-    foreach my $tp (keys %{$land{landCover}}) { # time varying root depth
+    foreach my $tp (@{$tp{landCover}}) {	# time varying root depth
 #       $awCap{landCover}{$tp} = $land{landCover}{$tp}{awDelta} *
 # 	($LAI / $land{landCover}{$tp}{MaxLAI} * $land{landCover}{$tp}{RootDepth})->setnonfinitetobad->setbadtoval(0);
 
@@ -1711,7 +1983,7 @@ foreach my $date (@$date_list)
     my ($areaCoeff, $cropDate) = growth_coeff( 1, $crpAreaGrwth, \@date,
 		$crpGrwthRefYr, $irrParam{CropArea}{fstYear}, $irrParam{CropArea}{lstYear});
 		### Read total cropland area fraction
-    $cropAreaFrac	= condition_slice($landMask,	# The ratio below is the soil factor term to account for
+    $cropAreaFrac	.= condition_slice($landMask,	# The ratio below is the soil factor term to account for
 	$CELL_AREA / $soil_area *			# "CropAreaFrac" being fraction of whole pixel area
 	$areaCoeff *	read_dateLayer( $dataSet{CropAreaFrac}, $cropDate, $extent, $runIO{spool},
 	{PATCH_VALUE=>	defined $$landPatch{CropAreaFrac} ? $$landPatch{CropAreaFrac} :	# Patch dataset for CropAreaFrac
@@ -1721,12 +1993,12 @@ foreach my $date (@$date_list)
 
 		### Read each crop land fractions (NB- "near" resample)
     my $ldFr = 'LandFraction';
-    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (keys %{$land{$lnd}}) {
+    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (@{$tp{$lnd}}) {
       my $TS_flag = $extendCropTS ? 1 : ($lnd eq 'irrCrop');
      ($areaCoeff, $cropDate) =  growth_coeff( $TS_flag, $irrAreaGrwth, \@date,
 		$irrGrwthRefYr, $land{$lnd}{$tp}{$ldFr}{fstYear}, $land{$lnd}{$tp}{$ldFr}{lstYear});
 
-      $landFrac{$lnd}{$tp}  = ($cropAreaFrac * $areaCoeff)->hclip(1) * ( read_dateLayer(
+      $landFrac{$lnd}{$tp}  .= ($cropAreaFrac * $areaCoeff)->hclip(1) * ( read_dateLayer(
 	$land{$lnd}{$tp}{$ldFr},	$cropDate,$extent,$runIO{spool},{RESAMPLE=>0,PATCH_VALUE=>
 		defined $$landPatch{$lnd}{$tp}{$ldFr} ? $$landPatch{$lnd}{$tp}{$ldFr} :	# Patch dataset
 	0, PPATCH_VALUE=>0 }))->double;
@@ -1737,28 +2009,28 @@ foreach my $date (@$date_list)
 
 		### Re-Scale cropland fractions
 			### Irrigated
-    my  $scale	 	=($irrArea->hclip($cropAreaFrac) / $irrArea)	->setnonfinitetobad->setbadtoval(0);
-    map $landFrac{irrCrop}{$_}	*= $scale,			keys(%{$land{irrCrop}});
+    my  $scale	 	 =($irrArea->hclip($cropAreaFrac) / $irrArea)	->setnonfinitetobad->setbadtoval(0);
+    map $landFrac{irrCrop}{$_}	*= $scale,			@{$tp{irrCrop}};
         $irrArea->inplace->hclip($cropAreaFrac);
-        $irrEqpArea	= condition($irrArea > $irrEqpArea, $irrArea, $irrEqpArea);
+        $irrEqpArea	.= condition($irrArea > $irrEqpArea, $irrArea, $irrEqpArea);
 			### Non-Irrigated
-        $scale	 	=(($cropAreaFrac - $irrArea) / $nonIrrArea)	->setnonfinitetobad->setbadtoval(0);
-    map $landFrac{rfdCrop}{$_}	*= $scale,			keys(%{$land{rfdCrop}});
-    map $rfdArea		+= $landFrac{rfdCrop}{$_},	keys(%{$land{rfdCrop}});
+        $scale	 	.=(($cropAreaFrac - $irrArea) / $nonIrrArea)	->setnonfinitetobad->setbadtoval(0);
+    map $landFrac{rfdCrop}{$_}	*= $scale,			@{$tp{rfdCrop}};
+    map $rfdArea		+= $landFrac{rfdCrop}{$_},	@{$tp{rfdCrop}};
         $landFrac{fallow}{land}	 = ($cropAreaFrac - $irrArea - $rfdArea)->lclip(0); # Scaling cannot be used
 								# for pixels where non-irrigated area is zero
 		### Re-Scale non-crop landcover fractions to reminder of cropland
     if ($runIO{LandCover}) {
-      map $landFrac{landCover}{$_} = $land{landCover}{$_}{$ldFr}->copy, keys(%{$land{landCover}});
+      map $landFrac{landCover}{$_} = $land{landCover}{$_}{$ldFr}->copy, @{$tp{landCover}};
       delete $landFrac{landCover}{Croplands};
 
-      map $sum  += $landFrac{landCover}{$_},	keys(%{$land{landCover}});
-          $scale = ((1 - $cropAreaFrac) / $sum)				->setnonfinitetobad->setbadtoval(0);
-      map $landFrac{landCover}{$_} *= $scale,	keys(%{$land{landCover}});
+      map $sum   += $landFrac{landCover}{$_},	@{$tp{landCover}};
+          $scale .= ((1 - $cropAreaFrac) / $sum)			->setnonfinitetobad->setbadtoval(0);
+      map $landFrac{landCover}{$_} *= $scale,	@{$tp{landCover}};
     }
     else {$landFrac{generalLand}{land} = $land{generalLand}{land}{$ldFr} - $cropAreaFrac; }
 
-# foreach my $lnd (sort keys %land) { foreach my $tp (sort keys %{$land{$lnd}}) {
+# foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
 #   printf "%11s => %13s : N = %d : min = %f : max = %f : sum = %f\n",$lnd,$tp,
 # 	$landFrac{$lnd}{$tp}->ngood,$landFrac{$lnd}{$tp}->min,$landFrac{$lnd}{$tp}->max,$landFrac{$lnd}{$tp}->sum;
 # }} print "\n";
@@ -1767,14 +2039,14 @@ foreach my $date (@$date_list)
 		#######################################################
 		### Read crop parameters (NB- "near" resample)
     $riceMask	*= 0;		# Reset it
-    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (keys %{$land{$lnd}}) {
+    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (@{$tp{$lnd}}) {
      ($areaCoeff, $cropDate) =  growth_coeff( $extendCropTS, 0, \@date,
 		$irrGrwthRefYr, $land{$lnd}{$tp}{$ldFr}{fstYear}, $land{$lnd}{$tp}{$ldFr}{lstYear});
 			# Growing crop masks
-      $cropMaskPrev{$lnd}{$tp}	 = $init_flag ? $landFrac{$lnd}{$tp} > 0 :	# Initializition
-				   $cropMask{$lnd}{$tp}->copy;	### Previous day crop mask
-      $cropMask{$lnd}{$tp}	 = $landFrac{$lnd}{$tp} > 0;	### This     day crop mask
-      $sMoist{$lnd}{$tp}	*= $cropMask{$lnd}{$tp};	### sMoist can be used as crop mask in run-state
+      $cropMaskPrev{$lnd}{$tp}	.= $init_flag ? $landFrac{$lnd}{$tp} > 0 :	# Initializition
+				   $cropMask{$lnd}{$tp};	### Previous day crop mask
+      $cropMask{$lnd}{$tp}	.= $landFrac{$lnd}{$tp} > 0;	### This     day crop mask
+      $sMoist  {$lnd}{$tp}	*= $cropMask{$lnd}{$tp};	### sMoist can be used as crop mask in run-state
       $sMoistGr{$lnd}{$tp}	*= $cropMask{$lnd}{$tp} if $BwGwFlag;	### BW/GW addition
       next if $lnd eq 'fallow';
 			# Available water capacity
@@ -1784,7 +2056,7 @@ foreach my $date (@$date_list)
 	0, PPATCH_VALUE=>0 });
 			# Crop depletion factor (crpDF)
       if ($lnd eq 'irrCrop') {
-	$crpDF{$tp} = $dailyIrr ? $ones :
+	$crpDF{$tp} .= $dailyIrr ? $ones :
 	read_dateLayer($land{$lnd}{$tp}{crpDF},		$cropDate,$extent,$runIO{spool},{RESAMPLE=>0,PATCH_VALUE=>
 		defined $$landPatch{$lnd}{$tp}{crpDF} ?	$$landPatch{$lnd}{$tp}{crpDF} :	# Patch dataset for crpDF
 	0, PPATCH_VALUE=>0 });
@@ -1792,7 +2064,7 @@ foreach my $date (@$date_list)
 	$riceMask += $landFrac{$lnd}{$tp}	if $tp =~ m/^rice/i;
       }
 			# Crop Coefficients (Kc)
-      $Kc_par{$lnd}{$tp} =
+      $Kc_par{$lnd}{$tp} .=
 	read_dateLayer($land{$lnd}{$tp}{Kc},		$cropDate,$extent,$runIO{spool},{RESAMPLE=>0,PATCH_VALUE=>
 		defined $$landPatch{$lnd}{$tp}{Kc} ?	$$landPatch{$lnd}{$tp}{Kc} :	# Patch dataset for Kc
 	0, PPATCH_VALUE=>0 });
@@ -1802,7 +2074,7 @@ foreach my $date (@$date_list)
   }
 		### Soil Moisture Initializition
   if ($init_flag) {
-    foreach my $lnd (sort keys %land) { foreach my $tp (sort keys %{$land{$lnd}}) {	### ADDED SORT-NEED!
+    foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
       $sMoist    {$lnd}{$tp} = $awCap{$lnd}{$tp} * $sMoistFrac;
       $sMoistPrev{$lnd}{$tp} = $sMoist{$lnd}{$tp}->copy;
       $sMoist[0] += $sMoistPrev{$lnd}{$tp} * $landFrac{$lnd}{$tp};
@@ -1828,13 +2100,13 @@ foreach my $date (@$date_list)
 
 		### Update domain slice indices for new crop fractions
   if ($slice && $runIO{Irrigation}) {
-    foreach my $lnd (keys %land) { foreach my $tp (keys %{$land{$lnd}}) {
+    foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
       $ind{$lnd}{$tp} = whichND($landFrac{$lnd}{$tp} > 0);
     }}
   }		### Make dataset slices
   my (%waterIn, %et, %et_IrrCrp,  %et_RfdCrp, %et_NonCrp, %surfRunoff, %ricePaddyRain,
       %GWt_infilt, %Aqf_infilt,   %Aqf_inFrac, %GWt_inFrac);
-  foreach my $lnd (keys %land) { foreach my $tp (keys %{$land{$lnd}}) {
+  foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
        set_to_zero($sMoistFrac{$lnd}{$tp}, $zeroes);			if ($BwGwFlag){		# BW/GW
        set_to_zero($sMoistET  {$lnd}{$tp}, $zeroes);
        set_to_zero($sMoistGrET{$lnd}{$tp}, $zeroes); }
@@ -1901,7 +2173,7 @@ EOS
   if ($runIO{Irrigation} && !$hour) {
     bMarkMap(3, $bMarkM, 'Processing of crop rotations');
 
-    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (sort keys %{$land{$lnd}}) {	### ADDED SORT-NEED!
+    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (@{$tp{$lnd}}) {
 			### Planting crop (converting fallow land to crop land)
       my  $plantMask = ($cropMask{$lnd}{$tp} - $cropMaskPrev{$lnd}{$tp}) == 1;
       if ($plantMask->sum) { if ($BwGwFlag) {
@@ -1912,7 +2184,7 @@ EOS
       }	$sMoistPrev{$lnd}{$tp}->inplace->hclip($awCap{$lnd}{$tp});
     }}
 			### Calculate Grid Cell soil moisture change
-    foreach my $lnd (sort keys %land) { foreach my $tp (sort keys %{$land{$lnd}}) {	### ADDED SORT-NEED!
+    foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
       $sMoist[1] += $sMoistPrev{$lnd}{$tp} * $landFrac{$lnd}{$tp};	# Cell weighted average
     }}
 			### Vertical water re-distribution at crop rotations
@@ -1923,7 +2195,7 @@ EOS
 
 			### Horizontal water re-distribution at crop rotations
       my $sMoistChg   = (($sMoist[0] + $grdWaterChg) / $sMoist[1])->setnonfinitetobad->setbadtoval(1)->clip(0,1);
-      foreach my $lnd (sort keys %land) { foreach my $tp (sort keys %{$land{$lnd}}) {	### ADDED SORT-NEED!
+      foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
 	$sMoistGr  {slc}{$lnd}{$tp} *= $slice? $sMoistChg->indexND($ind{$lnd}{$tp}): $sMoistChg	if $BwGwFlag;
 	$sMoistPrev{slc}{$lnd}{$tp} *= $slice? $sMoistChg->indexND($ind{$lnd}{$tp}): $sMoistChg;
 	$sMoistPrVs{slc}{$lnd}{$tp} *= $slice? $sMoistChg->indexND($ind{$lnd}{$tp}): $sMoistChg
@@ -1937,7 +2209,7 @@ EOS
 
   bMarkMap(2, $bMarkM, 'Soil Moisture');
 
-  foreach my $lnd (sort keys %land) { foreach my $tp (sort keys %{$land{$lnd}}) {	### ADDED SORT-NEED!
+  foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
 			### Skip in case of unneeded processing
     if    ($slice)		{ next unless $ind{$lnd}{$tp}->dim(1); }
     elsif ($runIO{Irrigation})	{ next unless $landFrac{slc}{$lnd}{$tp}->sum; }
@@ -1955,17 +2227,20 @@ EOS
     my $gm	= ($lnd =~ m/irrCrop/ && !$irrGm) ? 1 :
 	((1 - exp(-$alpha*$sMoistPrev{slc}{$lnd}{$tp} / $awCap{slc}{$lnd}{$tp})) / (1 - exp(-$alpha)))
 			->setnonfinitetobad->setbadtoval(0);
-    my $petLC	= $slice? $pet->indexND($ind{$lnd}{$tp})* $Kc_par{$lnd}{$tp}->indexND($ind{$lnd}{$tp}):
-			  $pet				* $Kc_par{$lnd}{$tp};
+    my $petLC	= ($slice? $pet->indexND($ind{$lnd}{$tp})* $Kc_par{$lnd}{$tp}->indexND($ind{$lnd}{$tp}):
+			   $pet				 * $Kc_par{$lnd}{$tp}) * $runIO{PET}{Scale};
+       $petLC  *= 1 - 0.058 * ($sMoistPrev{slc}{$lnd}{$tp}/$awCap{slc}{$lnd}{$tp})->
+		setnonfinitetobad->setbadtoval(1) * log($subDf)	if $subDf > 1;		# Multi-day scaling
+
+    my $smDelta	= $awCap{slc}{$lnd}{$tp}-$sMoistPrev{slc}{$lnd}{$tp};			# mm
     my $inDelta	= $subDf*($WaterIn - $petLC);						# mm/dt
 
     my $sMoistChg = $subDi *								# mm/day
 	condition($awCap{slc}{$lnd}{$tp} > 0,		# (!) Must use $inDelta in mm/dt
 		  condition($WaterIn > $petLC,
-		 	    condition($inDelta < $awCap{slc}{$lnd}{$tp}-$sMoistPrev{slc}{$lnd}{$tp},
-				      $inDelta,  $awCap{slc}{$lnd}{$tp}-$sMoistPrev{slc}{$lnd}{$tp}),
+		 	    condition($inDelta < $smDelta, $inDelta, $smDelta),
 		 	    $inDelta * $gm),
-		  0)->clip(-$sMoistPrev{slc}{$lnd}{$tp},$awCap{slc}{$lnd}{$tp}-$sMoistPrev{slc}{$lnd}{$tp});
+		  0)->clip(-$sMoistPrev{slc}{$lnd}{$tp}, $smDelta);
 
     $sMoist    {slc}{$lnd}{$tp} .= $sMoistPrev{slc}{$lnd}{$tp} + $sMoistChg * $subDf;	# mm
     $sMoistFrac{slc}{$lnd}{$tp} .=($sMoist{slc}{$lnd}{$tp} / $awCap{slc}{$lnd}{$tp})->setnonfinitetobad->setbadtoval(1)
@@ -1976,13 +2251,13 @@ EOS
 	# Note - Soil moisture change here is due to precipitation/evaporation
 
     if ($condition_Vs) {		# Virtual soil to track potential Irr demand
-      my $sMoistChgVs = $subDi *							# mm/day
+      my $smDeltaVs	= $awCap{slc}{$lnd}{$tp}-$sMoistPrVs{slc}{$lnd}{$tp};		# mm
+      my $sMoistChgVs	= $subDi *							# mm/day
 	condition($awCap{slc}{$lnd}{$tp} > 0,
 		  condition($WaterIn > $petLC,
-		 	    condition($inDelta < $awCap{slc}{$lnd}{$tp}-$sMoistPrVs{slc}{$lnd}{$tp},
-		 	  	      $inDelta,  $awCap{slc}{$lnd}{$tp}-$sMoistPrVs{slc}{$lnd}{$tp}),
+		 	    condition($inDelta < $smDeltaVs, $inDelta, $smDeltaVs),
 		 	    $inDelta),		# $gm for crops = 1
-		  0)->clip(-$sMoistPrVs{slc}{$lnd}{$tp},$awCap{slc}{$lnd}{$tp}-$sMoistPrVs{slc}{$lnd}{$tp});
+		  0)->clip(-$sMoistPrVs{slc}{$lnd}{$tp}, $smDeltaVs);
 
       $sMoistVs  {slc}{$lnd}{$tp} .= $sMoistPrVs{slc}{$lnd}{$tp} + $sMoistChgVs * $subDf;	# mm
       $sMoistFrVs{slc}{$lnd}{$tp} .=($sMoistVs  {slc}{$lnd}{$tp} / $awCap{slc}{$lnd}{$tp})->setnonfinitetobad->setbadtoval(1)
@@ -2008,10 +2283,11 @@ EOS
 		### Rice paddy water collected from rain water surplus, mm
     if ($lnd eq 'irrCrop' && $tp =~ m/^rice/i) {
       my $paddyDepthReal	 = condition_slice($riceMask, $ricePaddyStrg/$riceMask, 0);
-      my $paddyRain		 =($ricePercRate + $ricePaddyDepth - $paddyDepthReal)->lclip(0) * ($riceMask > 0);
+      my $paddyRain		 =($ricePercRate*$subDf  + $ricePaddyDepth-$paddyDepthReal)->lclip(0)*($riceMask > 0);
          $paddyRain		 = $paddyRain->indexND($ind{$lnd}{$tp}) if $slice;
-         $surplus		-= $paddyRain->inplace->hclip($surplus);		# mm/day
-      $ricePaddyRain{slc}{$tp}	+= $paddyRain * $subDf * $landFrac{slc}{$lnd}{$tp};	# mm
+	 $paddyRain		->inplace->hclip($surplus*$subDf);
+         $surplus		-= $paddyRain   *$subDi;			# mm
+      $ricePaddyRain{slc}{$tp}	+= $paddyRain   *$landFrac{slc}{$lnd}{$tp};	# mm
     }
 		### Surplus and Infiltration after rice paddy water has been collected
     my $GWt_infilt = $surplus * $GWt_inFrac{slc}{$lnd}{$tp} + $directRecharge;
@@ -2075,7 +2351,7 @@ EOS
   $Aqf_infiltPrecip	*=  $mm_2_m3		     if $aqfType;	# Convert units from mm/day to m3/day
   $Aqf_dQ		+=  $Aqf_infiltPrecip*$subDf if $aqfType == 3;	# Add to ModFlow aquifers, m3
   foreach my $aqf_ID (@aqf_IDs) {
-    my $sum =  $Aqf_infiltPrecip->indexND($$aqf_data{$aqf_ID}{idx})->sum * $subDf;	# m3
+    my $sum = $Aqf_infiltPrecip->aqfIdx_sum($$aqf_data{$aqf_ID}{idx})->at(0) * $subDf;	# m3
     $$aqf_data{$aqf_ID}{StoragePrev}	 = $$aqf_data{$aqf_ID}{Storage};
     $$aqf_data{$aqf_ID}{Storage}	+=  $sum;
     $$aqf_data{$aqf_ID}{Delta}		+=  $sum;
@@ -2116,19 +2392,20 @@ EOS
     bMarkMap(3, $bMarkM, 'Domestic demands');
 		# Pack aquifer arguments for the demandFromStreamGwater funcion
     my @aqfArr  = $aqfType== 3 ? (Aqf_Well_Storage($AQF_DATA,$Aqf_dQ), $Cfd_dQ) : ($zeroes,$zeroes);
-    my @aqfSet	= ($aqfType, $AQF_IDs, $ones, $$AQF_DATA{gwtUseC}, $aqfType ? $aquiferID : $zeroes,	# 0 .. 4
-       @aqfArr,pdl($aqfType? map([[$$aqf_data{$_}{Storage},$$aqf_data{$_}{Delta}]], @aqf_IDs):[[0,0]]));# 5 .. 7
+    my @aqfSet	= ($aqfType, $aIdx, $ones, $$AQF_DATA{gwtUseC}, $aqfType ? $aquiferID : $zeroes,	# 0 .. 4
+       @aqfArr,pdl($aqfType? map([$$aqf_data{$_}{Storage},$$aqf_data{$_}{Delta}], @aqf_IDs):[0,0]));	# 5 .. 7
+       $aqfSet[-1]->reshape(2,scalar(@aqf_IDs));	# Works inplace: https://metacpan.org/pod/PDL::Core#reshape
     my @argSet	= ($mm_2_m3, $ones, $domSearchDist);
 		# Run domestic water withdrawals. Notes:  I/O units are volume, mm;
     ($DomUseStrgLoc, $DomUseFlowLoc, $DomUseStrgRmt, $DomUseFlowRmt,  $domUseFlowRID,
      $domUseSIR,     $domUseGrwt,    $domUseAqf,     $domUseExtra) = ($domesticDemand * $subDf)->
-	demandFromStreamGwater($grdWater[1], $resStorage[0], $zeroes, $discharge, @aqfSet, @argSet, $dt);
+	demandFromStreamGwater($grdWater[1], $resStorage[0], $muskMask, $zeroes, $discharge, @aqfSet, @argSet, $dt);
 		# Update aquifer data hash
-    $aqf_data = arr_to_hash(unpdl_data($aqfSet[-1],{REF=>1}), [\@aqf_IDs,['Storage','Delta']], $aqf_data, -1) if $aqfType;
+    arr_to_hash(unpdl_data($aqfSet[-1],{REF=>1}), [\@aqf_IDs,['Storage','Delta']], $aqf_data, -1) if $aqfType;
 
 					# Convert mm -> mm/day
      map  $_ *= $subDi,	    $DomUseStrgLoc,  $DomUseFlowLoc, $DomUseStrgRmt, $DomUseFlowRmt, $domUseSIR,	# mm/day
-			    $domUseGrwt,     $domUseAqf,     $domUseExtra	if $hr_flag;
+			    $domUseGrwt,     $domUseAqf,     $domUseExtra	if $hr_flag || $md_flag;
      $domUseFlowLoc	 =  $DomUseStrgLoc + $DomUseFlowLoc;
      $domUseFlowRmt	 =  $DomUseStrgRmt + $DomUseFlowRmt;
      my $taken		 =  $domUseFlowLoc + $domUseFlowRmt + $domUseSIR + $domUseGrwt + $domUseAqf + $domUseExtra;
@@ -2150,19 +2427,20 @@ EOS
 				### Industrial demand- do not use SIR storage; $irrExtraCoeff=1
     bMarkMap(3, $bMarkM, 'Industiral demands');
 		# Pack aquifer arguments for the demandFromStreamGwater funcion
-    @aqfSet	= ($aqfType, $AQF_IDs, $ones, $$AQF_DATA{gwtUseC}, $aqfType ? $aquiferID : $zeroes,	# 0 .. 4
-    @aqfArr,   pdl($aqfType? map([[$$aqf_data{$_}{Storage},$$aqf_data{$_}{Delta}]], @aqf_IDs):[[0,0]]));# 5 .. 7
+    @aqfSet	= ($aqfType, $aIdx, $ones, $$AQF_DATA{gwtUseC}, $aqfType ? $aquiferID : $zeroes,	# 0 .. 4
+    @aqfArr,   pdl($aqfType? map([$$aqf_data{$_}{Storage},$$aqf_data{$_}{Delta}], @aqf_IDs):[0,0]));	# 5 .. 7
+    $aqfSet[-1]->reshape(2,scalar(@aqf_IDs));		# Works inplace: https://metacpan.org/pod/PDL::Core#reshape
     @argSet	= ($mm_2_m3, $ones, $indSearchDist);
 		# Run industrial water withdrawals. Notes:  I/O units are volume, mm;
     ($IndUseStrgLoc, $IndUseFlowLoc, $IndUseStrgRmt, $IndUseFlowRmt,  $indUseFlowRID,
      $indUseSIR,     $indUseGrwt,    $indUseAqf,     $indUseExtra) = ($industryDemand * $subDf)->
-	demandFromStreamGwater($grdWater[1], $resStorage[0], $zeroes, $discharge, @aqfSet, @argSet, $dt);
+	demandFromStreamGwater($grdWater[1], $resStorage[0], $muskMask, $zeroes, $discharge, @aqfSet, @argSet, $dt);
 		# Update aquifer data hash
-    $aqf_data = arr_to_hash(unpdl_data($aqfSet[-1],{REF=>1}), [\@aqf_IDs,['Storage','Delta']], $aqf_data, -1) if $aqfType;
+    arr_to_hash(unpdl_data($aqfSet[-1],{REF=>1}), [\@aqf_IDs,['Storage','Delta']], $aqf_data, -1) if $aqfType;
 
 					# Convert mm -> mm/day
      map  $_ *= $subDi,	    $IndUseStrgLoc,  $IndUseFlowLoc, $IndUseStrgRmt, $IndUseFlowRmt, $indUseSIR,	# mm/day
-			    $indUseGrwt,     $indUseAqf,     $indUseExtra	if $hr_flag;
+			    $indUseGrwt,     $indUseAqf,     $indUseExtra	if $hr_flag || $md_flag;
      $indUseFlowLoc	 =  $IndUseStrgLoc + $IndUseFlowLoc;
      $indUseFlowRmt	 =  $IndUseStrgRmt + $IndUseFlowRmt;
      $taken		 =  $indUseFlowLoc + $indUseFlowRmt + $indUseSIR + $indUseGrwt + $indUseAqf + $indUseExtra;
@@ -2184,19 +2462,20 @@ EOS
 				### Livestock demand- use SIR storage; $irrExtraCoeff=1
     bMarkMap(3, $bMarkM, 'Livestock demands');
 		# Pack aquifer arguments for the demandFromStreamGwater funcion
-    @aqfSet	= ($aqfType, $AQF_IDs, $ones, $$AQF_DATA{gwtUseC}, $aqfType ? $aquiferID : $zeroes,	# 0 .. 4
-    @aqfArr,   pdl($aqfType? map([[$$aqf_data{$_}{Storage},$$aqf_data{$_}{Delta}]], @aqf_IDs):[[0,0]]));# 5 .. 7
-    @argSet	= ($mm_2_m3, $ones, $indSearchDist);
+    @aqfSet	= ($aqfType, $aIdx, $ones, $$AQF_DATA{gwtUseC}, $aqfType ? $aquiferID : $zeroes,	# 0 .. 4
+    @aqfArr,   pdl($aqfType? map([$$aqf_data{$_}{Storage},$$aqf_data{$_}{Delta}], @aqf_IDs):[0,0]));	# 5 .. 7
+    $aqfSet[-1]->reshape(2,scalar(@aqf_IDs));		# Works inplace: https://metacpan.org/pod/PDL::Core#reshape
+    @argSet	= ($mm_2_m3, $ones, $stkSearchDist);
 		# Run livestock water withdrawals. Notes:  I/O units are volume, mm;
     ($StkUseStrgLoc, $StkUseFlowLoc, $StkUseStrgRmt, $StkUseFlowRmt,  $stkUseFlowRID,
      $stkUseSIR,     $stkUseGrwt,    $stkUseAqf,     $stkUseExtra) = ($livestockDemand * $subDf)->
-	demandFromStreamGwater($grdWater[1], $resStorage[0], $smResStrg[1], $discharge, @aqfSet, @argSet, $dt);
+	demandFromStreamGwater($grdWater[1], $resStorage[0], $muskMask, $smResStrg[1], $discharge, @aqfSet, @argSet, $dt);
 		# Update aquifer data hash
-    $aqf_data = arr_to_hash(unpdl_data($aqfSet[-1],{REF=>1}), [\@aqf_IDs,['Storage','Delta']], $aqf_data, -1) if $aqfType;
+    arr_to_hash(unpdl_data($aqfSet[-1],{REF=>1}), [\@aqf_IDs,['Storage','Delta']], $aqf_data, -1) if $aqfType;
 
 					# Convert mm -> mm/day
      map  $_ *= $subDi,	    $StkUseStrgLoc,  $StkUseFlowLoc, $StkUseStrgRmt, $StkUseFlowRmt, $stkUseSIR,	# mm/day
-			    $stkUseGrwt,     $stkUseAqf,     $stkUseExtra	if $hr_flag;
+			    $stkUseGrwt,     $stkUseAqf,     $stkUseExtra	if $hr_flag || $md_flag;
      $stkUseFlowLoc	 =  $StkUseStrgLoc + $StkUseFlowLoc;
      $stkUseFlowRmt	 =  $StkUseStrgRmt + $StkUseFlowRmt;
      $taken		 =  $stkUseFlowLoc + $stkUseFlowRmt + $stkUseSIR + $stkUseGrwt + $stkUseAqf + $stkUseExtra;
@@ -2269,7 +2548,7 @@ EOS
       $irrFloodRice	 = $ricePaddyFlood - $rainFloodRice;			# Irrigation portion of Flooding
       $ricePaddyWater	 = $irrPercRice    + $irrFloodRice;			# Rice paddy water to bring from Irr
 		### Convert some vars above from volume to fluxes, mm/day
-      map $_ *= $subDi,	   $rainPercRice, $rainFloodRice, $irrPercRice, $irrFloodRice if $hr_flag;	# mm/day
+      map $_ *= $subDi,	   $rainPercRice, $rainFloodRice, $irrPercRice, $irrFloodRice if $hr_flag || $md_flag;	# mm/day
 
 	# Note- $irr_demand_total is for soil only and does not include rice added water!
     $irrigationNet	 = $irr_demand_total + $ricePaddyWater;		# Volume, mm
@@ -2279,7 +2558,7 @@ EOS
    ($irrEvapDeliv, $irrPercDeliv,					# Delivery losses,	mm/day
     $irrEvapIneff, $irrPercIneff, $irrRnffIneff) =			# Application losses,	mm/day
 	irrLosses( $irr_demand_total*$subDi, $irrigationNet*$subDi, \%irr_appRte, $irrArea, \%irrTech, $irrEfficiency,
-		   $irrReturnCoef,   $lossEvapRate,  $ricePercRate, \%awCap, \%land, \%landFrac, $irrRffStorage[0]);
+		   $irrReturnCoef,   $lossEvapRate,  $ricePercRate, \%awCap, $tp{irrCrop},  \%landFrac, $irrRffStorage[0]);
     my $lossSum  =($irrEvapDeliv + $irrPercDeliv + $irrEvapIneff + $irrPercIneff + $irrRnffIneff)*$subDf; # mm
 
 	#################################################################
@@ -2301,20 +2580,21 @@ EOS
 		### Irrigation water withdrawal in addition to VIS
     bMarkMap(3, $bMarkM, 'Irrigation water withdrawal');
 		# Pack aquifer arguments for the demandFromStreamGwater funcion
-    my @aqfSet	= ($aqfType, $AQF_IDs, $irrExtraCoeff, $$AQF_DATA{gwtUseC}, $aqfType ? $aquiferID : $zeroes,	# 0 .. 4
+    my @aqfSet	= ($aqfType, $aIdx, $irrExtraCoeff, $$AQF_DATA{gwtUseC}, $aqfType ? $aquiferID : $zeroes,	# 0 .. 4
 	$aqfType== 3 ? (Aqf_Well_Storage($AQF_DATA,$Aqf_dQ),$Cfd_dQ) : ($zeroes,$zeroes),		# 5 .. 6
-        pdl($aqfType ? map([[$$aqf_data{$_}{Storage},$$aqf_data{$_}{Delta}]], @aqf_IDs) : [[0,0]]));	# 7
+        pdl($aqfType ? map([$$aqf_data{$_}{Storage},$$aqf_data{$_}{Delta}], @aqf_IDs) : [0,0]));	# 7
+    $aqfSet[-1]->reshape(2,scalar(@aqf_IDs));		# Works inplace: https://metacpan.org/pod/PDL::Core#reshape
     my @argSet	= ($mm_2_m3, $SW_ratio, $irrSearchDist);
 		# Run irrigation water withdrawals. Notes:  I/O units are volume, mm; $aqf_data to be updated in-place
     ($IrrUseStrgLoc, $IrrUseFlowLoc, $IrrUseStrgRmt, $IrrUseFlowRmt, $irrUseFlowRID,
      $irrUseSIR,     $irrUseGrwt,    $irrUseAqf,     $irrUseExtra) = $irr_request->demandFromStreamGwater(
-	$grdWater[1],$resStorage[0], $smResStrg[1],  $discharge, @aqfSet, @argSet, $dt);
+	$grdWater[1],$resStorage[0], $muskMask, $smResStrg[1],  $discharge, @aqfSet, @argSet, $dt);
 		# Update aquifer data hash
-    $aqf_data = arr_to_hash(unpdl_data($aqfSet[-1],{REF=>1}), [\@aqf_IDs,['Storage','Delta']], $aqf_data, -1) if $aqfType;
+    arr_to_hash(unpdl_data($aqfSet[-1],{REF=>1}), [\@aqf_IDs,['Storage','Delta']], $aqf_data, -1) if $aqfType;
 
 					# Convert mm -> mm/day
     map $_ *= $subDi,	  $IrrUseStrgLoc,   $IrrUseFlowLoc, $IrrUseStrgRmt, $IrrUseFlowRmt, $irrUseSIR,
-			  $irrUseGrwt,      $irrUseAqf,     $irrUseExtra	if $hr_flag;
+			  $irrUseGrwt,      $irrUseAqf,     $irrUseExtra	if $hr_flag || $md_flag;
     $irrUseFlowLoc	= $IrrUseStrgLoc  + $IrrUseFlowLoc;
     $irrUseFlowRmt	= $IrrUseStrgRmt  + $IrrUseFlowRmt;
     $irrigationFlow	= $irrUseFlowLoc  + $irrUseFlowRmt;
@@ -2337,7 +2617,7 @@ EOS
 		### Scale irrigation water components by $irrFactor (actual amount of extracted water)
     map $_ *= $irrFactor,  $irrigationNet, $irrPercRice,  $irrFloodRice, $ricePaddyWater,
 			   $irrEvapDeliv,  $irrPercDeliv, $irrEvapIneff, $irrPercIneff, $irrRnffIneff;
-#   map{ $riceSoilWater	+= $irrFactor * $irr_appRte{$_} if m/^rice/i } sort keys %{$land{irrCrop}}; # Not yet used in output
+#   map{ $riceSoilWater	+= $irrFactor * $irr_appRte{$_} if m/^rice/i } @{$tp{irrCrop}}; # Not yet used in output
 
 		### Remove groundwater portion from delivery losses-
 		###	only in case of efficiency based water delivery model
@@ -2357,16 +2637,21 @@ EOS
     $evapotrans		+= $irrEvapIneff + $irrEvapDeliv;
 	# irrPercIneff is zero here in case of irrigation technologies.  irrPercIneff is updated after routing,.
     my $percolation	 = $irrPercIneff + $irrPercRice + $rainPercRice + $irrPercDeliv;
-    $GWt_infiltIrr	 = $percolation  * $GWt_infiltRatio;		# Percolation to shallow groundwater,     mm/day
-    $Aqf_infiltIrr	 = $percolation  * $Aqf_infiltRatio* $mm_2_m3	if $aqfType;	# to groundwater aquifer, m3/day
+    $GWt_infiltIrr	.= $percolation  * $GWt_infiltRatio;		# Percolation to shallow groundwater,     mm/day
+    $Aqf_infiltIrr	.= $percolation  * $Aqf_infiltRatio* $mm_2_m3	if $aqfType;	# to groundwater aquifer, m3/day
     $Aqf_dQ		+= $Aqf_infiltIrr* $subDf			if $aqfType==3;	# to ModFlow aquifers,    m3
 		### Update aquifer storages
-    foreach my $aqf_ID (@aqf_IDs) {}		# Removed from public domain
-
+    foreach my $aqf_ID (@aqf_IDs) {
+      my $sum = $Aqf_infiltIrr->aqfIdx_sum($$aqf_data{$aqf_ID}{idx})->at(0) * $subDf;	# m3
+      $$aqf_data{$aqf_ID}{StoragePrev}	 = $$aqf_data{$aqf_ID}{Storage};
+      $$aqf_data{$aqf_ID}{Storage}	+=  $sum;
+      $$aqf_data{$aqf_ID}{Delta}	+=  $sum;
+      $$aqf_data{$aqf_ID}{IrrIn}	 =  $sum;
+    }
 		### Re-calculate soil moisture after the irrigation is applied
     bMarkMap(3, $bMarkM, 'Irrigation water application to soil');
 
-    foreach my $tp (sort keys %{$land{$lnd}}) {		### ADDED SORT-NEED!
+    foreach my $tp (@{$tp{$lnd}}) {
       $irrigation{$tp}	= $irrFactor * $irr_appRte{$tp};						# mm
       my $irrigation_S	=($slice? $irrigation{$tp}->indexND($ind{$lnd}{$tp}): $irrigation{$tp});	# mm
 
@@ -2376,7 +2661,7 @@ EOS
 	# Note - Soil moisture change now is due to precipitation + evaporation + irrigation
     $sMoist[1]	*= 0;	# Reset these vars (NB- they have children slices)
     $sMoistFrac	*= 0;
-    foreach my $lnd (sort keys %land) { foreach my $tp (sort keys %{$land{$lnd}}) {	### ADDED SORT-NEED!
+    foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
       $sMoist{SLC}{$lnd}{$tp}     += $sMoist{slc}{$lnd}{$tp}	* $landFrac{slc}{$lnd}{$tp};
       $sMoistFrac{SLC}{$lnd}{$tp} += $sMoistFrac{slc}{$lnd}{$tp}* $landFrac{slc}{$lnd}{$tp};
     }}
@@ -2510,14 +2795,16 @@ EOS
   $resStorage[0] -=  $rsrvrEvap * $subDf;						# m3
 			### Small Irrigation Reservoirs (SIR)
 			### NB- we are using Dominik's 0.6*PET or $waterEvap for evaporation from SIR
-  my $sirEvap     =($smResArea/1000* $waterEvap*$m3_2_mm)->hclip($smResStrg[1]*$subDi);		# mm/day
-  $smResStrg[1]  -= $sirEvap * $subDf;
+  if ($smResFlag) {
+    $sirEvap	  =($smResArea/1000* $waterEvap*$m3_2_mm)->hclip($smResStrg[1]*$subDi);		# mm/day
+    $smResStrg[1]-= $sirEvap * $subDf;
+  }
 			### Rivers
   my $riverEvap   = ($dL*$wStream  * $waterEvap)->hclip($resStorage[0]*$subDi);		# m3
   $resStorage[0] -=  $riverEvap * $subDf;
 			### Connectivity Canals open water evaporation at Recipient cells
   $$connectivity[1]->((5),) .= $waterEvap->index2d($$connectivity[0]->((2),),$$connectivity[0]->((3),))->flat
-	if $$connectivity[0]->dims;						# mm/day
+	if $$connectivity[0]->dims;							# mm/day
 
   my $netwkEvap	 = $rsrvrEvap + $riverEvap;	# This is part of river network balance, m3/day
   $evapotrans	+= $sirEvap   + $canopyET;	# This is part of pixel balance, mm/day
@@ -2624,8 +2911,10 @@ EOS
 	###############################################################
 	#####   USGS data assimilation
 
-  if ($usgs_data) {}		# Removed from public domain
-
+  if ($usgs_data) {
+    update_usgs($usgs_data, $date, $j_date+$hour/24, $usgsDecay);
+    @usgsStack	= make_stack($usgs_data, ['disch','DISCH','delta'], \%cell_ind);
+  }
 	###############################################################
   bMarkMap(3, $bMarkM, 'Routing call');
 
@@ -2676,28 +2965,28 @@ EOS
       $strg, $flow_out, $routeDiversion) = $cell_table->routing(
 	$rtMethod,	$C0, $C1, $C2,
 	$runoffVol,	$cRunoff,	$cRunoffP,	$cRunoffIrr,	$cRunoffTw, $cRunoffMsk,   $cRunoffDIN,
-	$dischargePrev,	$dischUsed,
+	$dischargePrev,	$dischUsed,	$depth*$width*  $length,
 	$streamAge,	$cStream[0],	$cStreamP[0],	$cStreamIrr[0],	$cStreamTw, $cStreamMsk[0],
 	$cStreamDIN,	$cStmConDIN,
 	$flow_outPrev,	$meanDischarge,	$resStorage[0],	$minRsvStrg,	@$reservoir,$dt,	   $j_date,
 	$cSwitch,	@$connectivity,	$waterTe,	$waterExp,	@DIN_Args,  @snkStack,	   @usgsStack);
 
-  push	@resStorage, $strg->lclip(0);
-	$discharge	= $disch ->lclip(0);
-	$streamAge	= $wAge      ->copybad($network)	if $compSwitch[0];
-  push	@cStream	, $dischFr   ->copybad($network)	if $compSwitch[1];
-  push	@cStreamP	, $dischPmFr ->copybad($network)	if $compSwitch[2];
-  push	@cStreamIrr	, $dischIrrFr->copybad($network)	if $compSwitch[3];
-	$cStreamTw	= $dischTw   ->copybad($network)	if $compSwitch[4];
-  push	@cStreamMsk	, $dischMsk  ->copybad($network)	if $compSwitch[5];
-	$cStreamDIN	= $dischDIN  ->copybad($network)	if $compSwitch[6];
-	$cStmConDIN	= $consrDIN  ->copybad($network)	if $compSwitch[6];
+  push	@resStorage,	  $strg ->lclip(0);			# Do not remove lclip()
+	$discharge	.= $disch->lclip(0);			# Do not remove lclip()
+	$streamAge	.= $wAge      ->copybad($network)	if $compSwitch[0];
+  push	@cStream	 , $dischFr   ->copybad($network)	if $compSwitch[1];
+  push	@cStreamP	 , $dischPmFr ->copybad($network)	if $compSwitch[2];
+  push	@cStreamIrr	 , $dischIrrFr->copybad($network)	if $compSwitch[3];
+	$cStreamTw	.= $dischTw   ->copybad($network)	if $compSwitch[4];
+  push	@cStreamMsk	 , $dischMsk  ->copybad($network)	if $compSwitch[5];
+	$cStreamDIN	.= $dischDIN  ->copybad($network)	if $compSwitch[6];
+	$cStmConDIN	.= $consrDIN  ->copybad($network)	if $compSwitch[6];
 
   rehash_stack($usgs_data, ['disch','DISCH','delta'], \%usgs_CT, @usgsStack) if $usgs_data;
-  my $aquiferSnk	= $snkStack [0]->((2),);	# Sink  flow (m3/sec) to an aquifer at sink sites locations
-  my $usgsDelta		= $usgsStack[0]->((2),);	# Added flow (m3/sec) to discharge  at USGS sites locations
-  my $flowUseDelta	= $dischUsedPrev - $dischUsed;	# Water taken from underpredicted discharge (see above)
-     $flowInPrev	=($discharge - $runoffVol)->lclip(0);
+  my $aquiferSnk	 = $snkStack [0]->((2),);	# Sink  flow (m3/sec) to an aquifer at sink sites locations
+  my $usgsDelta		 = $usgsStack[0]->((2),);	# Added flow (m3/sec) to discharge  at USGS sites locations
+  my $flowUseDelta	 = $dischUsedPrev - $dischUsed;	# Water taken from underpredicted discharge (see above)
+     $flowInPrev	.=($discharge - $runoffVol)->lclip(0);
 
 		### Update data for 5-year running average Discharge
   my $mDischargeS = $mDischargeK == $#mDischarge;	# Case of first 5-year span
@@ -2705,7 +2994,11 @@ EOS
         $mDischarge [$_]+= $discharge; } $mDischargeS..$mDischargeK;
 
 		### Update endorheic lake water balance and geometry
-		# Removed from public domain
+  compUpdate_Endorheic($flow_out) if $endoComp;
+  $endoStrg	+= $discharge->indexND($$outletIdx{ENDORHEIC}) * $dt;					# in m3
+  $endoArea	.= endoLakeGeometry($endoStrg->lclip(1), $endoSlope);					# in m2
+  $endoEvap	.= $endoArea/1000 * $waterEvap->indexND($$outletIdx{ENDORHEIC})->hclip($endoStrg);	# in m3
+  $endoStrg	-= $endoEvap      * $subDf;
 
 	###############################################################
 	#####	Return flows from irrigation and other water uses,
@@ -2755,10 +3048,16 @@ EOS
     $irrRffStorage[1]	-=  $irrPercIneff * $subDf;	# Subtract percolation from runoff storage pool
     my $GWt_infltIneff	 =  $irrPercIneff * $GWt_infiltRatio;				# mm/day
     my $Aqf_infltIneff	 =  $irrPercIneff * $Aqf_infiltRatio * $mm_2_m3 if $aqfType;	# m3/day
+       $Aqf_infltIneff //=  pdl();							# Must be PDL object
 
 		### Update aquifer storages
-    foreach my $aqf_ID (@aqf_IDs) {}		# Removed from public domain
-
+    foreach my $aqf_ID (@aqf_IDs) {
+      my $sum = $Aqf_infltIneff->aqfIdx_sum($$aqf_data{$aqf_ID}{idx})->at(0) * $subDf;	# m3
+      $$aqf_data{$aqf_ID}{StoragePrev} = $$aqf_data{$aqf_ID}{Storage};
+      $$aqf_data{$aqf_ID}{Storage}    +=  $sum;
+      $$aqf_data{$aqf_ID}{Delta}      +=  $sum;
+      $$aqf_data{$aqf_ID}{IrrIn}      +=  $sum;
+    }
 		### Update groundwater and aquifer tracking components
     bMarkMap(3, $bMarkM, 'Tracking of inefficent returns');
     compUpdate_GrWaterIrr($GWt_infltIneff,$Aqf_infltIneff);
@@ -2784,17 +3083,91 @@ EOS
   my $Aqf_infilt  = $Aqf_infiltPrecip	+ $Aqf_infiltIrr;		# m3/day
 
 		### Update lumped aquifer storage with sinking river flows
-  if ($snk_flag) {}		# Removed from public domain
+  if ($snk_flag) {
+    bMarkMap(2, $bMarkM, 'Sinks to aquifers');
 
+    foreach my $snk (0 .. $snkStack[1]    ->dim(0) - 2) {
+      my $snkVolume	= $aquiferSnk     ->at(  $snk)*$dt;	# m3
+      my $aqf_ID	= int $snkStack[0]->at(1,$snk);
+      my @colRow	= $snk_idx(,$snk) ->list;
+      my $idx		= $$aqf_data{$aqf_ID}{idx};
+      $$aqf_data{$aqf_ID}{Storage} += $snkVolume;		# m3
+      $$aqf_data{$aqf_ID}{Delta}   += $snkVolume;
+      $$aqf_data{$aqf_ID}{sinkIn}  += $snkVolume;
+       $Aqf_dQ->indexND($idx)	   += $snkVolume/$$aqf_data{$aqf_ID}{Area}*$CELL_AREA->indexND($idx) if $aqfType == 3;
+
+		###	Update component tracking in Virtual/Lumped aquifers
+      compUpdate_AquiferSnk($cAqWaterP,  $aqf_data,$aqf_ID,$cStreamP[1]  ->(@colRow,),$snkVolume) if $compSwitch[2];
+      compUpdate_AquiferSnk($cAqWaterIrr,$aqf_data,$aqf_ID,$cStreamIrr[1]->(@colRow,),$snkVolume) if $compSwitch[3];
+#     compBalance_sinks($snkVolume, \@colRow);		# Internal flux- Not yet used (no need) for reporting
+  } }
 	###############################################################
-	###	ModFlow fluid Dynamics (presently EFDM solver only)
+	###	ModFlow fluid Dynamics (presently Explicit Forward Difference Method (EFDM) solver only)
+  if ($aqfType == 3) {
+    bMarkMap(2, $bMarkM, 'ModFlow aquifer fluxes');
 
-  if ($aqfType == 3) {}		# Removed from public domain
+		### Initialization
+    my  $balancePrev	= ($$AQF_DATA{Strg_B} + $$AQF_DATA{Strg_T});
+    my  $dT		=   1 / $$AQF_DATA{N_steps};
+    my ($QQ, $FF)	= ([0,0], [0,0]);			# Reset summary variables
+    map set_to_zero($$AQF_DATA{$_}, $zeroes), qw(QhT_U QhT_V QhB_U QhB_V DC_T DC_B Qv);	# Reset summary variables
 
+    for (my $n=0; $n<$$AQF_DATA{N_steps}; $n++) {		# Use more steps, if solution is not stable
+		### Add stocks to the aquifer storage & head
+      $$AQF_DATA{Strg_B}->indexND($$AQF_DATA{idx_S}) +=($Aqf_dQ*$dT)->indexND($$AQF_DATA{idx_S});	# Unconfined
+      $$AQF_DATA{Strg_B}->indexND($$AQF_DATA{idx_B}) +=($Cfd_dQ*$dT)->indexND($$AQF_DATA{idx_B});	# Confined
+      $$AQF_DATA{Strg_T}->indexND($$AQF_DATA{idx_T}) +=($Aqf_dQ*$dT)->indexND($$AQF_DATA{idx_T});	# Confining
+      Aqf_Storage_2_Head($AQF_DATA);
+
+		### ModFlow fluid dynamics
+      my ($Q, $F) = ModFlow_EFDM( $AQF_DATA, $dT*$subDf );	# Argument time is in days; Flux units are m3/dt
+
+		### Add fluxes to the aquifer storage & head
+      $$AQF_DATA{Strg_B} += $$Q[0];
+      $$AQF_DATA{Strg_T} += $$Q[1];
+      Aqf_Storage_2_Head($AQF_DATA);
+		### Add to total fluxes (summaries)
+      map { $$QQ[$_]+=$$Q[$_]; $$FF[$_]+=$$F[$_] } 0,1;
+    }
+    map $$AQF_DATA{$_}	/= $dt, qw(QhT_U QhT_V QhB_U QhB_V Qv);	# Convert flux units to m3/sec for WBM output
+
+		### Check/print balance
+    my $balance	= $$AQF_DATA{Strg_B} + $$AQF_DATA{Strg_T};
+    my $S_sum	=($Aqf_dQ  + $Cfd_dQ)->sum;
+    my $Q_sum	=($$QQ[0]  + $$QQ[1])->sum;
+    my $F_sum	=($$FF[0]  + $$FF[1])->sum;
+    my $delta1	= $Q_sum   - $F_sum;
+    my $delta2	=($balance - $balancePrev)->sum - $S_sum - $Q_sum;
+    printf(" Fundamental ModFlow misbalance: %.4f = %.4f - %.4f (Delta = Q_sum - F_sum)\n", $delta1, $Q_sum, $F_sum)
+	if abs($delta1) > 5;
+    printf("\n ModFlow misbalance:  %.4f = %.4f - (%.4f + %.4f + %.4f)\n" .
+	" Delta = balance - (balancePrev + S_sum + Q_sum)\n", $delta2, $balance->sum, $balancePrev->sum, $S_sum,$Q_sum)
+	if abs($delta2) > 5;
+
+		### Add draining fluxes to the aquifer summary
+    my $drnOut	= $$FF[0] + $$FF[1];
+    foreach my $aqf_ID (@aqf_IDs) {
+      my $sum = $drnOut->aqfIdx_sum($$aqf_data{$aqf_ID}{idx})->at(0);
+      $$aqf_data{$aqf_ID}{Storage} +=  $sum;
+      $$aqf_data{$aqf_ID}{Delta}   +=  $sum;
+      $$aqf_data{$aqf_ID}{drnOut}  +=  $sum;
+      $$aqf_data{$aqf_ID}{MF_out}   = -$sum;
+      die("\nComponent balance not coded for ModFlow influx from ocean. Aborting...\n\n") if $compBalFlag && $sum > 0;
+# printf "%f - %f = %d\n",$$aqf_data{$aqf_ID}{Storage}*1e-9, $balance->sum*1e-9, ($$aqf_data{$aqf_ID}{Storage} - $balance->sum);
+  } }
 	###############################################################
 
-  if ($aqfType) {}		# Removed from public domain
+  if ($aqfType) {
+    bMarkMap(2, $bMarkM, 'Aquifer Processing # 3');
 
+    $Aqf_Storage .= ($$AQF_DATA{Strg_B} + $$AQF_DATA{Strg_T})/($CELL_AREA*1e3) if $aqfType == 3;	# mm over full cell area
+    foreach my $aqf_ID (@aqf_IDs) {
+		### Rasterize Virtual/Lumped aquifer storage to grid (mm)
+      $Aqf_Storage->indexND($$aqf_data{$aqf_ID}{idx}) += $$aqf_data{$aqf_ID}{Storage} / $$aqf_data{$aqf_ID}{Area} * 1e-3
+	if $aqfType < 3;
+		### Update aquifer summary values for the end-of-the-year report
+      map $$aqf_data{$aqf_ID}{$_.'_y'} += $$aqf_data{$aqf_ID}{$_}, @{$$AQF_DATA{sumKeys}};
+  } }
 	###############################################################
 	###   Calculate critical WBM balances
 	###############################################################
@@ -2848,7 +3221,7 @@ EOS
   my $sMoistChgT	= ($sMoistChg	* $mm_2_km3)->sum;
   my $evapotransT	= ($evapotrans	* $MM_2_km3)->sum;
   my $grdWaterChgT	= ($grdWaterChg	* $mm_2_km3)->sum;
-  my $Aqf_infiltT	= ($Aqf_infilt  *      1e-9)->sum;
+  my $Aqf_infiltT	= ($Aqf_infilt  *      1e-9)->sum * $subDf;
   my $runoffT		= ($runoffVol	* $dt* 1e-9)->sum;
   my $sRffStChgT	= ($sRffStChg	* $mm_2_km3)->sum;
   my $smResStChgT	= ($smResStChg  * $mm_2_km3)->sum;
@@ -3031,7 +3404,7 @@ EOS
 		  $doOutput ?	sprintf("File wbm_%04d-%02d.nc", @date[0,1]) :	# Monthly output run
 				sprintf("Spinup %d/%d",$yrCycle,$runIO{Spinup}{Loops});
 
-  if ($doOutput) {
+  if ($doOutput || $runIO{Spinup}{Save_Vars}) {
 
 		### Reference cell area for output variables
     my $soilRA	= { reference_area => 'soil portion of grid cell area' };
@@ -3052,13 +3425,9 @@ EOS
        $endorheic{Area}	= $zeroes->copy;	$endorheic{Area}->indexND($$outletIdx{ENDORHEIC}) .= $endoArea*1e-6;
        $endorheic{Evap}	= $zeroes->copy;	$endorheic{Evap}->indexND($$outletIdx{ENDORHEIC}) .= $endoEvap;
     }
-		### Re-scaling output variables to full or partial cell area
-    $surfRunoff		*= $sRatio			if 'surfRunoff'		~~ @list_out;	# Equal
-    $baseFlow		*= $sRatio			if m/^baseflow/		~~ @list_out;	# Match
-    $GWt_infiltPrecip	*= $sRatio			if 'GWt_infiltPrecip'	~~ @list_out;	# Equal
-       $grdWaterChg	*= $sRatio			if 'grdWaterChg'	~~ @list_out;	# Equal
-    my $UGW_out		 = $sRatio*$UGW			if 'UGW'		~~ @list_out;	# Equal
-    my $grdWater	 = $sRatio*$grdWater[1];
+		### Green/Blue water output aggregations for output variables:
+    my($sMoistGr, $sMoistBl, $GW_ET, $BW_ET) =			# sMoistGr, sMoistBl, GW_ET, BW_ET
+	make_GW_BW_output(\%sMoistGr, \%sMoistGrET, \%sMoist, \%sMoistET, \%landFrac, \@list_out);
 
 		### Calculated output variables (if required by the output variable list)
     my $disch_out	='discharge_out'~~@list_out? table_to_grid( $flow_out, $cell_table, $zeroes )	   :$zeroes;
@@ -3069,12 +3438,19 @@ EOS
     my $domUseSGW	= 'domUseSGW'   ~~@list_out? $domUseGrWt   -$domUseExtra			   :$zeroes;
     my $indUseSGW	= 'indUseSGW'   ~~@list_out? $indUseGrWt   -$indUseExtra			   :$zeroes;
     my $stkUseSGW	= 'stkUseSGW'   ~~@list_out? $stkUseGrWt   -$stkUseExtra			   :$zeroes;
-    my $irrRffStorage	='irrRffStorage'~~@list_out? $irrRffStorage[1] - $ricePaddyStrg			   :$zeroes;
-
+    my $flushRunoff	=m/^(f|n).+Run/	~~@list_out? $flushWater   *$M3_2_MM * $subDi			   :$zeroes;
+    my $netRunoff	= 'netRunoff'	~~@list_out?($Aqf_RIV_dsch -$Aqf_RIV_rech+$runoffVol)*$dt*$M3_2_MM :$zeroes;
+    my $cStreamP_mm	= $compSwitch[2] && m/^resStorage_mm/	~~@list_out? $cStreamP	*
+								 ($resStorage[1]	* $M3_2_MM)	   :$zeroes_4;
+    my $cEndoP_mm	= $compSwitch[2] && m/^endoStrg_mm/	~~@list_out? $cEndoP	*
+								 ($endorheic{Strg}	* $M3_2_MM)	   :$zeroes_4;
+    my $cRffStgP_mm	= $compSwitch[2] && m/^runoffStrg_mm/	~~@list_out? $cRffStgP	*
+								 ($irrRffStorage[1] + $surfRffStorage[1])  :$zeroes_4;
+    my $cSoilP_mm	= $compSwitch[2] && m/^soilMoist_mm/	~~@list_out? $cSoilP	*$sMoist[1]	   :$zeroes_4;
     my $cRunoffP_mm	= $compSwitch[2] && m/^runoff_mm/	~~@list_out? $cRunoffP  *$runoff  *$sRatio :$zeroes_4;
-    my $cBaseflowP_mm	= $compSwitch[2] && m/^baseflow_mm/	~~@list_out? $cGrWaterP *$baseFlow	   :$zeroes_4;
+    my $cBaseflowP_mm	= $compSwitch[2] && m/^baseflow_mm/	~~@list_out? $cGrWaterP *$baseFlow*$sRatio :$zeroes_4;
     my $cStreamP_m3s	= $compSwitch[2] && m/^discharge_m3s/	~~@list_out? $cStreamP  *$discharge	   :$zeroes_4;
-    my $cGrWaterP_mm	= $compSwitch[2] && m/^grndWater_mm/	~~@list_out? $cGrWaterP *$grdWater	   :$zeroes_4;
+    my $cGrWaterP_mm	= $compSwitch[2] && m/^grndWater_mm/	~~@list_out? $cGrWaterP *$grdWater[1]*$sRatio:$zeroes_4;
     my $cGrossIrrP_mm	= $compSwitch[2] && m/^GrossIrr_mm/	~~@list_out? $cGrossIrrP*$irrigationGross  :$zeroes_4;
     my $cNetIrrP_mm	= $compSwitch[2] && m/^NetIrr_mm/	~~@list_out? $cGrossIrrP*$irrigationNet	   :$zeroes_4;
     my $cIrrUseFlowP_mm	= $compSwitch[2] && m/^IrrFlow_mm/	~~@list_out?
@@ -3083,14 +3459,15 @@ EOS
     my $cIrrEvap_mm	= $compSwitch[2] && m/^IrrEvap_mm/	~~@list_out? $cGrossIrrP*$irrEvapIneff	   :$zeroes_4;
     my $cIrrPercRice_mm	= $compSwitch[2] && m/^IrrPercRice_mm/	~~@list_out? $cGrossIrrP*$irrPercRice	   :$zeroes_4;
     my $cIrrPercIneff_mm= $compSwitch[2] && m/^IrrPercIneff_mm/	~~@list_out? $cGrossIrrP*$irrPercIneff	   :$zeroes_4;
-    my $etIrrCrops_mm   = $compSwitch[2] && m/^etIrrCrops_mm/   ~~@list_out? $cSoilP    *$etIrrCrops       :$zeroes_4;
-		### Green/Blue water output aggregations for output variables:
-    my($sMoistGr, $sMoistBl, $GW_ET, $BW_ET) =			# sMoistGr, sMoistBl, GW_ET, BW_ET
-	make_GW_BW_output(\%sMoistGr, \%sMoistGrET, \%sMoist, \%sMoistET, \%landFrac, \@list_out);
-		### Cell total water mass storage. Note- $ricePaddyStrg is part of $surfRffStorage[1]
-    my $total_mass	=                   'total_mass'	~~@list_out?($irrRffStorage[1] +
-	$UGW + $surfRffStorage[1] +  $sMoist[1] + $grdWater[1]  + $smResStrg[1])*$sRatio +
-	$snowPack*$actvRA + $Aqf_Storage  + ($resStorage[1] + $glVolume + $endorheic{Strg})   *	$M3_2_MM   :$zeroes;
+    my $etIrrCrops_mm   = $compSwitch[2] && m/^etIrrCrops_mm/   ~~@list_out? $cSoilP	*$etIrrCrops       :$zeroes_4;
+    my $cEndoEvapP_mm	= $compSwitch[2] && m/^endoEvap_mm/	~~@list_out? $cEndoP	*
+								 ($endorheic{Evap}	*$M3_2_MM)	   :$zeroes_4;
+    my $cOpenWaterEvapP_mm=$compSwitch[2]&& m/^openWaterEvap_mm/~~@list_out?$cStreamP[1]*$netwkEvap	   :$zeroes_4;
+		### Cell total water mass storage
+    my $irrRffStrg	= $irrRffStorage[1] - $ricePaddyStrg;
+    my $total_mass	=                   'total_mass'	~~@list_out?($irrRffStrg + $ricePaddyStrg +
+	$surfRffStorage[1]+ $sMoist[1]  + $grdWater[1]   + $smResStrg[1]+ $UGW)*$sRatio  +
+	$snowPack*$aRatio + $Aqf_Storage+ ($resStorage[1]+ $glVolume    + $endorheic{Strg})   *	$M3_2_MM   :$zeroes;
 		### Convert units to mm/day
        $Aqf_infiltPrecip= $aqfType	 && 'Aqf_infiltPrecip'	~~@list_out? $Aqf_infiltPrecip*	$M3_2_MM   :$zeroes;
        $Aqf_infiltIrr	= $aqfType	 && 'Aqf_infiltIrr'	~~@list_out? $Aqf_infiltIrr   *	$M3_2_MM   :$zeroes;
@@ -3103,15 +3480,17 @@ EOS
 	condition($$AQF_DATA{mask_T}, $$AQF_DATA{h_T}, $$AQF_DATA{h_B})  -  $$AQF_DATA{Net_DEM}		   :$zeroes;
     my($Aqf_DH_Depth_T, $Aqf_H_Depth_T, $Aqf_H_Depth_B, $Aqf_H_Depth) =
 			  $aqfType == 3 && m/AQF_H_Depth/~~@list_out ? map($_ - $$AQF_DATA{DEM},
-	$Aqf_head_T, $$AQF_DATA{h_T}, $$AQF_DATA{h_B}, $$AQF_DATA{h_B}->hclip($Aqf_head_T))		  :($zeroes) x 3;
+	$Aqf_head_T, $$AQF_DATA{h_T}, $$AQF_DATA{h_B}, $$AQF_DATA{h_B}->hclip($Aqf_head_T))		  :($zeroes) x 4;
 
 			### This is the list of output variable key words
     my %data_out = (
 		### Major parameters
 				# Output variable "runoff" does not include "flush" and "glacial melt" waters
 	'runoff'	=> [$runoff,		'Runoff',					'mm/day', $sRatio],
-	'surfRunoff'	=> [$surfRunoff,	'Surface runoff',				'mm/day', $fullRA],
-	'baseflow'	=> [$baseFlow,		'Baseflow',					'mm/day', $fullRA],
+	'surfRunoff'	=> [$surfRunoff,	'Surface/Storm runoff',				'mm/day', $sRatio],
+	'flushRunoff'	=> [$flushRunoff,	'Flush water runoff',				'mm/day', $fullRA],
+	'netRunoff'	=> [$netRunoff,		'Net/Total runoff',				'mm/day', $fullRA],
+	'baseflow'	=> [$baseFlow,		'Baseflow',					'mm/day', $sRatio],
 	'discharge_in'	=> [$disch_in,		"Inflow discharge by $routingMethod routing",	'm3/sec'],
 	'discharge'	=> [$discharge,		"Discharge by $routingMethod routing",		'm3/sec'],# Inflow+rnff
 	'discharge_out'	=> [$disch_out,		"Outflow discharge by $routingMethod routing",	'm3/sec'],
@@ -3124,7 +3503,7 @@ EOS
 	'speed'		=> [$velocity,		'Instantaneous Stream/Reservoir Velocity',	'm/sec'],
 	'length'	=> [$length,		'Stream/Reservoir Segment Length',		'm'],
 	'precip'	=> [$precip,		'Precipitation',				'mm/day'],
-	'airT'		=> [$airT,		'Temperature',					'deg C'],
+	'airT'		=> [$airT,		'Temperature',					'degC'],
 	'snowPack'	=> [$snowPack,		'Snow Pack Water Equivalent',			'mm',	  $actvRA],
 	'snowPackChg'	=> [$sPackChg,		'Snow Pack Water Equivalent Change',		'mm/day', $actvRA],
 	'snowMelt'	=> [$snowMelt,		'Snow melt',					'mm/day', $actvRA],
@@ -3135,7 +3514,7 @@ EOS
 	'etIrrCrops'	=> [$etIrrCrops,	'Evapotranspiration from irrigated crops',	'mm/day', $soilRA],
 	'etRfdCrops'	=> [$etRfdCrops,	'Evapotranspiration from rainfed crops',	'mm/day', $soilRA],
 	'etNonCrops'	=> [$etNonCrops,	'Evapotranspiration from non-crop land',	'mm/day', $soilRA],
-	'openWaterEvap'	=> [$netwkEvap*$M3_2_MM,'Evaporation from rivers & reservoirs',		'mm/day', $fullRA],
+	'openWaterEvap'	=> [$netwkEvap,		'Evaporation from rivers & reservoirs',		'mm/day', $M3_2_MM], # NB units
 	'soilMoist'	=> [$sMoist[1],		'Soil Moisture Water Equivalent',		'mm',	  $soilRA],
 	'soilMoistChg'	=> [$sMoistChg,		'Soil Moisture Water Equivalent Change',	'mm/day', $soilRA],
 		# Note - Soil moisture change is due to precipitation/evaporation/irrigation
@@ -3145,20 +3524,22 @@ EOS
 	'sMoistBl'	=> [$sMoistBl,		'Blue  Water soil moisture equivalent',		'mm',	  $soilRA],
 	'GW_ET'		=> [$GW_ET,		'Green Water soil evapotranspiration',		'mm/day', $soilRA],
 	'BW_ET'		=> [$BW_ET,		'Blue  Water soil evapotranspiration',		'mm/day', $soilRA],
-	'grdWater'	=> [$grdWater,		'Groundwater',					'mm',	  $fullRA],
-	'grdWaterChg'	=> [$grdWaterChg,	'Groundwater Change',				'mm/day', $fullRA],
-	'UGW'		=> [$UGW_out,		"Accumulated $UnsStr groundwater use",		'mm',	  $fullRA],
-      'GWt_infiltPrecip'=> [$GWt_infiltPrecip,	'Infiltration to Groundwater from Precip',	'mm/day', $fullRA],
+	'grdWater'	=> [$grdWater[1],	'Groundwater',					'mm',	  $sRatio],
+	'grdWaterChg'	=> [$grdWaterChg,	'Groundwater Change',				'mm/day', $sRatio],
+	'UGW'		=> [$UGW,		"Accumulated $UnsStr groundwater use",		'mm',	  $sRatio],
+      'GWt_infiltPrecip'=> [$GWt_infiltPrecip,	'Infiltration to Groundwater from Precip',	'mm/day', $sRatio],
       'Aqf_infiltPrecip'=> [$Aqf_infiltPrecip,	'Infiltration to Aquifer from Precip',		'mm/day', $fullRA],
 	'GWt_infiltIrr'	=> [$GWt_infiltIrr,	'Infiltration to Groundwater from Irrigation',	'mm/day', $fullRA],
 	'Aqf_infiltIrr'	=> [$Aqf_infiltIrr,	'Infiltration to Aquifer from Irrigation',	'mm/day', $fullRA],
 	'Aqf_Storage'	=> [$Aqf_Storage,	'Groundwater Aquifer Storage',			'mm',	  $fullRA],
-	'resStorage'	=> [$resStorage[1],	'Stream and Reservoir Storage',		'm3/pixel'],
-	'surfRffStorage'=> [$surfRffStorage[1],	'Storm Runoff Retention Pool Storage',	'mm',		  $soilRA],
-	'irrRffStorage'	=> [$irrRffStorage,	'Irrig Runoff Retention Pool Storage',	'mm',		  $soilRA],
-	'total_mass'	=> [$total_mass,	'Total water mass',			'mm',		  $fullRA],
-	'endoStrg'	=> [$endorheic{Strg},	'Endorheic lakes water storage',	'm3/pixel'],
-	'endoArea'	=> [$endorheic{Area},	'Endorheic lakes Area',			'km2/pixel'],
+	'resStorage'	=> [$resStorage[1],	'Stream and Reservoir Storage',			'm3/pixel'],
+	'resStorage_mm' => [$resStorage[1],	'Stream and Reservoir Storage',			'mm', 	  $M3_2_MM], # NB units
+	'surfRffStorage'=> [$surfRffStorage[1],	'Storm Runoff Retention Pool Storage',		'mm',	  $soilRA],
+	'irrRffStorage'	=> [$irrRffStrg,	'Irrig Runoff Retention Pool Storage',		'mm',	  $soilRA],
+	'total_mass'	=> [$total_mass,	'Total water mass',				'mm',	  $fullRA],
+	'endoStrg'	=> [$endorheic{Strg},	'Endorheic lakes water storage',		'm3/pixel'],
+	'endoStrg_mm'	=> [$endorheic{Strg},	'Endorheic lake water storage',			'mm',	  $M3_2_MM], # NB units
+	'endoArea'	=> [$endorheic{Area},	'Endorheic lakes Area',				'km2/pixel'],
 	'endoEvap'	=> [$endorheic{Evap},	'Endorheic lakes water evaporation',	'm3/pixel/day'],
 		### Water demand parameters
 		$runIO{WaterDemand} ? (			# Original "soil" reference area is forced to "full"
@@ -3201,16 +3582,16 @@ EOS
 	) : (),
 		### Irrigation parameters
 		$runIO{Irrigation} ? (
-	'irrArea'	=> [$irrArea	 *$CELL_AREA,	'Irrigated cropland area',		'km2/pixel'],
-	'nonIrrArea'	=> [$nonIrrArea	 *$CELL_AREA,	'Rainfed and Fallow cropland area',	'km2/pixel'],
-	'cropArea'	=> [$cropAreaFrac*$CELL_AREA,	'Cropland area',			'km2/pixel'],
-	'cropAreaFrac'	=> [$cropAreaFrac,		'Cropland area fraction',		'fraction'],
-	'irrDemandTotal'=> [$irr_demand_total,		'Gross Irr demand total',		'mm/day',  $soilRA],
-	'irrDemand_km2'	=> [$irr_demand_total*$mm_km2,	'Gross Irr demand per irrigated km2',	'm3/km2/day'],
-	'irrigationGross'=>[$irrigationGross,		'Gross Irrigation',			'mm/day',  $soilRA],
-	'irrGross_km2'	=> [$irrigationGross *$mm_km2,	'Gross Irrigation per irrigated km2',	'm3/km2/day'],
-	'irrigationNet'	=> [$irrigationNet*$subDi,	'Net Irrigation',			'mm/day',  $soilRA],
-	'irrNet_km2'	=> [$irrigationNet   *$mm_km2,	'Net Irrigation per irrigated km2',	'm3/km2/day'],
+	'irrArea'	=> [$irrArea,		'Irrigated cropland area',		'km2/pixel',	$soil_area],
+	'nonIrrArea'	=> [$nonIrrArea,	'Rainfed and Fallow cropland area',	'km2/pixel',	$soil_area],
+	'cropArea'	=> [$cropAreaFrac,	'Cropland area',			'km2/pixel',	$soil_area],
+	'cropAreaFrac'	=> [$cropAreaFrac,	'Cropland area fraction',		'fraction'],
+	'irrDemandTotal'=> [$irr_demand_total,	'Gross Irr demand total',		'mm/day',  	$soilRA],
+	'irrDemand_km2'	=> [$irr_demand_total,	'Gross Irr demand per irrigated km2',	'm3/km2/day',	$mm_km2], # NB units
+	'irrigationGross'=>[$irrigationGross,	'Gross Irrigation',			'mm/day',	$soilRA],
+	'irrGross_km2'	=> [$irrigationGross,	'Gross Irrigation per irrigated km2',	'm3/km2/day',	$mm_km2], # NB units
+	'irrigationNet'	=> [$irrigationNet*$subDi,'Net Irrigation',			'mm/day',	$soilRA],
+	'irrNet_km2'	=> [$irrigationNet,	'Net Irrigation per irrigated km2',	'm3/km2/day',	$mm_km2], # NB units
 	'irrFactor'	=> [$irrFactor,		'Irrigation factor',				'fraction'],
 	'irrRunoff'	=> [$irrRunoff,		'Irrigation return runoff',			'mm/day',  $soilRA],
 	'irrFlowLoc'	=> [$irrUseFlowLoc,	'Gross Irrigation from local river storage',	'mm/day',  $soilRA],
@@ -3222,18 +3603,18 @@ EOS
 	'irrigationGrwt'=> [$irrUseGrwt,	'Gross Irrigation from ground water',		'mm/day',  $soilRA],
 	'irrigationAqf'	=> [$irrUseAqf,		'Gross Irrigation from aquifer water',		'mm/day',  $soilRA],
 	'irrigationExtra'=>[$irrUseExtra,	'Gross Irrigation from Extra water',		'mm/day',  $soilRA],
-	'addedWater'	=> [$ricePaddyWater,	'Added water to rice paddy percolation',	'mm/day',  $soilRA],
+	'addedWater'	=> [$ricePaddyWater*$subDi,'Added water to rice paddy percolation',	'mm/day',  $soilRA],
 	'ricePaddyStrg'	=> [$ricePaddyStrg,	'Irrigation water in flooded rice paddies',	'mm',	   $soilRA],
 	'smResStrg'	=> [$smResStrg[1],	'Storage in small irrigation reservoirs',	'mm',	   $soilRA],
 	'sirIrrTaken'	=> [$sirIrrTaken,	'Water used from small irrigation reservoirs',	'mm/day',  $soilRA],
-	'sirEvap'	=> [$sirEvap*$M3_2_MM,	'Evaporation from small irrigation reservoirs',	'mm/day',  $fullRA],
+	'sirEvap'	=> [$sirEvap,		'Evaporation from small irrigation reservoirs',	'mm/day',  $M3_2_MM], # NB units
 	'irrPercDeliv'	=> [$irrPercDeliv,	'Percolation from irrigatoin conveyances',	'mm/day',  $soilRA],
 	'irrPercIneff'	=> [$irrPercIneff,	'Percolation from inefficient irrigation',	'mm/day',  $soilRA]) : (),
 			### Glacier data
 		$runIO{Glaciers} ? (
-	'glMelt'	=> [$glMelt,		'Glacier melt runoff in m3/sec',	'm3/sec'],
-	'glArea'	=> [$glArea,		'Glacier area fraction',		'fraction'],
-	'glVolume'	=> [$glVolume*$M3_2_MM,	'Glacier water storage',		'mm',	$fullRA]) : (),
+	'glMelt'	=> [$glMelt,		'Glacier melt runoff in m3/sec',		'm3/sec'],
+	'glArea'	=> [$glArea,		'Glacier area fraction',			'fraction'],
+	'glVolume'	=> [$glVolume,		'Glacier ice water storage',			'mm',	   $M3_2_MM]) : (),
 
 		###  Component Tracking variables  #####################
 			### Stream Age
@@ -3299,10 +3680,40 @@ EOS
 	'discharge_m3s_pr'=> [$cStreamP_m3s(,,(2)), 'Rainwater in discharge (p)',		'm3/sec'],
 	'discharge_m3s_pu'=> [$cStreamP_m3s(,,(3)), "$UnsStr dwater in discharge (p)",		'm3/sec'],
 
+	'resStorage_mm_ps'=> [$cStreamP_mm(,,(0)),'Snow melt in steam/reservoirs (p)',		'mm',	  $fullRA],
+	'resStorage_mm_pg'=> [$cStreamP_mm(,,(1)),'Glacial melt in steam/reservoirs (p)',	'mm',	  $fullRA],
+	'resStorage_mm_pr'=> [$cStreamP_mm(,,(2)),'Rainwater in steam/reservoirs (p)',		'mm',	  $fullRA],
+	'resStorage_mm_pu'=> [$cStreamP_mm(,,(3)),"$UnsStr water in steam/reservoirs (p)",	'mm',	  $fullRA],
+
+	'endoStrg_mm_ps'  => [$cEndoP_mm(,,(0)), 'Snow melt in endorheic lakes (p)',		'mm',	  $fullRA],
+	'endoStrg_mm_pg'  => [$cEndoP_mm(,,(1)), 'Glacial melt in endorheic lakes (p)',		'mm',	  $fullRA],
+	'endoStrg_mm_pr'  => [$cEndoP_mm(,,(2)), 'Rainwater in endorheic lakes (p)',		'mm',	  $fullRA],
+	'endoStrg_mm_pu'  => [$cEndoP_mm(,,(3)), "$UnsStr water in endorheic lakes (p)",	'mm',	  $fullRA],
+
+	'runoffStrg_mm_ps'=> [$cRffStgP_mm(,,(0)), 'Snow melt in runoff storage (p)',		'mm',	  $soilRA],
+	'runoffStrg_mm_pg'=> [$cRffStgP_mm(,,(1)), 'Glacial melt in runoff storage (p)',	'mm',	  $soilRA],
+	'runoffStrg_mm_pr'=> [$cRffStgP_mm(,,(2)), 'Rainwater in runoff storage (p)',		'mm',	  $soilRA],
+	'runoffStrg_mm_pu'=> [$cRffStgP_mm(,,(3)), "$UnsStr water in runoff storage (p)",	'mm',	  $soilRA],
+
+	'soilMoist_mm_ps' => [$cSoilP_mm(,,(0)), 'Snow melt in soil storage (p)',		'mm',	  $soilRA],
+	'soilMoist_mm_pg' => [$cSoilP_mm(,,(1)), 'Glacial melt in soil storage (p)',		'mm',	  $soilRA],
+	'soilMoist_mm_pr' => [$cSoilP_mm(,,(2)), 'Rainwater in soil storage (p)',		'mm',	  $soilRA],
+	'soilMoist_mm_pu' => [$cSoilP_mm(,,(3)), "$UnsStr water in soil storage (p)",		'mm',	  $soilRA],
+
 	'grndWater_mm_ps' => [$cGrWaterP_mm(,,(0)), 'Snow melt in ground water (p)',		'mm',	  $fullRA],
 	'grndWater_mm_pg' => [$cGrWaterP_mm(,,(1)), 'Glacial melt in ground water (p)',		'mm',	  $fullRA],
 	'grndWater_mm_pr' => [$cGrWaterP_mm(,,(2)), 'Rain/surface in ground water (p)',		'mm',	  $fullRA],
 	'grndWater_mm_pu' => [$cGrWaterP_mm(,,(3)), "$UnsStr water in ground water (p)",	'mm',	  $fullRA],
+
+	'endoEvap_mm_ps'  =>[$cEndoEvapP_mm(,,(0)), "Snow melt in endorheic lake evaporation",		   'mm',$fullRA],
+        'endoEvap_mm_pg'  =>[$cEndoEvapP_mm(,,(1)), "Glacial melt in endorheic lake evaporation",	   'mm',$fullRA],
+        'endoEvap_mm_pr'  =>[$cEndoEvapP_mm(,,(2)), "Rain/surface in endorheic lake evaporation",	   'mm',$fullRA],
+        'endoEvap_mm_pu'  =>[$cEndoEvapP_mm(,,(3)), "$UnsStr water in endorheic lake evaporation",	   'mm',$fullRA],
+
+	'openWaterEvap_mm_ps'=>[$cOpenWaterEvapP_mm(,,(0)), "Snow melt in open water evaporation",	   'mm',$fullRA],
+        'openWaterEvap_mm_pg'=>[$cOpenWaterEvapP_mm(,,(1)), "Glacial melt in open water evaporation",	   'mm',$fullRA],
+        'openWaterEvap_mm_pr'=>[$cOpenWaterEvapP_mm(,,(2)), "Rain/surface in open water evaporation",	   'mm',$fullRA],
+        'openWaterEvap_mm_pu'=>[$cOpenWaterEvapP_mm(,,(3)), "$UnsStr water in open water evaporation",	   'mm',$fullRA],
 
 			$runIO{Irrigation} ? (
 	'GrossIrr_ps'	  => [$cGrossIrrP(,,(0)),   'Snow melt fraction in gross irr (p)',	'fraction'],
@@ -3374,25 +3785,51 @@ EOS
 						    "Irrigation return frac in groundwater",		'fraction'],
    map(("grndWater_irr_$_"=>[$cGrWaterIrr(,,(2+$_)),"Irrigation return frac in groundwater, cycle $_",	'fraction']),1..$nIrr)),
 			####  Irrigation re-use and fates
-			$compBalFlag ? ( map ((
-	"openWaterEvap_irr_$_"		=> [$cStreamIrr_0(,,($_))*$netwkEvap*$M3_2_MM,
+			$compBalFlag ? ( $nIrr > 1 ? map ((
+	"openWaterEvap_irr_$_"		=> [$cStreamIrr_0(,,(2+$_))*$netwkEvap*$M3_2_MM,
 	   "Irrigation return water evaporated from river network, cycle $_",		'mm/day', $fullRA],
-	"irrFracInGross_irr_$_"		=> [$$irrFracInGross[$_],
+	"irrFracInGross_irr_$_"		=> [$$irrFracInGross[$_-1],
            "Reused irrigation water fraction in Gross irr water, cycle $_",	      'fraction', $soilRA],
-	"UseReuseOutGross_irr_$_"	=> [$$UseReuseOutGross_irr[$_],
+	"UseReuseOutGross_irr_$_"	=> [$$UseReuseOutGross_irr[$_-1],
            "Irrigation return water removed for DIL consumption, cycle $_",		'mm/day', $soilRA],
-	"IrrReuseInGross_irr_$_"	=> [$$IrrReuseInGross_irr[$_],
+	"IrrReuseInGross_irr_$_"	=> [$$IrrReuseInGross_irr[$_-1],
 	   "Gross irrigation reuse of irrigation return water, cycle $_",		'mm/day', $soilRA],
-	"IrrReuseInGrossFlow_irr_$_"	=> [$$IrrReuseInGrossFlow_irr[$_],
+	"IrrReuseInGrossFlow_irr_$_"	=> [$$IrrReuseInGrossFlow_irr[$_-1],
 	   "Gross irrigation reuse of irrigation return water from flow, cycle $_",	'mm/day', $soilRA],
-	"IrrReuseInGrossAqf_irr_$_"	=> [$$IrrReuseInGrossAqf_irr[$_],
+	"IrrReuseInGrossAqf_irr_$_"	=> [$$IrrReuseInGrossAqf_irr[$_-1],
 	   "Gross irrigation reuse of irrigation return water from aquifers, cycle $_",	'mm/day', $soilRA],
-	"IrrReuseInGrossGrwt_irr_$_"	=> [$$IrrReuseInGrossGrwt_irr[$_],
+	"IrrReuseInGrossGrwt_irr_$_"	=> [$$IrrReuseInGrossGrwt_irr[$_-1],
 	   "Gross irrigation reuse of irrigation return water from grndwater, cycle $_",'mm/day', $soilRA],
-	"IrrReuseOutNet_irr_$_"		=> [$$IrrReuseOutNet_irr[$_],
+	"IrrReuseOutNet_irr_$_"		=> [$$IrrReuseOutNet_irr[$_-1],
 	   "Net irrigation reuse of irrigation return water, cycle $_",			'mm/day', $soilRA],
-	"IrrReuseOutNonben_irr_$_"	=> [$$IrrReuseOutNonben_irr[$_],
-			"Non-beneficial loss of irrigation return water, cycle $_",	'mm/day', $soilRA]),1..$nIrr)):()):(),
+	"IrrReuseOutNonben_irr_$_"	=> [$$IrrReuseOutNonben_irr[$_-1],
+	   "Non-beneficial loss of irrigation return water, cycle $_",			'mm/day', $soilRA]),1..$nIrr):(),
+
+	### Cumulative values of the above output vars --> Start
+	"openWaterEvap_irr" => [$cStreamIrr_0(,,0:2)->glue(2,$cStreamIrr_0(,,3:2+$nIrr)->mv(2,0)->sumover)*$netwkEvap*$M3_2_MM,
+	   "Irrigation return water evaporated from river network",			'mm/day', $fullRA],
+	"irrFracInGross_irr"		=> [$$irrFracInGross[$nIrr],
+           "Reused irrigation water fraction in Gross irr water",		      'fraction', $soilRA],
+	"UseReuseOutGross_irr"		=> [$$UseReuseOutGross_irr[$nIrr],
+           "Irrigation return water removed for DIL consumption",			'mm/day', $soilRA],
+	"IrrReuseInGross_irr"		=> [$$IrrReuseInGross_irr[$nIrr],
+	   "Gross irrigation reuse of irrigation return water",				'mm/day', $soilRA],
+	"IrrReuseInGrossFlow_irr"	=> [$$IrrReuseInGrossFlow_irr[$nIrr],
+	   "Gross irrigation reuse of irrigation return water from flow",		'mm/day', $soilRA],
+	"IrrReuseInGrossAqf_irr"	=> [$$IrrReuseInGrossAqf_irr[$nIrr],
+	   "Gross irrigation reuse of irrigation return water from aquifers",		'mm/day', $soilRA],
+	"IrrReuseInGrossGrwt_irr"	=> [$$IrrReuseInGrossGrwt_irr[$nIrr],
+	   "Gross irrigation reuse of irrigation return water from grndwater",		'mm/day', $soilRA],
+	"IrrReuseOutNet_irr"		=> [$$IrrReuseOutNet_irr[$nIrr],
+	   "Net irrigation reuse of irrigation return water",				'mm/day', $soilRA],
+	"IrrReuseOutNonben_irr"		=> [$$IrrReuseOutNonben_irr[$nIrr],
+	   "Non-beneficial loss of irrigation return water",				'mm/day', $soilRA],
+	### <-- End
+
+	'UseReuseInGross_use'		=> [$UseReuseInGross_use,
+			'Reused human return water in human withdrawals',		'mm/day', $soilRA],
+	'IrrReuseInGross_use'		=> [$IrrReuseInGross_use,
+			'Reused human return water in Gross irrigation withdrawals',	'mm/day', $soilRA]):()):(),
 			### Water temperature
 		$compSwitch[4] ? (
 	'discharge_twt'	=> [$cStreamTw,		'Streamflow water temperature',	'C'],
@@ -3456,13 +3893,13 @@ EOS
       $data_out{"$crp\_irrDemand"}  = [$irr_demand{$crp}, "$crp Net Irrigation Demand",	'mm/day',$soilRA];
     }
 			### Soil moisture by crop
-    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (keys %{$land{$lnd}}) {
+    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (@{$tp{$lnd}}) {
       $data_out{"$tp\_$lnd\_soilMoistFrac"} =
 	[$sMoistFrac{$lnd}{$tp},	"Soil Moisture Fraction for $tp in $lnd land",	'fraction'];
     } }
 			### PET by crop
     if (m/_PET$/ ~~ @list_out) {
-    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (keys %{$land{$lnd}}) {
+    foreach my $lnd (qw(irrCrop rfdCrop fallow)) { foreach my $tp (@{$tp{$lnd}}) {
       $data_out{"$tp\_$lnd\_PET"} =
 	[$pet*$Kc_par{$lnd}{$tp}, "Potential Evapotranspiration for $tp in $lnd land",	'mm/day',$soilRA];
     } } }
@@ -3478,55 +3915,61 @@ EOS
     } } }
 			### ModFlow case: Mask out pixels outside aquifers with nodata
     if ($aqfType == 3) { foreach  my $var (grep m/^AQF_/, @list_out) {
-      $data_out{$var}[0] = $data_out{$var}[0]->setbadif(!$$AQF_DATA{mask_B});
-      $data_out{$var}[0] = $data_out{$var}[0]->setbadif( $$AQF_DATA{mask_S}) if $var =~ m/_(T|Z)$/;
+      $data_out{$var}[0] .= $data_out{$var}[0]->setbadif(!$$AQF_DATA{mask_B});
+      $data_out{$var}[0] .= $data_out{$var}[0]->setbadif( $$AQF_DATA{mask_S}) if $var =~ m/_(T|Z)$/;
+    } }
+			### Change cell reference area for all or some output variables
+    for (my $i=0; $i<=$#list_out; $i++) {	next unless defined $data_out{$list_out[$i]}[3];
+		# Scale output regardless of "outputScale" flag (NB- do not use overloaded *=)
+      if (ref($data_out{$list_out[$i]}[3]) eq 'PDL') {
+	$data_out{$list_out[$i]}[0]	= $data_out{$list_out[$i]}[0] * $data_out{$list_out[$i]}[3];
+	$data_out{$list_out[$i]}[3]	= $fullRA;
+      }
+      else {	# Scale output if "outputScale" is requested
+	my $refArea	= $data_out{$list_out[$i]}[3]->{reference_area};
+	next if !$outputScale || $refArea =~ m/^full/;
+				# Scale all output variables (NB- do not use overloaded *=)
+	$data_out{$list_out[$i]}[0]	= $data_out{$list_out[$i]}[0] * $sRatio if $refArea =~ m/^soil/;
+	$data_out{$list_out[$i]}[0]	= $data_out{$list_out[$i]}[0] * $aRatio if $refArea =~ m/^active/;
+	$data_out{$list_out[$i]}[3]	= $fullRA;
     } }
 			### Accumulate for monthly averages
     unless ($run_daily) {
-      foreach my $var (@list_out) { if ( $date =~ m/-01$/ ) {
+      foreach my $var (@list_out) { if ( $mnBegCond ) {
 	set_to_zero(	$dataSum  {$var},$zeroes);
 			$dataCount{$var}  = 0; }
-	$dataSum  {$var} += $data_out{$var}[0];
-	$dataCount{$var} += 1;
-    } }
+	if ($var =~ m/^GrossIrr_p/) {
+	  $dataSum  {$var} += condition($irrigationGross, $data_out{$var}[0], 0);
+	  $dataCount{$var} += condition($irrigationGross, 1,                  0);
+	} else {
+	  $dataSum  {$var} += $data_out{$var}[0];
+	  $dataCount{$var} += 1;
+    } } }
 			###############################################
 			### Finalize and save WBM output to a NetCDF file
     if ($run_file) {
-      my $jDate   = $run_daily ? $j_date : julian_day(@date[0,1],15);
+      my $jDate   = $run_daily ? $j_date : &$julian_day(@date[0,1],15);
       my $nc_Time = $jDate - $jDate_1900;
 	 $nc_Time = $nc_Time*24 + $hour	if $hr_flag;
-					### Make monthly averages
+			### Make monthly averages
       unless ($run_daily) { foreach my $var (@list_out) {
-	$dataSum {$var}   /= $dataCount{$var}	if $data_out{$var}[2] !~ m/\/month$/;
-	$data_out{$var}[0] = $dataSum  {$var};
+		if ($data_out{$var}[2] !~ m/\/month$/) {
+	$dataCount{$var}->inplace->lclip(1) if ref $dataCount{$var};
+	$dataSum  {$var}   /= $dataCount{$var};	}
+	$data_out {$var}[0] = $dataSum  {$var};
       } }
-
+			### Set file path and band
       ($path,$band) = @$run_file;
        $path =~ s/.+:(.+):.+/$1/;	# Strip NetCDF extras
 
 			### Add sort order for the variables in the output NetCDF files
       map $data_out{$list_out[$_]}[4] = $_, 0 .. $#list_out;
 
-			### Change cell reference area for all or some output variables
-      for (my $i=0; $i<=$#list_out; $i++) {	next unless defined $data_out{$list_out[$i]}[3];
-		# Scale output regardless of "outputScale" flag (NB- do not use overloaded *=)
-	if (ref($data_out{$list_out[$i]}[3]) eq 'PDL') {
-	  $data_out{$list_out[$i]}[0]	= $data_out{$list_out[$i]}[0] * $data_out{$list_out[$i]}[3];
-	  $data_out{$list_out[$i]}[3]	= $fullRA;
-	}
-	else {	# Scale output if "outputScale" is requested
-	  my $refArea	= $data_out{$list_out[$i]}[3]->{reference_area};
-	  next if !$outputScale || $refArea =~ m/^full/;
-				# Scale all output variables (NB- do not use overloaded *=)
-	  $data_out{$list_out[$i]}[0]	= $data_out{$list_out[$i]}[0] * $sRatio if $refArea =~ m/^soil/;
-	  $data_out{$list_out[$i]}[0]	= $data_out{$list_out[$i]}[0] * $aRatio if $refArea =~ m/^active/;
-	  $data_out{$list_out[$i]}[3]	= $fullRA;
-      } }
 			### Finalize the data list to write
       my %dataToWrite = map(($_=>$data_out{$_}),@list_out);
 			### Write data to file
       write_nc($path, $band, $nc_Time, $grid, \%dataToWrite,	{TS_RESOLUTION => $run_TS, NC4 => $runIO{NC4},
-		TYPE => \&float, CREDITS => $credits, CALENDAR => $runIO{calendar}, ATTRIB => $global_attrib});
+		TYPE => $ncVarType, CREDITS => $credits, CALENDAR => $runIO{calendar}, ATTRIB => $global_attrib});
       $path = 'File '.basename($path);
     }
 			###############################################
@@ -3535,23 +3978,24 @@ EOS
     foreach my $i (0..2) { foreach my $var (@{$runIO{agg_vars}}) {
       next unless $runIO{TA_depth}[$i];
 
-      var_accumulate($Agg_str[$i], $Agg_var{$var}, $data_out{$var}, $date);
+      var_accumulate($Agg_str[$i], $Agg_var{$var}, $data_out{$var}, $date, $var, $irrigationGross);
       if ($Agg_do[$i]) {
-	my ($path,$band,$dataToWrite,$aggrRange) = var_aggregate($Agg_str[$i], $var, $Agg_var{$var}, $data_out{$var}, $date);
-	my  $nc_Time = $j_date - $jDate_1900 - $Agg_off[$i];
+	my ($path,$band,$dataToWrite,$aggrRange)=var_aggregate($Agg_str[$i],$var,$Agg_var{$var},$data_out{$var},$date,$doOutput);
+	   ($path,$band)= ($runIO{Output_dir}.'/spinup_out/'.($i==1?'monthly':'yearly')."/$var/wbm.nc", 0)  if $i && !$doOutput ;
+	my  $nc_Time	= $j_date - $jDate_1900 - $Agg_off[$i];
 	write_nc($path, $band, $nc_Time, $grid, $dataToWrite,
-		{TS_RESOLUTION => $Agg_Str[$i], NC4 => $runIO{NC4}, TYPE => \&float, CALENDAR => $runIO{calendar},
-		 CREDITS => $credits, ATTRIB => [@$RT_global_attrib,@$aggrRange,['AggrMethod','average']]});
+		{TS_RESOLUTION => $Agg_Str[$i], NC4 => $runIO{NC4}, TYPE => $ncVarType, CALENDAR => $runIO{calendar},
+		 CREDITS => $credits, ATTRIB => [@$RT_global_attrib,@$aggrRange,['AggrMethod','average']]})
+		if $doOutput || ($i==1 && $runIO{Spinup}{Save_Vars}==1) || ($i==2 && $runIO{Spinup}{Save_Vars});
 	var_reset($Agg_str[$i], $Agg_var{$var});
     } }}
 		### Save irrigation equipped area
     if ( $yrEndCond && ref($irrEqpArea) ) {
       my $path    = "$runIO{Output_dir}/yearly/irrEquipArea/irrEquipArea.nc";
-      my $band    = $date[0] - substr($runIO{Run_Start},0,4) + 1;
-      my $nc_Time = julian_day($date[0],7,1) - $jDate_1900;
-      write_nc($path, $band, $nc_Time, $grid,
+      my $nc_Time = &$julian_day($date[0],7,1) - $jDate_1900;
+      write_nc($path, 0, $nc_Time, $grid,	### Appending new bands
 		{'irrEquipArea'	=> [$irrEqpArea*$sRatio, 'Irrigation equipped area', 'fraction']},
-		{TS_RESOLUTION => 'yearly', NC4 => $runIO{NC4}, TYPE => \&float, CALENDAR => $runIO{calendar},
+		{TS_RESOLUTION => 'yearly', NC4 => $runIO{NC4}, TYPE => $ncVarType, CALENDAR => $runIO{calendar},
 		 CREDITS => $credits, ATTRIB => $global_attrib});
     }
   }
@@ -3559,7 +4003,7 @@ EOS
 	###   Diversion and Lumped/Virtual aquifer summaries
   if ($yrCycle > $runIO{Spinup}{Loops} && !$noOutput) {
     diversion_yr_total(	\@diversion, $routeDiversion, \@date, \%runIO, $route, $dt);
-    aquifer_summary(	 $aqfType,   $aqf_data,        $date, \%runIO,\%cAqWaterP, \%cAqWaterIrr);
+    aquifer_summary(	 $aqfType,   $aqf_data,        $date, \%runIO,$cAqWaterP, $cAqWaterIrr, $aIdx);
     compBalance_save(	\%compBal,  \@compSwitch,      $date, \%runIO, $nIrr) if $compBalFlag && !$skipCompBal;
   }
   $skipCompBal	= 0;
@@ -3580,7 +4024,8 @@ EOS
 	$glMeltT, $irrExtraT, $etIrrCropsT, $sp_str;
 		### Balance header string
   if ($n_count_print++ == 0) {
-    print "Order of Irrigated Crops in the output below:\n\t",join('  ', @$irrCropList),"\n\n" if $runIO{Irrigation};
+    print "Order of Irrigated Crops in the output below:\n\t",join('  ', @$irrCropList),"\n\n"
+		if $runIO{Irrigation} && @$irrCropList;
     print ' 'x CORE::index($str,'Balance'),"Balance=(Pixl,Flow,Totl, RffTot, FlowStg,  DStrg, GlMlt, IrEx,IrET) $units\n";
   }		### Irrigation balances string
   $str .= sprintf "   Irrigation(Gross/Net Paddy : Crops)=(%.2f/%.2f $irrFormat_str); Avg Supply = %s %%\n",
@@ -3588,6 +4033,8 @@ EOS
 		### USGS Delta string
   $str .= sprintf "\tusgsDelta     = %.4f\n", $usgsDeltaT if $usgs_data;
   print $str;				# Print daily/monthly water balance
+  die "\nUnknown calculation error occured resulting in illegal values of NaN or Inf in output. Aborting...\n\n"
+	if $str =~ m/NaN|Inf/;
 
 		### Print end-of-the-year balances
   if ($yrEndCond) {
@@ -3603,10 +4050,11 @@ EOS
 		 $irrGrossT_y,$irrNetT_y,@irrXW_y,$irrPaddyT_y,@irrNetT_y,
 		 $irrIneffRnff_y, $irrIneffPerc_y, $irrIneffEvap_y, $irrNetT_y/$irrGrossT_y*100,
 		 $irrPercDeliv_y, $irrEvapDeliv_y,
-		($cropAreaFrac*$cell_area)->sum * 1e-4, ($irrEqpArea*$cell_area)->sum * 1e-4;
+		($cropAreaFrac*$soil_area)->sum * 1e-4, ($irrEqpArea*$soil_area)->sum * 1e-4;
 				### Reset annual totals to zero
 	map $_=0, $irrNetT_y,$irrGrossT_y,$irrNetT_y,@irrXW_y,$irrIneffRnff_y,$irrIneffPerc_y,$irrIneffEvap_y,
-		  $irrPercDeliv_y,$irrEvapDeliv_y,$irrPaddyT_y,@irrNetT_y,$irrDemVsT_y,@irrDemVsT_y,$irrEqpArea;
+		  $irrPercDeliv_y,$irrEvapDeliv_y,$irrPaddyT_y,@irrNetT_y,$irrDemVsT_y,@irrDemVsT_y;
+	$irrEqpArea *= 0;
     }
 		### End of year Non-irrigation water use balances
     if ($runIO{WaterDemand}) {
@@ -3618,17 +4066,40 @@ EOS
 		$stkGrossT_y, $stkNetT_y, @stkXW_y	if $runIO{WaterDemand};
     }
 		### End of year runoff/precipitation balance
-    my $wbm_dischT_y	= $dischT_y - $usgsDeltaT_y if $usgs_data;
-    printf	"   Rff-Gl/Precip  Yr = (%.2f / %.2f), %.2f %% \n", $RunoffT_y,$precipT_y,$RunoffT_y/$precipT_y*100;
-    printf	"   Runoff-Dischg  Yr = (%.2f - %.2f), %.2f km3\n", $runoffT_y,$dischT_y, $runoffT_y-$dischT_y;
-    printf	"   USGS-WBM Dsch  Yr = (%.2f - %.2f), %.2f km3\n", $dischT_y,$wbm_dischT_y,$usgsDeltaT_y if $usgs_data;
-    printf	"   ET Non/Irr/Rfd Yr = (%.2f / %.2f / %.2f) km3\n",$etNonCropsT_y, $etIrrCropsT_y, $etRfdCropsT_y;
-    printf	"   Surface W Storage =  %.2f km3\n",   ($resStorageT + $smResStrgT) * $scrPrintScale;
-    printf	"   Grndwater Storage =  %.2f km3\n\n", ($grdWater[1] * $mm_2_km3)->sum;
+    my $wbm_dischT_y	 = $dischT_y - $usgsDeltaT_y if $usgs_data;
+    my $dam_storage	 =($resStorage[1] * $damMask)->sum*1e-9	if $runIO{Reservoirs};
+    my @dam_storage	 =($dam_storage, $dam_storage/$damCapacity*100)	if $runIO{Reservoirs};
+       $RunoffT_y	+= aqf_RunoffT();			# Add aquifer contributions to rivers
+       $runoffT_y	+= aqf_RunoffT();
+    printf	"   RffPls-Gl/Precip Yr = (%.2f / %.2f), %.2f %% \n", $RunoffT_y,$precipT_y,$RunoffT_y/$precipT_y*100;
+    printf	"   RunoffPls-Dischg Yr = (%.2f - %.2f), %.2f km3\n", $runoffT_y,$dischT_y, $runoffT_y-$dischT_y;
+    printf	"   USGS-WBM Dsch    Yr = (%.2f - %.2f), %.2f km3\n", $dischT_y,$wbm_dischT_y,$usgsDeltaT_y if $usgs_data;
+    printf	"   ET Non/Irr/Rfd   Yr = (%.2f / %.2f / %.2f) km3\n",$etNonCropsT_y, $etIrrCropsT_y, $etRfdCropsT_y;
+    printf	"   Reservoir Storage   =  %.2f km3 (%.1f %% of Capacity)\n", @dam_storage if $runIO{Reservoirs};
+    printf	"   Surface W Storage   =  %.2f km3\n",   ($resStorageT + $smResStrgT);
+    printf	"   Grndwater Storage   =  %.2f km3\n\n", ($grdWater[1] * $mm_2_km3)->sum;
 
 		### End of year aquifer balances
-      if ( $aqfType ) {}		# Removed from public domain
-
+    if ( $aqfType ) {
+      my $print_str	= "   Aquifer %s Storage =  %.2f km3 (%.1f %% of Capacity) sinkIn= %.1f IrrIn= %.1f InfIn= %.1f drnIn= %.1f bflIn= %.1f absOut= %.1f sprOut= %.1f drnOut= %.1f bflOut= %.1f km3\n";
+      my $N		= scalar(@aqf_IDs);	# Number of aquifers
+      my $print_all	= $N > 10 ? 1 : 0;
+      my @all_yr	= ((0) x (scalar(@{$$AQF_DATA{sumKeys}})+2))	if $print_all;
+      foreach my $aqf_ID (@aqf_IDs) {
+	my $storage	= $$aqf_data{$aqf_ID}{Storage} * 1e-9;
+	my $storagePct	= $storage / $$aqf_data{$aqf_ID}{Capacity} * 100;
+	my @stats	=($storage, $storagePct, map($$aqf_data{$aqf_ID}{$_.'_y'}*1e-9, @{$$AQF_DATA{sumKeys}}));
+	if($print_all) { map $all_yr[$_] += $stats[$_], 0 .. $#stats;	}
+	else {		 printf $print_str, $aqf_ID, @stats;		}
+	map $$aqf_data{$aqf_ID}{$_.'_y'} = 0,  @{$$AQF_DATA{sumKeys}}; # Reset annual totals to zero
+      }
+      if ($print_all) {	$all_yr[1] = $all_yr[0] / $aquiferCap * 100;
+			printf $print_str, "(All of $N)", @all_yr;	}
+      if ($aqfType == 3) {
+	printf "   ModFlow EFDM max(FSC) = %f\n",$$AQF_DATA{FSC};	$$AQF_DATA{FSC} = 0;
+      } printf "   Springs Discharge =  %.2f km3 (%.1f %% of Capacity)\n",$spr_dschT_y,$spr_dschT_y/$spr_dschCap*100
+		if $spr_dschCap;	print "\n";
+    }
     printf "  Y=%04d %s\n", $date[0], "Spool files added = $n_spool";
 
 		### Reset annual totals to zero:
@@ -3644,9 +4115,9 @@ EOS
 	###   Clear previous day
   $flow_outPrev	.= $flow_out;
   map shift(@{$_}), \@grdWater,\@resStorage,\@sMoist,\@surfRffStorage,\@irrRffStorage,\@smResStrg,\@irrVIS;
-  foreach my $lnd (keys %land) { foreach my $tp (keys %{$land{$lnd}}) {
-    $sMoistPrev{$lnd}{$tp} = $sMoist  {$lnd}{$tp}->copy;
-    $sMoistPrVs{$lnd}{$tp} = $sMoistVs{$lnd}{$tp}->copy		if exists $sMoistVs{$lnd}{$tp};
+  foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
+    $sMoistPrev{$lnd}{$tp} .= $sMoist  {$lnd}{$tp}->copy;
+    $sMoistPrVs{$lnd}{$tp} .= $sMoistVs{$lnd}{$tp}->copy		if exists $sMoistVs{$lnd}{$tp};
   }}
   shift @cStream	if $compSwitch[1];   shift @cStreamP	if $compSwitch[2];
   shift @cStreamIrr	if $compSwitch[3];   shift @cStreamMsk	if $compSwitch[5];
@@ -3677,7 +4148,8 @@ EOS
     if     ($n_count  < $n_spinup) {
       ($pfx, $sfx, $j_date)	= ('Spinup', '', -$n_count); }
     elsif  ($n_count == $n_spinup) {
-      ($pfx, $sfx, $j_date)	= ('Spinup', '.spinup', julian_day(split(m/-/,$$date_list[$n_spinup]))-1);
+      (my $DATE	= $$date_list[$n_spinup]) =~ s/T\d.+//;		# Remove hour string
+      ($pfx, $sfx, $j_date)	= ('Spinup', '.spinup', &$julian_day(split(m/-/,$DATE))-1);
 		### Reset spinup tracking, if requested
       reset_spinup_tracking(2,3) if $wbmParam{resetSpinupTracking};
     }
@@ -3703,7 +4175,7 @@ EOS
     writeflex("$run_state_file$sfx.snowBand.dat",@$snowBand)		if $runIO{snowBands};
 
 		### Landcover/Crop parameters (soil moisture)
-    foreach my $lnd (keys %land) { foreach my $tp (keys %{$land{$lnd}}) {
+    foreach my $lnd (@lnd) { foreach my $tp (@{$tp{$lnd}}) {
 			### Encode crop mask into sMoist value by adding a large number
       if ($lnd =~ m/Crop|fallow/) {
 	my $encode = condition($cropMask{$lnd}{$tp},  -$sMoist{$lnd}{$tp}-1, $sMoist{$lnd}{$tp});
@@ -3713,8 +4185,25 @@ EOS
       writeflex("$run_state_file$sfx.Gr.$lnd.$tp.dat", $sMoistGr{$lnd}{$tp}) if $BwGwFlag;	### BW/GW addition
     }}
 		### Aquifer data
-    if ( $aqfType ) {} 		# Removed from public domain
+    if ( $aqfType ) {
+      my %AQFDATA;	foreach my $aqf_ID (@aqf_IDs) { foreach my $key (keys %{$$aqf_data{$aqf_ID}}) {
+	 $AQFDATA{$aqf_ID}{$key}  =  (unpdl_scalars($$aqf_data{$aqf_ID}{$key}))[0]; }}
+      my $dump_file	= $run_state_file."$sfx.aqf_data.json";
+      open (FILE,">$dump_file") or die "Couldn't open $dump_file, $!";
+	my $dumper = Data::Dumper->new([\%AQFDATA], [qw(AQFDATA)]);
+	  $dumper->Purity(1)->Deepcopy(1);
+	my $str = $dumper->Dump;	$str =~ s/\n\s+/\n/g;
+	   $str =~ s/'InfiltFrac'.+\n//g;	# Remove 'InfiltFrac' and 'idx' keys in the dumper
+	   $str =~ s/'idx'.+\n//g;		# which are PDL data
+	print FILE $str;
+      close FILE;
+		### Tracking components data
+      writeflex("$run_state_file$sfx.cAqWaterP.dat",   $cAqWaterP)	if $cAqWaterP->dims;
+      writeflex("$run_state_file$sfx.cAqWaterIrr.dat", $cAqWaterIrr)	if $cAqWaterIrr->dims;
 
+		### ModFlow aquifers
+      writeflex("$run_state_file$sfx.ModFlow.dat", $$AQF_DATA{Strg_B}, $$AQF_DATA{Strg_T})	if $aqfType == 3;
+    }
 		### End of year balances
     my $dump_file	= $run_state_file."$sfx.yr_data.json";
     open (FILE,">$dump_file") or die "Couldn't open $dump_file, $!";
@@ -3732,13 +4221,14 @@ EOS
     close FILE;
 
 		### USGS assimilation data
-    if ($usgs_data) {} 		# Removed from public domain
-
-		### Component tracking data
-    if ($compBalFlag) {
-      $dump_file	= $run_state_file."$sfx.compBal.json";
+    if ($usgs_data) {
+      $dump_file	= $run_state_file."$sfx.usgs_data.json";
+      my %USGS_DATA;	# Strip out {data} key and data (very large chunk, but not needed for resuming) from
+      foreach my $site (keys %$usgs_data) { foreach my $key (keys %{$$usgs_data{$site}}) {
+	$USGS_DATA{$site}{$key} = $$usgs_data{$site}{$key} unless $key eq 'data';
+      } }
       open (FILE,">$dump_file") or die "Couldn't open $dump_file, $!";
-	$dumper = Data::Dumper->new([\%compBal], ['COMPBAL']);
+	$dumper = Data::Dumper->new([\%USGS_DATA], ['USGS_DATA']);
 	  $dumper->Purity(1)->Deepcopy(1);
 	$str = $dumper->Dump;	$str =~ s/\n\s+/\n/g;
 	print FILE $str;
@@ -3821,6 +4311,17 @@ sub get_paths
 
 #######################################################################
 
+sub time_vars
+{
+  my $subDi	= shift();
+  my $subDh	= 24/$subDi;						# Sub-daily interval, hours
+  my $subDf	=  1/$subDi;						# Sub-daily interval, day
+  my $dt	= 3600*$subDh;						# Time step, sec.
+  return $subDh, $subDf, $dt;
+}
+
+#######################################################################
+
 sub dayLength
 {
   my ($lon, $lat, $jday, $hrS, $hrLen) = @_;
@@ -3843,12 +4344,12 @@ sub dayLength
   my @hrCond	=(dayLightCondition($lon,$dayLen,$hrS), dayLightCondition($lon,$dayLen,$hrE));
 
 		### Daylight length within sub-daily time step (fraction of time step)
- return condition( $hrCond[0] < $hrCond[1],	$hrE - $dltBeg,		# Sunrise	within the interval
-	condition( $hrCond[0] > $hrCond[1],	$dltEnd - $hrS,		# Sunset	within the interval
+ return condition( $hrCond[0] < $hrCond[1],	($hrE - $dltBeg) % 24,		# Sunrise	within the interval
+	condition( $hrCond[0] > $hrCond[1],	($dltEnd - $hrS) % 24,		# Sunset	within the interval
 	condition(($hrS < $dltBeg) & ($dltBeg < $hrE),
-	condition( $hrCond[0],			$hrLen - 24 + $dayLen,	# Whole night	within the interval
-						$dayLen),		# Whole day	within the interval
-						$hrCond[0])))/$hrLen;	# No change	within the interval
+	condition( $hrCond[0],			$hrLen - 24 + $dayLen,		# Whole night	within the interval
+						$dayLen),			# Whole day	within the interval
+						$hrCond[0]*$hrLen)))/$hrLen;	# No change	within the interval
 }
 
 sub dayLightCondition {			# Daylight condition check at given hour ($hr)
@@ -4033,7 +4534,9 @@ sub PET_FAO_56		### FAO-56 PET method
 sub get_relHumidity		### http://www.eol.ucar.edu/projects/ceop/dm/documents/refdata_report/eqns.html
 {					# Relative humidity cannot and not allowed to be < 10 %
   my ($argument, $airT, $elev)	= @_;
-  my  $humidity_in		= read_dateLayer(@$argument);	# Read the input
+  my  $humidity_in		= ref($$argument[1]) ?	# Read the input
+			read_dateLayers(@$argument)  :
+			read_dateLayer (@$argument);
 
 	### Case of Relative Humidity, in % units
   if    ($$argument[0]->{MT_attrib}{Units} eq '%') {
@@ -4084,7 +4587,7 @@ sub scale_MinMax
   closedir DIR_HANDLE;
   return map("$spool_dir/$_", @files) if scalar(@files) == 365;
 
-  my @jDay	= map sprintf("%04d-%02d-%02d",inverse_julian_day(2451911+$_)), 0..364;
+  my @jDay	= map sprintf("%04d-%02d-%02d",inverse_julian_day(2451911+$_)), 0..364;	# not for 360-calendar
   my @data	= map read_dateLayer($dataset, $_, $extent, $$runIO{spool}, {PATCH_VALUE=>0}), @jDay;
 
   my %dSize	= ('float' => 4, 'double' => 8);
@@ -4162,7 +4665,11 @@ sub endoLakeGeometry
 {
   my ($volume, $slope)	= @_;
 
-  return 0;			# Removed from public domain
+	### Circular cone geometry: V = pi/3 * H *R**2;	 H = Slope * R
+  my $radius	= (3/pi * $volume / $slope)**(1/3);
+  my $area	= pi * $radius**2;
+
+  return $area;
 }
 
 #######################################################################
@@ -4225,11 +4732,11 @@ sub snowBands_init
 
 sub snow_balance
 {
-  my ($snowPack,$airT,$precip,$snowFallThreshold,$snowMeltThreshold, $subDf) = @_;
+  my ($snowPack,$airT,$precip,$snowFallThreshold,$snowMeltThreshold) = @_;
 
-  my $snowFall  = ($airT < $snowFallThreshold) * $precip;
-  my $snowMelt  =(($airT > $snowMeltThreshold) *
-	(2.63 + 2.55*$airT + 0.0912*$airT*$precip))->hclip($snowPack);
+  my $snowFall  = ($airT <= $snowFallThreshold) * $precip;
+  my $snowMelt  =(($airT >  $snowMeltThreshold) *
+	(2.63 + 2.55*$airT + 0.0912*$airT*$precip))->hclip($snowPack * $subDi);
   my $sPackChg  = $snowFall - $snowMelt;
      $snowPack += $sPackChg * $subDf;		### Snow pack is updated here
 
@@ -4375,7 +4882,7 @@ sub runoffMask_init
   my ($runSet, $runAttr, $list_out, $noOutput) = @_;
   my ($runIO,  $meta, $extent)	= @$runSet;
 
-  return unless $$runIO{Runoff_mask};
+  return (pdl(),[],0) unless $$runIO{Runoff_mask};
   print "Initialization of datasets for Runoff Masks:\n";
 
   my @varOut = qw(dischMsk runoffMsk grndWtMsk);
@@ -4500,7 +5007,10 @@ sub land_init
 	### Initialization of Land Cover (including crops) parameters
 {
   my ($runIO, $meta, $extent) = @_;
-  my  $MagicT = [$$runIO{Input_MT}, $$runIO{Output_MT}]; # [Global,Local] Magic Table files
+  my  $MagicT	= [$$runIO{Input_MT}, $$runIO{Output_MT}]; # [Global,Local] Magic Table files
+  my  $yr_start	= substr(
+	$$runIO{Spinup}{Start} && $$runIO{Spinup}{Start} lt $$runIO{Run_Start} && !$$runIO{Spinup}{State_ID} ?
+	$$runIO{Spinup}{Start} :  $$runIO{Run_Start}, 0,4);
 
   print "\nInitialization of Land Cover (including crops) parameters-\n";
 
@@ -4572,7 +5082,7 @@ sub land_init
 			### Parameters required for collapsing/averaging of land cover types!!!
       my @required = qw/KcMin KcMax awDelta awCap RootDepth MaxLAI/;	# NB!!!
 								  ### Croplands stay!!!
-      foreach my $tp (keys %{$land{landCover}}) {		next if $tp  =~ /crop/i;
+      foreach my $tp (sort keys %{$land{landCover}}) {	next if $tp  =~ /crop/i;
     map $land{landCover}{land}{$_}    += $land{landCover}{$tp}{$ldFr} * $land{landCover}{$tp}{$_}, @required;
 	$land{landCover}{land}{$ldFr} += $land{landCover}{$tp}{$ldFr};
 	delete $land{landCover}{$tp};		### Delete collapsed land cover types
@@ -4608,28 +5118,28 @@ sub land_init
 
 		### Crop land fraction within general cropland
       $crop{$group}{$crp}{$ldFr}	=
-	new RIMS::DataSet(attrib($crop{$group}{$crp}{$ldFrKey},		$MagicT));
+	new RIMS::DataSet(attrib($crop{$group}{$crp}{$ldFrKey},		$MagicT),{START_YEAR_CLIP=>$yr_start,SP_DELTA=>1});
 			### Patch
       $crop{patch}{$group}{$crp}{$ldFr}	=
-	new RIMS::DataSet(attrib($cPch{$group}{$crp}{$ldFrKey},		$MagicT))	if %cPch;
+	new RIMS::DataSet(attrib($cPch{$group}{$crp}{$ldFrKey},		$MagicT),{START_YEAR_CLIP=>$yr_start})	if %cPch;
       push @{$$runIO{spool_list}}, [$crop{$group}{$crp}{$ldFr},
 	{PATCH_VALUE=>$crop{patch}{$group}{$crp}{$ldFr}, RESAMPLE=>0,PPATCH_VALUE=>0}];
 
 		### Crop soil moisture capacity
       $crop{$group}{$crp}{awCap}	= ($collapse_method ne 'average') ?
 	($awDelta*$crop{$group}{$crp}{RootDepth})->lclip(0) :
-	new RIMS::DataSet(attrib($crop{$group}{$crp}{RootDepth},	$MagicT));
+	new RIMS::DataSet(attrib($crop{$group}{$crp}{RootDepth},	$MagicT),{START_YEAR_CLIP=>$yr_start,SP_DELTA=>1});
 			### Patch
       $crop{patch}{$group}{$crp}{awCap}	=
-	new RIMS::DataSet(attrib($cPch{$group}{$crp}{RootDepth},	$MagicT))	if %cPch && $collapse_method eq 'average';
+	new RIMS::DataSet(attrib($cPch{$group}{$crp}{RootDepth},	$MagicT)) if %cPch && $collapse_method eq 'average';
       push @{$$runIO{spool_list}}, [$crop{$group}{$crp}{awCap},
 	{PATCH_VALUE=>$crop{patch}{$group}{$crp}{awCap}, RESAMPLE=>0,PPATCH_VALUE=>0}] if ref($crop{$group}{$crp}{awCap}) ne 'PDL';
 		### Crop Coefficients (Kc)
       $crop{$group}{$crp}{Kc}		=
-	new RIMS::DataSet(attrib($crop{$group}{$crp}{Kc_TS},		$MagicT));
+	new RIMS::DataSet(attrib($crop{$group}{$crp}{Kc_TS},		$MagicT),{START_YEAR_CLIP=>$yr_start,SP_DELTA=>1});
 			### Patch
       $crop{patch}{$group}{$crp}{Kc}	=
-	new RIMS::DataSet(attrib($cPch{$group}{$crp}{Kc_TS},		$MagicT))	if %cPch;
+	new RIMS::DataSet(attrib($cPch{$group}{$crp}{Kc_TS},		$MagicT),{START_YEAR_CLIP=>$yr_start})	if %cPch;
       push @{$$runIO{spool_list}}, [$crop{$group}{$crp}{Kc},
 	{PATCH_VALUE=>$crop{patch}{$group}{$crp}{Kc}, RESAMPLE=>0,PPATCH_VALUE=>0}];
 
@@ -4637,7 +5147,7 @@ sub land_init
 		### Crop Depletion Factor
 	$crop{$group}{$crp}{crpDF}	= isNumber($crop{$group}{$crp}{$CDF}) ?
 	  $crop{$group}{$crp}{$CDF} * ones(double,$$extent{ncols},$$extent{nrows}) :
-	  new RIMS::DataSet(attrib($crop{$group}{$crp}{$CDF},		$MagicT));
+	  new RIMS::DataSet(attrib($crop{$group}{$crp}{$CDF},		$MagicT),{START_YEAR_CLIP=>$yr_start,SP_DELTA=>1});
 			### Patch
 	$crop{patch}{$group}{$crp}{crpDF} =
 	  new RIMS::DataSet(attrib($cPch{$group}{$crp}{$CDF},		$MagicT))	if %cPch &&
@@ -4653,18 +5163,20 @@ sub land_init
     my $patch_val = undef;
     if ($irrParam{CropAreaFracPatch}) {						### Get patch value or dataset
       my $patch	= init_DSet($extent,$meta,$irrParam{CropAreaFracPatch},	$MagicT,
-	{RESAMPLE=>0, DATASET_OPT=>{START_YEAR_CLIP=>1800}});				# Use "near" resample
+	{RESAMPLE=>0} );							# Use "near" resample
       if (ref($patch) =~ m/DataSet/) { $crop{patch}{CropAreaFrac} = $patch; }
       else			     { $patch_val		  = $patch; }
     }
     $crop{allCropFr} = init_DSet($extent,$meta,$irrParam{CropAreaFrac},	$MagicT,
-	{RESAMPLE=>0, DATASET_OPT=>{START_YEAR_CLIP=>1800}, PATCH_VALUE=>$patch_val});	# Use "near" resample
+	{RESAMPLE=>0}, PATCH_VALUE=>$patch_val );				# Use "near" resample
 
 		### Fallow land fraction within general cropland
     $crop{fallow}{land}{awCap}	= ($awDelta*$rootingDepth)->lclip(0);
-    $crop{fallow}{land}{$ldFr}	= new RIMS::DataSet(attrib($crop{Fallow}{Fallow}{$ldFrKey}, $MagicT));
+    $crop{fallow}{land}{$ldFr}	= new RIMS::DataSet(attrib($crop{Fallow}{Fallow}{$ldFrKey},
+									$MagicT),{START_YEAR_CLIP=>$yr_start,SP_DELTA=>1});
 			### Patch
-    $crop{patch}{fallow}{land}{$ldFr} = new RIMS::DataSet(attrib($cPch{Fallow}{Fallow}{$ldFrKey}, $MagicT)) if %cPch;
+    $crop{patch}{fallow}{land}{$ldFr} = new RIMS::DataSet(attrib($cPch{Fallow}{Fallow}{$ldFrKey},
+									$MagicT),{START_YEAR_CLIP=>$yr_start}) if %cPch;
     push @{$$runIO{spool_list}}, [$crop{fallow}{land}{$ldFr},
 	{PATCH_VALUE=>$crop{patch}{fallow}{land}{$ldFr}, RESAMPLE=>0,PPATCH_VALUE=>0}];
 
@@ -4791,7 +5303,7 @@ sub irrLosses
 	###	Process based water application losses (method of Jagermeyr et al., 2015)
   if ($$irrTech{Application}{Process}) {
     my $storage	= condition_slice($irrArea> 0 , $rffStorage/$irrArea, 0);
-    foreach my $tp (sort keys %{$$land{irrCrop}}) {		### IS SORT NEEDED?
+    foreach my $tp (@$land) {
       my $rice	= $tp =~ m/^rice/i ? $percRate : 0;	# This is done for avoiding rice water percolation
 							# to be done twice, i.e. rice added water
       $appRnff += $$landFrac{irrCrop}{$tp} * condition($$irr_demand{$tp} > 0,
@@ -4821,6 +5333,7 @@ sub irrFactorPct {
 sub read_land_param
 {
   my ($file,$field) = @_;
+
   my ($hdr, @data ) = read_table($file);
   my ($id,  $group) = (delete($$hdr{$$field[0]}), delete($$hdr{$$field[1]}), delete($$hdr{Comment}));
   my  %land;
@@ -4916,25 +5429,52 @@ sub aqf_balance {
   return $zn, \%discharge, $head, $err;
 }
 
+sub aqf_RunoffT
+{
+  return 0 unless $aqfType;
+  
+  my $sum  = 0;
+  foreach my $aqf_ID (@aqf_IDs) {
+     $sum += List::Util::sum(map($$aqf_data{$aqf_ID}{$_.'_y'}*1e-9, qw(sprOut bflOut))) -
+	     List::Util::sum(map($$aqf_data{$aqf_ID}{$_.'_y'}*1e-9, qw(sinkIn bflIn) ));
+  }  return  $sum;
+}
+
+sub aqf_Idx
+{
+  my  $ID	= shift();
+  my  $aIdx	= zeroes(long, @$ID[-1]+1);
+  map $aIdx($$ID[$_]).=$_, 0..$#$ID;
+  return $aIdx;
+}
+
 #######################################################################
 ###############     Runtime aggregation functions        ##############
 
 sub var_accumulate
 {
-  my ($ts, $data, $data_out, $date) = @_;
+  my ($ts, $data, $data_out, $date, $var, $irr) = @_;
 
-    $$data{start}{$ts}	= $date unless $$data{count}{$ts};
-    $$data{data} {$ts} += $$data_out[0];
-    $$data{data2}{$ts} += $$data_out[0]**2;
-    $$data{count}{$ts}++;
+    if ($var =~ m/^GrossIrr_p/) {
+      $$data{start}{$ts}  = $date unless ref($$data{count}{$ts});
+      $$data{data} {$ts} += condition($irr, $$data_out[0],	0);
+      $$data{data2}{$ts} += condition($irr, $$data_out[0]**2,	0);
+      $$data{count}{$ts} += condition($irr, 1,			0);
+    } else {
+      $$data{start}{$ts}  = $date unless $$data{count}{$ts};
+      $$data{data} {$ts} += $$data_out[0];
+      $$data{data2}{$ts} += $$data_out[0]**2;
+      $$data{count}{$ts}++;
+    }
 }
 
 sub var_aggregate
 {
-  my ($ts, $var, $data, $data_out, $date) = @_;
+  my ($ts, $var, $data, $data_out, $date, $doOutput) = @_;
   my  $varS	 = $var.'_sigma';
 		### Aggreate
-  $$data{data2}{$ts} .= 1/$$data{count}{$ts}*sqrt(($$data{count}{$ts}*$$data{data2}{$ts}-$$data{data}{$ts}**2)->lclip(0));
+  $$data{count}{$ts} -> inplace->lclip(1) if ref $$data{count}{$ts};
+  $$data{data2}{$ts} .= 1/$$data{count}{$ts} * sqrt(($$data{count}{$ts}*$$data{data2}{$ts}-$$data{data}{$ts}**2)->lclip(0));
   $$data{data} {$ts} /=   $$data{count}{$ts};
 		### Make NC data structure
   my $dataToWrite =  {$var	=> [$$data{data} {$ts}, @$data_out[1..3]],
@@ -4942,7 +5482,7 @@ sub var_aggregate
      $$dataToWrite  {$varS}[1]	=  'Sigma of ' .  $$dataToWrite{$varS}[1];
 		### Time series range of aggregated data, path and band
   my $aggrRange   = [['AggrRangeStart',$$data{start}{$ts}],['AggrRangeEnd',$date]];
-  my $path_band   =   $$data{dSet}{$ts}->dateLayer($date,3);
+  my $path_band   = $doOutput ? $$data{dSet}{$ts}->dateLayer($date,3) : ['', 0];
     $$path_band[0]=~ s/.+:(.+):.+/$1/;				# Strip NetCDF extras
 
   return @$path_band, $dataToWrite, $aggrRange;
@@ -4979,7 +5519,7 @@ sub reset_spinup_tracking
     $cStreamP[0]	= $reset_4c->copy;
     $cGrWaterP		= $reset_4c->copy;
     $cEndoP		= $endoComp?$reset_4c->copy : $reset_4c;
-    %cAqWaterP		= map(($_=>$px4c->copy), @aqf_IDs);
+    $cAqWaterP		= pdl(map($px4c->copy,0..$#aqf_IDs));
   }
   if (3 ~~ @groups) {
     $cRffStgIrr		= $reset_Nd->copy;
@@ -4989,7 +5529,7 @@ sub reset_spinup_tracking
     $cVIS_Irr		= $reset_Nd->copy;
     $cStreamIrr[0]	= $reset_Nd->copy;
     $cGrWaterIrr	= $reset_Nd->copy;
-    %cAqWaterIrr	= map(($_=>$pxNd->copy), @aqf_IDs);
+    $cAqWaterIrr	= pdl(map($pxNd->copy,0..$#aqf_IDs));
   }
   return 1;
 }
@@ -5000,8 +5540,8 @@ sub compUpdate_Aquifer
 {
   my($comp, $aqf_data, $ID_from, $ID_to, $volumeAdd) = @_;
 
-  $$comp{$ID_to} =($$comp{$ID_to}   * ($$aqf_data{$ID_to}{Storage} - $volumeAdd) +
-		   $$comp{$ID_from} *  $volumeAdd ) / $$aqf_data{$ID_to}{Storage};
+  $comp(,,,($aIdx($ID_to))) .= ($comp(,,,($aIdx($ID_to))) * ($$aqf_data{$ID_to}{Storage} - $volumeAdd) +
+		   $comp(,,,($aIdx($ID_from))) *  $volumeAdd ) / $$aqf_data{$ID_to}{Storage};
   return 1;
 }
 
@@ -5011,7 +5551,7 @@ sub compUpdate_AquiferSnk
 {
   my($compAqf, $aqf_data, $ID, $compAdd, $volumeAdd) = @_;
 
-  $$compAqf{$ID} =($$compAqf{$ID} * ($$aqf_data{$ID}{Storage} - $volumeAdd) +
+  $compAqf(,,,($aIdx($ID))) .= ($compAqf(,,,($aIdx($ID))) * ($$aqf_data{$ID}{Storage} - $volumeAdd) +
 		    $compAdd      *  $volumeAdd ) / $$aqf_data{$ID}{Storage};
   return 1;
 }
@@ -5103,28 +5643,22 @@ sub compUpdate_GrWater
 {
   my ($GWt_infiltPrecip, $Aqf_infiltPrecip) = @_;
 	# mm/day		m3/day
+  my $aqfArr = pdl(map([$$aqf_data{$_}{StoragePrev},$$aqf_data{$_}{Storage}], @aqf_IDs))
+	if $compSwitch[2] || $compSwitch[3];
 
   if ($compSwitch[2]) {		### Primary water fractions in ground water
     $cGrWaterP		*= $grdWater[1];
     $cGrWaterP		+=($GWt_infiltPrecip*$subDf) * $cSoilP;
     $cGrWaterP		.= normalizeFr( $cGrWaterP, $extent );
 				### Primary water fractions in aquifers
-    foreach my $ID ( @aqf_IDs ) {
-      $cAqWaterP{$ID}	 = ($$aqf_data{$ID}{StoragePrev}*$cAqWaterP{$ID} +
-	($Aqf_infiltPrecip*$subDf*($aquiferID == $ID) * $cSoilP)
-	->sumover->sumover->reshape(1,1,4)) / $$aqf_data{$ID}{Storage};
-    }
+    $aqfArr->update_Aqf_comp($cAqWaterP->squeeze, $Aqf_infiltPrecip*$subDf * $cSoilP, $aquiferID, $aIdx);
   }
   if ($compSwitch[3]) {		### Irrigation water fraction in ground water
     $cGrWaterIrr	*= $grdWater[1];
     $cGrWaterIrr	+=($GWt_infiltPrecip*$subDf) * $cSoilIrr;
     $cGrWaterIrr	.= normalizeFr( $cGrWaterIrr, $extent );
 				### Irrigation water fraction in virtual/lumped aquifer
-    foreach my $ID ( @aqf_IDs ) {
-      $cAqWaterIrr{$ID}	 = ($$aqf_data{$ID}{StoragePrev}*$cAqWaterIrr{$ID} +
-	($Aqf_infiltPrecip*$subDf*($aquiferID == $ID) * $cSoilIrr)
-	->sumover->sumover->reshape($pxNa->dims)) / $$aqf_data{$ID}{Storage};
-    }
+    $aqfArr->update_Aqf_comp($cAqWaterIrr->squeeze, $Aqf_infiltPrecip*$subDf * $cSoilIrr, $aquiferID, $aIdx);
   }
   if ($compSwitch[5] && $mskModel) {	###  Spatial  mask fractions
     $cGrWaterMsk	*= $grdWater[1];
@@ -5238,7 +5772,7 @@ sub compUpdate_VIS	### Note- $irrVIS[0] is zero ( which is OK!), if VIS is not u
     my $irrUseComp =	($IrrUseStrgLoc*$cStreamP[0] + $IrrUseStrgRmt*$cStreamP[0]->indexND($irrUseFlowRID) +
 			 $IrrUseFlowLoc*$cStreamP[1] + $IrrUseFlowRmt*$cStreamP[1]->indexND($irrUseFlowRID) +
 			 $irrUseGrwt   *$cGrWaterP   + $irrUseSIR    *$cSIR_P_prev + $irrUseExtra*$cExtra) * $subDf;
-   map $irrUseComp+= $irrUseAqf*$subDf *$cAqWaterP{$_} * ($aquiferID == $_), @aqf_IDs;		# Aquifers
+    $irrUseComp->add_Aqf_comp($irrUseAqf*$subDf, $cAqWaterP->squeeze, $aquiferID, $aIdx);	# Aquifers
     $cVIS_P	  *= $irrVIS[0];
     $cVIS_P	  += $irrUseComp;
     $cVIS_P	  .= normalizeFr( $cVIS_P,  $extent );
@@ -5249,7 +5783,7 @@ sub compUpdate_VIS	### Note- $irrVIS[0] is zero ( which is OK!), if VIS is not u
     my $irrUseComp =	($IrrUseStrgLoc*$cStreamIrr[0] + $IrrUseStrgRmt*$cStreamIrr[0]->indexND($irrUseFlowRID) +
 			 $IrrUseFlowLoc*$cStreamIrr[1] + $IrrUseFlowRmt*$cStreamIrr[1]->indexND($irrUseFlowRID) +
 			 $irrUseGrwt   *$cGrWaterIrr   + $irrUseSIR    *$cSIR_Irr_prev + $irrUseExtra*$cExtra) * $subDf;
-   map $irrUseComp+= $irrUseAqf*$subDf *$cAqWaterIrr{$_} * ($aquiferID == $_), @aqf_IDs;	# Aquifers
+    $irrUseComp->add_Aqf_comp($irrUseAqf*$subDf, $cAqWaterIrr->squeeze, $aquiferID, $aIdx);	# Aquifers
 		### Push irrigation water reuse to the water added to VIS
     foreach my $i (reverse(1 .. $cVIS_Irr->dim(2)-1)) {
       my $j = List::Util::max($i,3);
@@ -5267,7 +5801,7 @@ sub compUpdate_VIS	### Note- $irrVIS[0] is zero ( which is OK!), if VIS is not u
     my $irrUseComp =	($IrrUseStrgLoc*$cStreamMsk[0] + $IrrUseStrgRmt*$cStreamMsk[0]->indexND($irrUseFlowRID) +
 			 $IrrUseFlowLoc*$cStreamMsk[1] + $IrrUseFlowRmt*$cStreamMsk[1]->indexND($irrUseFlowRID) +
 			 $irrUseGrwt   *$cGrWaterMsk   + $irrUseSIR    *$cSIR_Msk_prev +
-			($irrUseExtra  +$irrUseAqf)    * $subDf        *$cExtra) * $subDf;
+			($irrUseExtra  +$irrUseAqf)		       *$cExtra) * $subDf;
     $cVIS_Msk	  *= $irrVIS[0];
     $cVIS_Msk	  += $irrUseComp;
     $cVIS_Msk	  .= normalizeFr( $cVIS_Msk,  $extent );
@@ -5323,11 +5857,15 @@ sub compUpdate_Returns
 {
   return unless $runIO{Irrigation} || $runIO{WaterDemand};
 
-  my ($irrRnffIneff, $irrFloodRice, $rainFloodRice, $GWt_infiltRatio, $Aqf_infiltRatio,		# All in mm
+  my ($irrRnffIneff, $irrFloodRice, $rainFloodRice, $GWt_infiltRatio, $Aqf_infiltRatio,		# All in mm/day
       $irrPercIneff, $irrPercRice,  $rainPercRice,  $irrPercDeliv,    $returnRff) = @_;		# except ratios
 
     my $rffStorage	= $surfRffStorage[1] + $irrRffStorage[1];	# Tracking components are shared between
 									# surface and irrigation retention pools
+
+    my $aqfArr = pdl(map([$$aqf_data{$_}{StoragePrev},$$aqf_data{$_}{Storage}], @aqf_IDs))
+	if $compSwitch[2] || $compSwitch[3];
+
     if ($compSwitch[1]) {	### Basic water fractions in runoff storage
       my $cRain		= $zeroes_4->copy;	$cRain (,,(2)).= 1;
       my $cExtra	= $zeroes_4->copy;	$cExtra(,,(3)).= 1;
@@ -5343,8 +5881,8 @@ sub compUpdate_Returns
 			($indUseGrwt + $indUseExtra + $indUseAqf)*$cExtra) +
 	$stkReturnFr*($StkUseStrgLoc*$cStream[0] + $StkUseStrgRmt*$cStream[0]->indexND($stkUseFlowRID) +
 		      $StkUseFlowLoc*$cStream[1] + $StkUseFlowRmt*$cStream[1]->indexND($stkUseFlowRID) +
-			($stkUseGrwt + $stkUseExtra + $stkUseAqf)*$cExtra  + $stkUseSIR*$cSIR_prev) : 0) +
-	($runIO{Irrigation} ? ($irrRnffIneff  + $irrFloodRice)   *$cVIS +$rainFloodRice*$cRain : 0)    );
+			($stkUseGrwt + $stkUseExtra + $stkUseAqf)*$cExtra  + $stkUseSIR*$cSIR_prev):0) +
+	($runIO{Irrigation} ? ($irrRnffIneff  + $irrFloodRice)   *$cVIS +$rainFloodRice*$cRain     :0) );
 
       $cRffStg	    .= normalizeFr( $cRffStg, $extent );
     }
@@ -5363,11 +5901,11 @@ sub compUpdate_Returns
 		      $indUseGrwt   *$cGrWaterP   + $indUseExtra  *$cExtra) +
 	$stkReturnFr*($StkUseStrgLoc*$cStreamP[0] + $StkUseStrgRmt*$cStreamP[0]->indexND($stkUseFlowRID) +
 		      $StkUseFlowLoc*$cStreamP[1] + $StkUseFlowRmt*$cStreamP[1]->indexND($stkUseFlowRID) +
-		      $stkUseGrwt   *$cGrWaterP   + $stkUseExtra  *$cExtra + $stkUseSIR*$cSIR_P_prev) : 0) +
-	($runIO{Irrigation} ? ($irrRnffIneff + $irrFloodRice)  *$cVIS_P + $rainFloodRice*$cSoilP   : 0)   );
+		      $stkUseGrwt   *$cGrWaterP   + $stkUseExtra  *$cExtra + $stkUseSIR*$cSIR_P_prev):0) +
+	($runIO{Irrigation} ? ($irrRnffIneff + $irrFloodRice)  *$cVIS_P + $rainFloodRice*$cSoilP     :0) );
 		# Aquifers
-     map $cRffStgP += $subDf* ($domReturnFr*$domUseAqf+$indReturnFr*$indUseAqf+$stkReturnFr*$stkUseAqf) *
-			$cAqWaterP{$_} * ($aquiferID == $_), @aqf_IDs;
+      $cRffStgP->add_Aqf_comp($subDf * ($domReturnFr*$domUseAqf+$indReturnFr*$indUseAqf+$stkReturnFr*$stkUseAqf),
+			$cAqWaterP->squeeze, $aquiferID, $aIdx);		# Aquifers
 
       $cRffStgP	   .= normalizeFr( $cRffStgP, $extent );
 
@@ -5380,10 +5918,8 @@ sub compUpdate_Returns
 	$cGrWaterP .= normalizeFr( $cGrWaterP, $extent );
 		# Aquifer Water return
 	$cPerc     *= $mm_2_m3 if $aqfType;
-	foreach my $ID ( @aqf_IDs ) {
-	  $cAqWaterP{$ID}  = ($$aqf_data{$ID}{StoragePrev}*$cAqWaterP{$ID} +
-	    ($Aqf_infiltRatio*($aquiferID == $ID) * $cPerc)->sumover->sumover->reshape(1,1,4)) / $$aqf_data{$ID}{Storage};
-    } } }
+	$aqfArr->update_Aqf_comp($cAqWaterP->squeeze, $Aqf_infiltRatio*$cPerc, $aquiferID, $aIdx);	# Aquifers
+    } }
 				### Used water fractions in runoff storage and ground water
     if ($compSwitch[3]) {
 		# Irr return added to runoff storage (retention pool)
@@ -5398,11 +5934,9 @@ sub compUpdate_Returns
       $cGrWaterIrr	 += $GWt_infiltRatio * $cPerc;
       $cGrWaterIrr	  = normalizeFr( $cGrWaterIrr, $extent );
 		# Aquifer Water return
-         $cPerc		 *= $mm_2_m3 if $aqfType;	# m3
-      foreach my $ID ( @aqf_IDs ) {
-	$cAqWaterIrr{$ID}   = ($$aqf_data{$ID}{StoragePrev}*$cAqWaterIrr{$ID} +
-	    ($Aqf_infiltRatio*($aquiferID == $ID) * $cPerc)->sumover->sumover->reshape($pxNa->dims)) / $$aqf_data{$ID}{Storage};
-    } }
+      $cPerc		 *= $mm_2_m3 if $aqfType;	# m3
+      $aqfArr->update_Aqf_comp($cAqWaterIrr->squeeze, $Aqf_infiltRatio*$cPerc, $aquiferID, $aIdx);	# Aquifers
+    }
 				### Spatial mask fractions in runoff storage and ground water
     if ($compSwitch[5] && $mskModel) {
 		# Runoff return
@@ -5438,27 +5972,23 @@ sub compUpdate_GrWaterIrr
 {
   my($GWt_infltIneff, $Aqf_infltIneff) = @_;
 	# mm/day	m3/day
+  my $aqfArr = pdl(map([$$aqf_data{$_}{StoragePrev},$$aqf_data{$_}{Storage}], @aqf_IDs))
+	if $compSwitch[2] || $compSwitch[3];
 
   if ($compSwitch[2]) {
     $cGrWaterP *= $grdWater[1];
     $cGrWaterP += $GWt_infltIneff*$subDf * $cRffStgP;
     $cGrWaterP .= normalizeFr( $cGrWaterP, $extent );
 			# Aquifer
-    foreach my $ID ( @aqf_IDs ) {
-      $cAqWaterP{$ID}	 =($$aqf_data{$ID}{StoragePrev} * $cAqWaterP{$ID} +
-	($Aqf_infltIneff * $subDf * ($aquiferID == $ID) * $cRffStgP)
-	->sumover->sumover->reshape($px4b->dims)) / $$aqf_data{$ID}{Storage};
-  } }
+    $aqfArr->update_Aqf_comp($cAqWaterP->squeeze, $Aqf_infltIneff*$subDf*$cRffStgP, $aquiferID, $aIdx);
+  }
   if ($compSwitch[3]) {
     $cGrWaterIrr	*= $grdWater[1];
     $cGrWaterIrr	+= $GWt_infltIneff*$subDf * $cRffStgIrr;	### Water from Irrigation return
     $cGrWaterIrr	.= normalizeFr( $cGrWaterIrr, $extent );
 			# Aquifer
-    foreach my $ID ( @aqf_IDs ) {
-      $cAqWaterIrr{$ID}	 =($$aqf_data{$ID}{StoragePrev} * $cAqWaterIrr{$ID} +
-	($Aqf_infltIneff * $subDf * ($aquiferID == $ID) * $cRffStgIrr)
-	->sumover->sumover->reshape($pxNa->dims)) / $$aqf_data{$ID}{Storage};
-  } }
+    $aqfArr->update_Aqf_comp($cAqWaterIrr->squeeze, $Aqf_infltIneff*$subDf*$cRffStgIrr, $aquiferID, $aIdx);
+  }
   if ($compSwitch[5] && $mskModel) {
     $cGrWaterMsk *= $grdWater[1];
     $cGrWaterMsk += $GWt_infltIneff*$subDf * $cRffStgMsk;
@@ -5489,14 +6019,14 @@ sub compBalance_Prev
   if ($compSwitch[2]) {
     unless (exists $compBal{Prm}) {					# Update previous values
       for (my $i=0; $i<$cRunoffP->dim(2); $i++ ) {
-	$compBal{Prm}{Soil_prev}[$i]	= ($sMoist[0]	  * $cSoilP	  (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Prm}{RffStg_prev}[$i]	= ($rffStorage    * $cRffStgP	  (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Prm}{SIR_prev}[$i]	= ($smResStrg[0]  * $cSIR_P	  (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Prm}{VIS_prev}[$i]	= ($irrVIS[0]	  * $cVIS_P	  (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Prm}{GrWater_prev}[$i]	= ($grdWater[0]   * $cGrWaterP    (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Prm}{Stream_prev}[$i]	= ($resStorage[0] * $cStreamP[0]->(,,($i)) * 1e-9     )->sum;
+	$compBal{Prm}{Soil_prev}[$i]	= ($sMoist[0]	  * $cSoilP	  (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Prm}{RffStg_prev}[$i]	= ($rffStorage    * $cRffStgP	  (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Prm}{SIR_prev}[$i]	= ($smResStrg[0]  * $cSIR_P	  (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Prm}{VIS_prev}[$i]	= ($irrVIS[0]	  * $cVIS_P	  (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Prm}{GrWater_prev}[$i]	= ($grdWater[0]   * $cGrWaterP    (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Prm}{Stream_prev}[$i]	= ($resStorage[0] * $cStreamP[0]->(,,($i)) * 1e-9     )->sum->at(0);
 	$compBal{Prm}{AqWater_prev}[$i]	= $aqfType ? 1e-9 * List::Util::sum(
-		map($$aqf_data{$_}{Storage} * $cAqWaterP{$_}->at(0,0,$i), @aqf_IDs)) : 0;
+		map($$aqf_data{$_}{Storage} * $cAqWaterP(,,,($aIdx($_)))->at(0,0,$i), @aqf_IDs)) : 0;
     } }
     else {								# Initialize previous values
       for (my $i=0; $i<$cRunoffP->dim(2); $i++ ) {
@@ -5516,14 +6046,14 @@ sub compBalance_Prev
   if ($compSwitch[3]) {
     unless (exists $compBal{Irr}) {					# Update previous values
       for (my $i=0; $i<$cRunoffIrr->dim(2); $i++ ) {
-	$compBal{Irr}{Soil_prev}[$i]	= ($sMoist[0]	  * $cSoilIrr	    (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Irr}{RffStg_prev}[$i]	= ($rffStorage    * $cRffStgIrr	    (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Irr}{SIR_prev}[$i]	= ($smResStrg[0]  * $cSIR_Irr	    (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Irr}{VIS_prev}[$i]	= ($irrVIS[0]	  * $cVIS_Irr	    (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Irr}{GrWater_prev}[$i]	= ($grdWater[0]   * $cGrWaterIrr    (,,($i)) * $mm_2_km3)->sum;
-	$compBal{Irr}{Stream_prev}[$i]	= ($resStorage[0] * $cStreamIrr[0]->(,,($i)) * 1e-9     )->sum;
+	$compBal{Irr}{Soil_prev}[$i]	= ($sMoist[0]	  * $cSoilIrr	    (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Irr}{RffStg_prev}[$i]	= ($rffStorage    * $cRffStgIrr	    (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Irr}{SIR_prev}[$i]	= ($smResStrg[0]  * $cSIR_Irr	    (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Irr}{VIS_prev}[$i]	= ($irrVIS[0]	  * $cVIS_Irr	    (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Irr}{GrWater_prev}[$i]	= ($grdWater[0]   * $cGrWaterIrr    (,,($i)) * $mm_2_km3)->sum->at(0);
+	$compBal{Irr}{Stream_prev}[$i]	= ($resStorage[0] * $cStreamIrr[0]->(,,($i)) * 1e-9     )->sum->at(0);
 	$compBal{Irr}{AqWater_prev}[$i]	= $aqfType ? 1e-9 * List::Util::sum(
-		map($$aqf_data{$_}{Storage} * $cAqWaterIrr{$_}->at(0,0,$i), @aqf_IDs)) : 0;
+		map($$aqf_data{$_}{Storage} * $cAqWaterIrr(,,,($aIdx($_)))->at(0,0,$i), @aqf_IDs)) : 0;
     } }
     else {								# Initialize previous values
       for (my $i=0; $i<$cRunoffIrr->dim(2); $i++ ) {
@@ -5546,10 +6076,10 @@ sub compBalance_PrevSoil
 {
   return unless $compBalFlag;
   if ($compSwitch[2]) {
-    map $compBal{Prm}{Soil_prev}[$_] = ($sMoist[0] * $cSoilP  (,,($_)) * $mm_2_km3)->sum, 0 .. $cRunoffP  ->dim(2)-1;
+    map $compBal{Prm}{Soil_prev}[$_] = ($sMoist[0] * $cSoilP  (,,($_)) * $mm_2_km3)->sum->at(0), 0 .. $cRunoffP  ->dim(2)-1;
   }
   if ($compSwitch[3]) {
-    map $compBal{Irr}{Soil_prev}[$_] = ($sMoist[0] * $cSoilIrr(,,($_)) * $mm_2_km3)->sum, 0 .. $cRunoffIrr->dim(2)-1;
+    map $compBal{Irr}{Soil_prev}[$_] = ($sMoist[0] * $cSoilIrr(,,($_)) * $mm_2_km3)->sum->at(0), 0 .. $cRunoffIrr->dim(2)-1;
   }
   return 1;
 }
@@ -5673,10 +6203,8 @@ sub compBalance_Use
 		      # SIR
       $idlEvapComp += (1 - $stkReturnFr) * $stkUseSIR  * $cSIR_P_prev if $smResFlag;
 		      # Aquifers
-      foreach my $ID (@aqf_IDs) {
-	$idlEvapComp  += ($aquiferID == $ID) * $cAqWaterP{$ID}  *
-	      ((1-$domReturnFr) * $domUseAqf + (1-$indReturnFr) * $indUseAqf + (1-$stkReturnFr) * $stkUseAqf);
-      }
+      $idlEvapComp->add_Aqf_comp((1-$domReturnFr) * $domUseAqf + (1-$indReturnFr) * $indUseAqf + (1-$stkReturnFr) * $stkUseAqf, 
+		$cAqWaterP->squeeze, $aquiferID, $aIdx);
     }
     map $compBal{Prm}{EvapDIL} [$_] = ($idlEvapComp(,,($_)) * $MM_2_km3)->sum,	(0 .. $cRunoffP->dim(2)-1);
     map $compBal{Prm}{EvapTech}[$_] =  0,					(0 .. $cRunoffP->dim(2)-1);
@@ -5704,8 +6232,8 @@ sub compBalance_Use
 		      $stkUseGrwt * $cGrWaterIrr + $useExtra * $cExtra;
 			# SIR
       $idlUseComp  += $stkUseSIR  * $cSIR_Irr_prev if $smResFlag;
-			# Groundwater
-      map $idlUseComp += $useAquifer * $cAqWaterIrr{$_} * ($aquiferID == $_), @aqf_IDs;	# Aquifers
+			# Aquifers
+      $idlUseComp->add_Aqf_comp($useAquifer, $cAqWaterIrr->squeeze, $aquiferID, $aIdx);
     }
 		### Withdrawals for irrigation
     my  $irrUseComp =  $IrrUseStrgLoc*$cStreamIrr[0] + $IrrUseFlowLoc*$cStreamIrr[1]
@@ -5718,8 +6246,8 @@ sub compBalance_Use
     map $$IrrReuseInGrossGrwt_irr[$_-3]	= $irr_comp_Grwt(,,($_)),	3..$k;
     my  $irr_comp_Flow		 = $irrUseComp - $irr_comp_Grwt;
     map $$IrrReuseInGrossFlow_irr[$_-3]	= $irr_comp_Flow(,,($_)),	3..$k;
-			# Groundwater
-    map $irrUseComp += $irrUseAqf    *$cAqWaterIrr{$_} * ($aquiferID == $_), @aqf_IDs;	# Aquifers
+			# Aquifers
+    $irrUseComp->add_Aqf_comp($irrUseAqf, $cAqWaterIrr->squeeze, $aquiferID, $aIdx);
 			# Reuse variables
     my  $irr_comp_Aqf		 = $irrUseComp - $irr_comp_Flow - $irr_comp_Grwt;
     map $$IrrReuseInGrossAqf_irr[$_-3]	= $irrUseComp(,,($_)),		3..$k;
@@ -5731,8 +6259,12 @@ sub compBalance_Use
       $compBal{Irr}{UsedIrrGrwt}[$i]	= ($irr_comp_Grwt(,,($i)) * $MM_2_km3)->sum;
       $compBal{Irr}{UsedIrrAqf}[$i]	= ($irr_comp_Aqf(,,($i))  * $MM_2_km3)->sum;
 
-      if ($i > 2) {
-		# Rasterized values for WBM output, mm/day
+		### Rasterized values for WBM output, mm/day
+      if ($i == 2) {	# Domestic/Industiral/Livestock (DIL)
+	$UseReuseInGross_use		= $idlUseComp(,,($i));		# Reuse of _use by human use
+	$IrrReuseInGross_use		= $irrUseComp(,,($i));		# Reuse of _use by gross irrigation
+      }
+      if ($i > 2) {	# Irrigatoin
 	$$UseReuseOutGross_irr [$i-3]	=  $idlUseComp(,,($i));		# Reuse of _irr by human use
 	$$IrrReuseInGross_irr  [$i-3]	=  $irrUseComp(,,($i));		# Irrigation gross "In" to _irr balance
 	$$IrrReuseOutNet_irr   [$i-3]	=  $irrUseComp(,,($i)) *	# Irrigtion net "Out" to _irr balance
@@ -5741,7 +6273,14 @@ sub compBalance_Use
 		condition_slice($irrigationGross > 0,($irrEvapIneff + $irrEvapDeliv ) / $irrigationGross, 0);
 	$$irrFracInGross       [$i-3]	=
 		condition_slice($irrigationGross > 0, $irrUseComp(,,($i)) / $irrigationGross, 0);
-      }
+      }	
+    }
+		### Make cumulative output vars
+    map $$_[$nIrr] = 0,		$UseReuseOutGross_irr, $IrrReuseInGross_irr, $IrrReuseInGrossFlow_irr,
+	$IrrReuseInGrossGrwt_irr, $IrrReuseInGrossAqf_irr,$IrrReuseOutNet_irr, $IrrReuseOutNonben_irr,$irrFracInGross;
+    for (my $i=0; $i<$nIrr; $i++ ) {
+      map $$_[$nIrr]+=$$_[$i],	$UseReuseOutGross_irr, $IrrReuseInGross_irr, $IrrReuseInGrossFlow_irr,
+	$IrrReuseInGrossGrwt_irr, $IrrReuseInGrossAqf_irr,$IrrReuseOutNet_irr, $IrrReuseOutNonben_irr,$irrFracInGross;
     }
 		### Gross water use (introduced to the system)
     $compBal{Irr}{Gross}[1]   =  ($$pristineIrrComp[0] * $mm_2_km3)->sum + $$pristineIrrComp[1]->sum * 1e-9;
@@ -5819,11 +6358,11 @@ sub compBalance_Final
       $compBal{Prm}{Stream}[$i]	= ($resStorage[1] * $cStreamP[1]->(,,($i)) * 1e-9 )->sum;	# Storage term
       $compBal{Prm}{GrWater}[$i]= ($grdWater[1]   * $cGrWaterP	(,,($i)) * $mm_2_km3)->sum;	# Storage term
       $compBal{Prm}{AqWater}[$i]=  @aqf_IDs? 1e-9 * List::Util::sum(				# Storage term
-				  map($$aqf_data{$_}{Storage} * $cAqWaterP{$_}->at(0,0,$i), @aqf_IDs)) : 0;
+				  map($$aqf_data{$_}{Storage} * $cAqWaterP(,,,($aIdx($_)))->at(0,0,$i), @aqf_IDs)) : 0;
       $compBal{Prm}{Out}[$i]	= ($cStreamP[1]->(,,($i))->indexND($$outletIdx{ALL})*		# Flux    term
 				   $flow_out->index($$outletIdx{all})  )->sum * $dt * 1e-9 +
 				  (@aqf_IDs? 1e-9 * List::Util::sum(
-				  map($$aqf_data{$_}{MF_out}  * $cAqWaterP{$_}->at(0,0,$i), @aqf_IDs)) : 0);
+				  map($$aqf_data{$_}{MF_out}  * $cAqWaterP(,,,($aIdx($_)))->at(0,0,$i), @aqf_IDs)) : 0);
       $compBal{Prm}{StrDlt}[$i]+= ($flowUseDelta*$cStreamP[1]->(,,($i)))->sum * $dt * 1e-9;	# Flux    term
 		### SIR and IBT canals evaporation contribution
       $compBal{Prm}{EvapRiv}[$i]+= $compBal{Prm}{sirEvap}[$i] + ($$connectivity[0]->dims ? (	# Flux    term
@@ -5842,11 +6381,11 @@ sub compBalance_Final
       $compBal{Irr}{Stream}[$i]	= ($resStorage[1] * $cStreamIrr[1]->(,,($i)) * 1e-9 )->sum;	# Storage term
       $compBal{Irr}{GrWater}[$i]= ($grdWater[1]   * $cGrWaterIrr(,,($i)) * $mm_2_km3)->sum;	# Storage term
       $compBal{Irr}{AqWater}[$i]=  @aqf_IDs? 1e-9 * List::Util::sum(				# Storage term
-				  map($$aqf_data{$_}{Storage} * $cAqWaterIrr{$_}->at(0,0,$i), @aqf_IDs)) : 0;
+				  map($$aqf_data{$_}{MF_out}  * $cAqWaterP(,,,($aIdx($_)))->at(0,0,$i), @aqf_IDs)) : 0;
       $compBal{Irr}{Out}[$i]	= ($cStreamIrr[1]->(,,($i))->indexND($$outletIdx{ALL})*		# Flux    term
 				   $flow_out->index($$outletIdx{all})    )->sum * $dt * 1e-9 +
 				  (@aqf_IDs? 1e-9 * List::Util::sum(
-				  map($$aqf_data{$_}{MF_out}  * $cAqWaterIrr{$_}->at(0,0,$i), @aqf_IDs)) : 0);
+				  map($$aqf_data{$_}{MF_out}  * $cAqWaterIrr(,,,($aIdx($_)))->at(0,0,$i), @aqf_IDs)) : 0);
       $compBal{Irr}{StrDlt}[$i]+= ($flowUseDelta*$cStreamIrr[1]->(,,($i)))->sum * $dt * 1e-9;	# Flux    term
 		### SIR and IBT canals evaporation contribution
       $compBal{Irr}{EvapRiv}[$i] +=$compBal{Irr}{sirEvap}[$i] + ($$connectivity[0]->dims ? (	# Flux    term
@@ -5870,37 +6409,41 @@ sub usage
   print <<EOF;
 
 Usage:
-	$app_name [-h] [-v] [-bd|by|bm] [-test] [-noRun] [-rm] [-rmSpool] [-noOutput] [-noState] [-dState] [-t THREADS] [-tz THREAD_SIZE] [-sl] [-idump] [-saveDams] [-err] [-spoolDir SPOOL_DIR] [-stateDir STATE_DIR] RUN_ID
+	$app_name [-h] [-v] [-bd|bm] [-test] [-noRun] [-rm] [-rmSpool] [-bldSpool N_FORKS [NC]] [-noOutput] [-noState] [-dState] [-t THREADS] [-tz THREAD_SIZE] [-sl] [-idump] [-saveDams] [-err] [-spoolDir SPOOL_DIR] [-stateDir STATE_DIR] [-noStateID] RUN_ID
 
 This is PDL implementation for the University of New Hampshire Water Balance Model (WBM). Version @{[WBM_VERSION]}
-RUN_ID is the run ID from I/O spreadsheet (wbm_run_list.csv) or a parameter input file.
+RUN_ID is the run ID from I/O spreadsheet (wbm_run_list.csv) or a model init file.
 
 Options:
 
 h		Display this help.
 v		Verbose mode.
 bd		Perform code benchmarking for daily  intervals.
-by		Perform code benchmarking for yearly intervals.
 bm		Perform code benchmark mapping. Pause using "bm.lock" file.
 test		Test mode: no output, WBM runs one time step only.
 noRun		No run mode: Initialization only, creates auxilary files
-		   in the output directory.
+		   in the output directory, but allows -bldSpool to work.
 rm		Remove and do not update existing ouput files.
 rmSpool		Remove all this run input spool files. Manual removal
 		   of selected files is recommened though.
+bldSpool	Build spool files using N_FORKS and optional NC flag
+		   to generate NetCDF files in spool.
 noOutput	Do not write output files while running full TS of the model.
-noState		Do not read or write run state files
-dState		Write  daily run state files. Forces spinup "State_ID".
+noState		Do not read or write run state files.
+dState		Write  daily run state files. Forces "State_ID" in "Spinup" block.
 t		Number of threads to use. Default is 4.
 tz		Minimum thread size. Default is 1 Mb.
 sl		Use PDL slicing (faster when using many crops).
 saveDams	Save subset of dams within this run spatial domain.
 err		Print all GDAL relevant STDERR to screen for debugging.
-spoolDir	Overwrite path to spool     directory defined in the init file.
-stateDir	Overwrite path to run state directory defined in the init file.
+spoolDir	Overwrite path to spool     directory defined in the WBM.conf file.
+stateDir	Overwrite path to run state directory defined in the WBM.conf file.
+noStateID	Resume interrupted run for cases with State_ID in use.
 
-Example:
-$app_name -v -rm -by test
+Examples:
+	$app_name -v -rm RUN.init
+	$app_name -v -test test
+	$app_name -v -noRun -bldSpool 24 false RUN.init
 
 EOF
   exit;
@@ -5921,7 +6464,7 @@ pp_def('routing', HandleBad => 1,
     double rnff(n,m);
     double rnffFr(n,m,cc);	double rnffFrPm(n,m,cp);	double rnffIrrFr(n,m,ci);
     double rnffTw(n,m);		double rnffMsk(n,m,mm);		double rnffDIN(n,m);
-    double dschPrev(n,m);	double dschUsed(n,m);
+    double dschPrev(n,m);	double dschUsed(n,m);		double resStorageMusk(n,m);
     double waterAgePrev(n,m);
     double dschFrPrev(n,m,cc);	double dschFrPmPrev(n,m,cp);	double dschIrrFrPrev(n,m,ci);
     double dschTwPrev(n,m);	double dschMskPrev(n,m,mm);
@@ -5953,7 +6496,8 @@ pp_def('routing', HandleBad => 1,
     int i,i_cell,j_route,i_in,i_out,j_in,j_out;
     int    subDh = $dt() / 3600;				// Sub-daily interval, hours
     double subDf = $dt() /(3600*24);				// Sub-daily interval, day
-    double resRelease, denominator, waterVolume, wTemperature, DIN_R, HL;
+    double resStorage,  resRelease,  resDelta, dischPrev, dschMusk,
+	   denominator, waterVolume, wTemperature, DIN_R, HL;
 
 		// Connectivity network variables and constants
     int iConnStackPos = 0; int nC;
@@ -6052,9 +6596,10 @@ pp_def('routing', HandleBad => 1,
 
       $dsch_in(n=>i_in, m=>j_in)  = $dsch(n=>i_in, m=>j_in);
       $dsch   (n=>i_in, m=>j_in) += $rnff(n=>i_in, m=>j_in);
+      resStorage		  = $resStoragePrev(n=>i_in,m=>j_in);	// Intermediate resStorage. Do not remove!
 
   //	Calculate component fractions of surface runoff water
-      denominator = $resStoragePrev(n=>i_in,m=>j_in)+$dsch(n=>i_in,m=>j_in)*$dt(); // Trapezoidal would halve this, right?
+      denominator = resStorage + $dsch(n=>i_in,m=>j_in)*$dt();
       waterVolume = $rnff(n=>i_in,m=>j_in) * $dt();
 
 		// Water age
@@ -6124,65 +6669,56 @@ pp_def('routing', HandleBad => 1,
 	$dschDIN  (n=>i_in,m=>j_in) *= 1 - DIN_R;						// g/L
       }
 
-      if ( resCapacity == 0 ) {
+  ////////  Water Withdrawal from Flow (irrigation and other water uses)  ////////
 
-  ////////  Muskingum Transport and Accumulation  ////////
-	if ( $rtMethod() == 1 ) {
-	  resRelease =
-	    $c0(n=>i_in,m=>j_in) * $dsch(n=>i_in,m=>j_in)      +
-	    $c1(n=>i_in,m=>j_in) * $dschPrev(n=>i_in, m=>j_in) +
-	    $c2(n=>i_in,m=>j_in) * $flowOutPrev(l=>i_cell);
-	  if (resRelease < 0) resRelease = 0;
+      if ($dschUsed(n=>i_in,m=>j_in) > 0) {
+	storageFlow	= $rtMethod() == 2 ? resStorage/$dt() : 0;		// Flow to drain reservoir
+	denominator	= $dsch(n=>i_in,m=>j_in) + storageFlow;
+	if ($dschUsed(n=>i_in,m=>j_in) > denominator) $dschUsed(n=>i_in,m=>j_in) = denominator;
 
-	  $resStorage(n=>i_in,m=>j_in) =
-	    $resStoragePrev(n=>i_in,m=>j_in) + ($dsch(n=>i_in,m=>j_in) - resRelease)*$dt();
+			/// Case of proportional withdrawal
+	if (denominator > 0) {
+	  resStorage		 -=($dschUsed(n=>i_in,m=>j_in) * storageFlow		/denominator)*$dt();
+	  $dsch(n=>i_in,m=>j_in) -= $dschUsed(n=>i_in,m=>j_in) * $dsch(n=>i_in,m=>j_in) /denominator;
 	}
+      }
+      
+  ////////  Restore Muskingum resStorage  ////////
 
-  ////////  LRR Transport and Accumulation  ////////
-	else if ( $rtMethod() == 2 ) {
-	  $resStorage(n=>i_in,m=>j_in) =
-	    $resStoragePrev(n=>i_in,m=>j_in) + $dsch(n=>i_in,m=>j_in)*$dt();
-
-	  resRelease = $resStorage(n=>i_in,m=>j_in)*$c0(n=>i_in,m=>j_in)/$dt();		// c0 is flowCoeff
-	  $resStorage(n=>i_in,m=>j_in) *= 1 -       $c0(n=>i_in,m=>j_in);
-	}
-
-  ////////  Unknown Routing method  ////////
-	else {
-	  printf( "\nUnknown routing method in Pdlpp. Aborting...\n\n" );
-	  exit(0xFF);		// It is exit with BAD status
-	}
-
-  ////////  Check for negative storage and fix if needed
-	if ($resStorage(n=>i_in,m=>j_in) < 0) {
-	  resRelease = $resStoragePrev(n=>i_in,m=>j_in)/$dt() + $dsch(n=>i_in, m=>j_in);
-	  $resStorage(n=>i_in,m=>j_in) = 0;
+      if ($rtMethod() == 1 && !resCapacity) {
+	$dsch(n=>i_in,m=>j_in)	-= ($resStorageMusk(n=>i_in,m=>j_in) - resStorage)/$dt();	// m3/sec
+	resStorage		 =  $resStorageMusk(n=>i_in,m=>j_in);
+	if ($dsch(n=>i_in,m=>j_in) < 0) {
+	  resStorage		+= $dsch(n=>i_in,m=>j_in)*$dt();
+	  $dsch(n=>i_in,m=>j_in) = 0;
 	}
       }
 
+
   ////////  Reservoirs Storage and Release  ////////
-      else {
+      if ( resCapacity ) {
+	  dischPrev = $dsch(n=>i_in,m=>j_in);
 				  ///// Observed outflow dams //
 	  if ( dschObs ) {
-	      resRelease = (dschObs < $resStoragePrev(n=>i_in, m=>j_in)  + $dsch(n=>i_in,m=>j_in)*$dt() ?
-			    dschObs : $resStoragePrev(n=>i_in, m=>j_in)) / $dt();
+	      $dsch(n=>i_in,m=>j_in) = (dschObs < resStorage  + dischPrev*$dt() ?
+					dschObs : resStorage) / $dt();
 	  } else {  // If observed discharge is present use that, unless there is not enough water in reservoir
 
 				  ///// Spillway dams	/////
 	      if (resMethod == 0) {				//// Crest is at the level of resCapacity
 		  beta = 4 * alpha / resArea;			//// resLevel is head storage above crest
-		  resLevel = $resStoragePrev(n=>i_in,m=>j_in) - resCapacity;
+		  resLevel = resStorage - resCapacity;
 		  if (resLevel < minLvl) resLevel = minLvl;	//// Do not allow head to be below 1 cm
 		  /// Iterative solution of Prusevich equation (2.7)
-		  deltaDisch = ($dsch(n=>i_in,m=>j_in) - $dschPrev(n=>i_in,m=>j_in)) / subDh;
+		  deltaDisch = (dischPrev - $dschPrev(n=>i_in,m=>j_in)) / subDh;
 		  for(i=1; i<=subDh; i++) {
-		      resRelease = $dschMean(n=>i_in,m=>j_in) *
+		      $dsch(n=>i_in,m=>j_in) = $dschMean(n=>i_in,m=>j_in) *
 			  pow((alpha == 0 ? resLevel/optLvl : (sqrt(1+beta*resLevel)-1)/(sqrt(1+beta*optLvl)-1)),1.6);
-		      resLevel  += ($dschPrev(n=>i_in,m=>j_in)+deltaDisch*i - resRelease)*$dt()/subDh;
+		      resLevel  += ($dschPrev(n=>i_in,m=>j_in)+ deltaDisch*i - $dsch(n=>i_in,m=>j_in))*$dt()/subDh;
 		      if (resLevel < minLvl) resLevel = minLvl;
 		  }
-		  resRelease = $dsch(n=>i_in,m=>j_in) - (resLevel+resCapacity-$resStoragePrev(n=>i_in,m=>j_in))/$dt();
-		  if (resRelease < 0) resRelease = 0;
+		  $dsch(n=>i_in,m=>j_in) = dischPrev - (resLevel+resCapacity-resStorage)/$dt();
+		  if ($dsch(n=>i_in,m=>j_in) < 0) $dsch(n=>i_in,m=>j_in) = 0;
 		  resCapacity = 1e15;				//// Spillway dams cannot be overfilled
 	      }
 				  ///// Regulated dams	/////
@@ -6190,14 +6726,14 @@ pp_def('routing', HandleBad => 1,
 		  regCapacity =  resCapacity / ($dschMean(n=>i_in,m=>j_in) * 365*$dt());
 		  if (regCapacity < 0.1) regCapacity = 0.1;
 		  if (regCapacity > 1.0) regCapacity = 1.0;
-		  resLevel    = $resStoragePrev(n=>i_in,m=>j_in) / resCapacity;
-		  deltaDisch  = ($dsch(n=>i_in,m=>j_in) - $dschPrev(n=>i_in,m=>j_in)) / subDh;
+		  resLevel    = resStorage / resCapacity;
+		  deltaDisch  = (dischPrev - $dschPrev(n=>i_in,m=>j_in)) / subDh;
 
 		  /// Iterative solution (needed for reservoirs with small regulatory capacity)
 		  for(i=1; i<=subDh; i++) {
-		      resRelease =  $dschMean(n=>i_in,m=>j_in) *
+		      $dsch(n=>i_in,m=>j_in) =  $dschMean(n=>i_in,m=>j_in) *
 			  (resLevel < Xe ? Y0 + a_Par*log(1 + c_Par*resLevel) : B_Par + b_Par*pow(resLevel - Xb, p_Par));
-		      resLevel  += ($dschPrev(n=>i_in,m=>j_in)+deltaDisch*i - resRelease)*$dt()/subDh / resCapacity;
+		      resLevel  += ($dschPrev(n=>i_in,m=>j_in)+deltaDisch*i - $dsch(n=>i_in,m=>j_in))*$dt()/subDh / resCapacity;
 		      if (resLevel > 1) resLevel = 1;
 		      if (resLevel < 0) resLevel = 0;
 		  }
@@ -6206,30 +6742,16 @@ pp_def('routing', HandleBad => 1,
 		 ///// Update reservoir storage
 
 	  $resStorage(n=>i_in,m=>j_in) =
-	  $resStoragePrev(n=>i_in,m=>j_in) + ($dsch(n=>i_in,m=>j_in) - resRelease)*$dt();
+	  resStorage + (dischPrev - $dsch(n=>i_in,m=>j_in))*$dt();
 						 //// If overfilled
 	  if ($resStorage(n=>i_in,m=>j_in) > resCapacity) {
-	      resRelease = $dsch(n=>i_in,m=>j_in) + ($resStoragePrev(n=>i_in,m=>j_in) - resCapacity)/$dt();
+	      $dsch(n=>i_in,m=>j_in) = dischPrev + (resStorage - resCapacity)/$dt();
 	      $resStorage(n=>i_in,m=>j_in) = resCapacity;
 	  }					//// If empty
 	  else if ($resStorage(n=>i_in,m=>j_in) < 0) {
-	      resRelease = $dsch(n=>i_in,m=>j_in) + $resStoragePrev(n=>i_in,m=>j_in)/$dt();
+	      $dsch(n=>i_in,m=>j_in) = dischPrev + resStorage/$dt();
 	      $resStorage(n=>i_in,m=>j_in) = 0;
 	  }
-      }
-
-  ////////  Water Withdrawal from Flow (irrigation and other water uses)  ////////
-
-      if ($dschUsed(n=>i_in,m=>j_in) > 0) {
-	storageFlow	= $resStorage(n=>i_in,m=>j_in)/$dt();			// Flow to drain reservoir
-	denominator	= resRelease + storageFlow;
-	if ($dschUsed(n=>i_in,m=>j_in) > denominator) $dschUsed(n=>i_in,m=>j_in) = denominator;
-
-			/// Case of proportional withdrawal
-	if (denominator > 0) {
-	  $resStorage(n=>i_in,m=>j_in)	-=($dschUsed(n=>i_in,m=>j_in) * storageFlow/denominator)*$dt();
-	   resRelease			-= $dschUsed(n=>i_in,m=>j_in) * resRelease /denominator;
-	}
       }
 
   ////////  Connectivity Routing  ////////
@@ -6244,7 +6766,7 @@ pp_def('routing', HandleBad => 1,
 	  $connParms(pk=>6,cl=>routeI) = 0;		// Evaporation from canal, reset it from previous time step
 
 	if (($connTable(ck=>4,cl=>routeI) < $j_date()) && ($connTable(ck=>5,cl=>routeI) >= $j_date()) &&
-	    (resRelease+storageFlow > 0)) {
+	    ($dsch(n=>i_in,m=>j_in)+storageFlow > 0)) {
 
 	  ci_out  = $connTable(ck=>2,cl=>routeI);
 	  cj_out  = $connTable(ck=>3,cl=>routeI);
@@ -6253,7 +6775,8 @@ pp_def('routing', HandleBad => 1,
 	  c_parm3 = $connParms(pk=>2,cl=>routeI);	// MaxFlow parameter
 
 					////////// Connectivity universal rule (calculate diversion)-
-	  diversion = (resRelease+storageFlow  <= c_parm2) ? 0 : (resRelease+storageFlow - c_parm2) * c_parm1/100;
+	  diversion = ($dsch(n=>i_in,m=>j_in)+storageFlow  <= c_parm2) ? 0 :
+		      ($dsch(n=>i_in,m=>j_in)+storageFlow - c_parm2) * c_parm1/100;
 	  if (diversion > c_parm3) diversion	= c_parm3;
 	  $routeDiversion(cl=>routeI)		= diversion;
 
@@ -6317,15 +6840,17 @@ pp_def('routing', HandleBad => 1,
 		/// Subtract Diversion Withdrawal from Donor Flow and Reservoir Storage
 	if (diversionCell > 0) {
 			/// Case of proportional withdrawal (depreciated)
-//	  $resStorage(n=>i_in,m=>j_in)	-=(diversionCell * storageFlow/(resRelease+storageFlow))*$dt();
-//	  resRelease			-= diversionCell * resRelease /(resRelease+storageFlow);
+//	  resStorage		 -=(diversionCell * storageFlow/($dsch(n=>i_in,m=>j_in)+storageFlow))*$dt();
+//	  $dsch(n=>i_in,m=>j_in) -= diversionCell * $dsch(n=>i_in,m=>j_in) /($dsch(n=>i_in,m=>j_in)+storageFlow);
 
 			/// Case of flow-priority withdrawal
-	  if (diversionCell > (resRelease-c_parm2)) {			// c_parm2 is MinFlow
-	    $resStorage(n=>i_in,m=>j_in)-=(diversionCell - (resRelease-c_parm2))*$dt();
-	    diversionCell		 = resRelease-c_parm2;		// Max from Flow
+	  if (diversionCell > ($dsch(n=>i_in,m=>j_in)-c_parm2)) {			// c_parm2 is MinFlow
+	    resDelta	= (diversionCell - ($dsch(n=>i_in,m=>j_in)-c_parm2))*$dt();
+	    if (resCapacity) {	$resStorage(n=>i_in,m=>j_in)	-= resDelta; }
+	    else {		 resStorage			-= resDelta; }
+	    diversionCell  = $dsch(n=>i_in,m=>j_in)-c_parm2;				// Max from Flow
 	  }
-	  resRelease			-= diversionCell;
+	  $dsch(n=>i_in,m=>j_in)	-= diversionCell;
 	}
 
 	iConnStackPos++;			// Advance stack pointer to the next cell
@@ -6334,22 +6859,65 @@ pp_def('routing', HandleBad => 1,
   ////////  Remove water to aquifer sinks  ////////
 
       if ( $snkStack(    nsk=>iSnkStackPos) == i_cell ) {
-	$snkData(msk=>2, nsk=>iSnkStackPos) += resRelease * $snkData(msk=>0, nsk=>iSnkStackPos);   // Sink infiltration
-	resRelease			    *= (1.0       - $snkData(msk=>0, nsk=>iSnkStackPos));  // Update discharge
+	$snkData(msk=>2, nsk=>iSnkStackPos) += $dsch(n=>i_in,m=>j_in) *				// Sink infiltration
+							$snkData(msk=>0, nsk=>iSnkStackPos);
+	$dsch(n=>i_in,m=>j_in)		    *= 1.0  -	$snkData(msk=>0, nsk=>iSnkStackPos);	// Update discharge
 	iSnkStackPos++;
       }
 
   ////////  USGS gauging data assimilation  ////////
 
       if ($usgsStack(	nus=>iUsgsStackPos ) == i_cell) {
-	$usgsData(	mus=>1, nus=>iUsgsStackPos) =  resRelease;				// WBM discharge
+	$usgsData(	mus=>1, nus=>iUsgsStackPos) =  $dsch(n=>i_in,m=>j_in);			// WBM discharge
 	if ($usgsData(	mus=>0, nus=>iUsgsStackPos) >  0)					// Update Delta
-	    $usgsData(	mus=>2, nus=>iUsgsStackPos) =  $usgsData(mus=>0, nus=>iUsgsStackPos) - resRelease;
-	if ($usgsData(	mus=>2, nus=>iUsgsStackPos) < -resRelease)				// No negative discharge
-	    $usgsData(	mus=>2, nus=>iUsgsStackPos) = -resRelease;
-	resRelease				   +=  $usgsData(mus=>2, nus=>iUsgsStackPos);	// Add delta
+	    $usgsData(	mus=>2, nus=>iUsgsStackPos) =  $usgsData(mus=>0,nus=>iUsgsStackPos) - $dsch(n=>i_in,m=>j_in);
+	if ($usgsData(	mus=>2, nus=>iUsgsStackPos) < -$dsch(n=>i_in,m=>j_in))			// No negative discharge
+	    $usgsData(	mus=>2, nus=>iUsgsStackPos) = -$dsch(n=>i_in,m=>j_in);
+	$dsch(n=>i_in,m=>j_in)			   +=  $usgsData(mus=>2, nus=>iUsgsStackPos);	// Add delta
 		/// Shift USGS stack
 	iUsgsStackPos++;
+      }
+
+  /////////////////////////////////////////////////////////////////
+  ////////  Finilizing the discharge out (Actual Routing)  ////////
+
+      if ( resCapacity == 0 ) {			/// Rivers
+
+  ////////  Muskingum Transport and Accumulation  ////////
+	if ( $rtMethod() == 1 ) {
+	  resRelease =
+	    $c0(n=>i_in,m=>j_in) * $dsch(n=>i_in, m=>j_in)	+
+	    $c1(n=>i_in,m=>j_in) * $dschPrev(n=>i_in, m=>j_in)	+
+	    $c2(n=>i_in,m=>j_in) * $flowOutPrev(l=>i_cell);
+	  if (resRelease < 0) resRelease = 0;
+
+	  $resStorage(n=>i_in,m=>j_in) = resStorage + ($dsch(n=>i_in,m=>j_in) - resRelease)*$dt();
+	}
+
+  ////////  LRR Transport and Accumulation  ////////
+	else if ( $rtMethod() == 2 ) {
+	  $resStorage(n=>i_in,m=>j_in) = resStorage + $dsch(n=>i_in,m=>j_in)*$dt();
+
+	  resRelease = $resStorage(n=>i_in,m=>j_in)*$c0(n=>i_in,m=>j_in)/$dt();		// c0 is flowCoeff
+	  $resStorage(n=>i_in,m=>j_in) *= 1 -       $c0(n=>i_in,m=>j_in);
+	}
+
+  ////////  Unknown Routing method  ////////
+	else {
+	  printf( "\nUnknown routing method in Pdlpp. Aborting...\n\n" );
+	  exit(0xFF);		// It is exit with BAD status
+	}
+
+  ////////  Check for negative storage and fix if needed
+	if ($resStorage(n=>i_in,m=>j_in) < 0) {
+	  resRelease = resStorage/$dt()  + $dsch(n=>i_in, m=>j_in);
+	  $resStorage(n=>i_in,m=>j_in) = 0;
+	}
+      }
+  ////////
+
+      else {					/// Reservoirs and Lakes
+	resRelease = $dsch(n=>i_in,m=>j_in);
       }
 
   ////////  Update outDischarge pixels  ////////
@@ -6443,8 +7011,9 @@ pp_def('snow_routing', HandleBad => 1,
 
 pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
   Pars => 'double irrDemand(n,m);
-    double groundWater(n,m);	double resStorage(n,m);    double sirStorage(n,m);	double discharge(n,m);
-    int    aqfType();		int    aqf_ID(k1);	   double irrExtraCoeff(n,m);	double gwtUseC();
+    double groundWater(n,m);	double resStorage(n,m);    double muskMask(n,m);
+    double sirStorage(n,m);	double discharge(n,m);
+    int    aqfType();		int    index_ID(iAqf);	   double irrExtraCoeff(n,m);	double gwtUseC();
     int    aquiferID(n,m);	double aqfStorage(n,m);	   double Cfd_dQ(n,m);		double aqf_data(k0,k1);
     double mm_2_m3(n,m);	double SW_ratio(n,m);	   int    irrSearchDist(n,m);	double dt();
 
@@ -6462,7 +7031,6 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
     int m_size  = $SIZE(m);	int i, ii, j, jj;
   //int k0_size = $SIZE(k0);				// 0- Storage; 1- Delta
     int k1_size = $SIZE(k1);				// Number of Aquifer IDs
-    int max_ID  = $aqf_ID(k1=>k1_size-1)+1;		// Max+1  of Aquifer IDs (last element of aqf_ID)
 
     double irrigation, irrDelta, gwtDelta, delta_m3, rStorage, denominator, flowStorage, flowFrac, strgFrac, aqfStrg;
     double maxFraction = 0.8;			// Maximum water take out from river flow & storage
@@ -6470,7 +7038,6 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
     double *myDemand;	myDemand = malloc(k1_size*sizeof *myDemand);
     double *myRatio ;	myRatio  = malloc(k1_size*sizeof *myRatio );
     double *myAqfSum;	myAqfSum = malloc(k1_size*sizeof *myAqfSum);
-    int    *index_ID;	index_ID = malloc(max_ID *sizeof *index_ID);
 
   ////////  Irrigation from River Storage  ////////
 
@@ -6521,7 +7088,7 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
 			// Third, take irrigation water from own river by SW-ratio
 	if (irrDelta > 0) {
 	  flowStorage	= $discharge( n=>ii,m=>jj) * $dt();
-	  denominator	= $resStorage(n=>ii,m=>jj) + flowStorage;
+	  denominator	= $resStorage(n=>ii,m=>jj) * $muskMask(n=>ii,m=>jj) + flowStorage;
 	  if (denominator > 0) {
 	    flowFrac	= flowStorage / denominator;
 	    strgFrac	= 1 - flowFrac;
@@ -6559,14 +7126,14 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
 	      if (j < 0 || j >= m_size) continue;
 	      for (i = ii-$irrSearchDist(n=>ii,m=>jj); i <= ii+$irrSearchDist(n=>ii,m=>jj); i++) {
 		if ((i < 0 || i >= n_size) || $ISBAD($resStorage(n=>i,m=>j))) continue;
-		denominator = $resStorage(n=>i,m=>j) + $discharge(n=>i,m=>j)*$dt();
+		denominator = $resStorage(n=>i,m=>j)*$muskMask(n=>i,m=>j) + $discharge(n=>i,m=>j)*$dt();
 		if (rStorage < denominator) {
 		  i_sch = i; j_sch = j;  rStorage = denominator;
 		}
 	      }
 	    }			// Take from found largest river around
 	    flowStorage	= $discharge( n=>i_sch,m=>j_sch) * $dt();
-	    denominator	= $resStorage(n=>i_sch,m=>j_sch) + flowStorage;
+	    denominator	= $resStorage(n=>i_sch,m=>j_sch) * $muskMask(n=>i_sch,m=>j_sch) + flowStorage;
 	    if (denominator > 0) {
 	      flowFrac	= flowStorage / denominator;
 	      strgFrac	= 1 - flowFrac;
@@ -6593,8 +7160,6 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
 							// for cases when an aquifer storage is large (10^15 m3) that causes
     if ($aqfType()) {					// accumulated error of multiple substractions due to the number is
       for (i = 0; i < k1_size; i++) myAqfSum[i] = 0;	// at or near 16 significant digits that "double" type can take.
-      for (i = 0; i < max_ID;  i++) index_ID[i]	= 0;
-      for (i = 0; i < k1_size; i++) index_ID[$aqf_ID(k1=>i)] = i;		// Aquifer ID indices
 
   ////////  Check virtual/lumped aquifer water supply to meet demand  ////////
 
@@ -6604,7 +7169,8 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
         for (jj = 0; jj < m_size; jj++) {
 	  for (ii = 0; ii < n_size; ii++) {
 	    if ( $ISBAD($groundWater(n=>ii,m=>jj)) || $irrExtra(n=>ii,m=>jj) == 0 ) continue;
-	      indID		 = index_ID[$aquiferID(n=>ii,m=>jj)];
+	      indID		 = $aquiferID(n=>ii,m=>jj);
+	      indID		 = $index_ID(iAqf=>indID);
 	      myDemand[indID]	+= $irrExtra(n=>ii,m=>jj) * $mm_2_m3(n=>ii,m=>jj);	// m3
 	  }
 	}
@@ -6619,7 +7185,8 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
 	  if ( $ISBAD($groundWater(n=>ii,m=>jj)) || $aquiferID(n=>ii,m=>jj) == 0 || $irrExtra(n=>ii,m=>jj) == 0 ) continue;
 
 			// Sixth, take irrigation water from aquifer, if still needed
-	    indID	   = index_ID[$aquiferID(n=>ii,m=>jj)];
+	    indID	   = $aquiferID(n=>ii,m=>jj);
+	    indID	   = $index_ID(iAqf=>indID);
 	    if ($aqfType() == 3) {
 		  aqfStrg  = $aqfStorage(n=>ii,m=>jj) + $Cfd_dQ(n=>ii,m=>jj);
 		  irrDelta = $irrExtra(n=>ii,m=>jj)   * $mm_2_m3(n=>ii,m=>jj);
@@ -6645,7 +7212,8 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
 	  for (jj = 0; jj < m_size; jj++) {
 	    for (ii = 0; ii < n_size; ii++) {
 	      if ( $ISBAD($groundWater(n=>ii,m=>jj)) || $irrGrwt(n=>ii,m=>jj) == 0 ) continue;
-	      indID = index_ID[$aquiferID(n=>ii,m=>jj)];
+	      indID = $aquiferID(n=>ii,m=>jj);
+	      indID = $index_ID(iAqf=>indID);
 	      myDemand[indID] += $irrGrwt(n=>ii,m=>jj) * (1 - $gwtUseC()) * $mm_2_m3(n=>ii,m=>jj);	// m3
 	    }
 	  }
@@ -6660,7 +7228,8 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
 	    if ( $ISBAD($groundWater(n=>ii,m=>jj)) || $aquiferID(n=>ii,m=>jj) == 0 || $irrGrwt(n=>ii,m=>jj) == 0 ) continue;
 
 			// Seventh, substitute groundwater with aquifer source
-	    indID	   = index_ID[$aquiferID(n=>ii,m=>jj)];
+	    indID	   = $aquiferID(n=>ii,m=>jj);
+	    indID	   = $index_ID(iAqf=>indID);
 	    if ($aqfType() == 3) {
 		  aqfStrg  = $aqfStorage(n=>ii,m=>jj) + $Cfd_dQ(n=>ii,m=>jj);
 		  gwtDelta = $irrGrwt(n=>ii,m=>jj)   * $mm_2_m3(n=>ii,m=>jj) * (1 - $gwtUseC());
@@ -6693,7 +7262,6 @@ pp_def('demandFromStreamGwater', HandleBad => 1, NoPthread => 1,
     free(myDemand);
     free(myRatio );
     free(myAqfSum);
-    free(index_ID);
 ');
 
 #######################################################################
@@ -7002,6 +7570,272 @@ pp_def('mask_union', HandleBad => 1,
     }
 	// Free OS memory
     free(myKeys);
+');
+
+#######################################################################
+
+pp_def('aqf_RIV_update', HandleBad => 1,
+  Pars => 'double aqfArr(k,nAqf); 
+    double Qriv(n,m);		double	resStorage(n,m);  double grndWaterTw(n,m);
+    double rnffMask(n,m,mm);	int     cSwitch(cNum);
+    double streamAge(n,m);	double	cStream(n,m,cc);  double cStreamP(n,m,cp);
+    double cStreamIrr(n,m,ci);	double	cStreamTw(n,m);   double cStreamMsk(n,m,mm);
+    double cStreamDIN(n,m);	double	cStmConDIN(n,m);
+    double cAqWaterP(cp,nAqf);	double	cAqWaterIrr(ci,nAqf);
+    int    aquiferID(n,m);	int     index_ID(iAqf);',
+  Code => '
+		// Dimension constants
+    int n_size = $SIZE(n);	int c_size = $SIZE(cc);	int p_size = $SIZE(cp);
+    int m_size = $SIZE(m);	int i_size = $SIZE(ci);	int mm_size= $SIZE(mm);
+    int a_size = $SIZE(nAqf);
+    int k_size = $SIZE(k);	// Hash keys: 0=bflOut; 1=bflIn; 2=Delta; 3=Storage
+		// Check dimensions
+    if ($cSwitch(cNum=>1) && c_size != 4) {
+      printf( "\nWrong dimensions for cStream variable in Pdlpp function aqf_RIV_update(). Aborting...\n\n" );
+      exit(0xFF);		// It is exit with BAD status
+    }
+		// General internal/private variables
+    int    i, j, ii, indID;
+    double bflOut, bflIn;
+    int    track = 0;	for (i = 0; i < $SIZE(cNum); i++) track += $cSwitch(cNum=>i);
+
+		// Dynamic variables, and their initialization
+    double *prmSum[a_size];	double *irrSum[a_size];
+    for (i=0; i<a_size; i++) {				// Memory allocation
+      prmSum[i] = (double *)malloc(p_size * sizeof(double));
+      irrSum[i] = (double *)malloc(i_size * sizeof(double));
+    }
+    for (i=0; i<a_size; i++) {				// Array initialization
+      for (ii=0; ii<p_size; ii++) { prmSum[i][ii] = 0; }
+      for (ii=0; ii<i_size; ii++) { irrSum[i][ii] = 0; }
+    }
+
+	//////////////////////////////////////////////////
+	//////////	Processing	//////////////////
+
+    for (j=0; j<m_size; j++) {		// Start of per pixel loop
+      for (i=0; i<n_size; i++) {
+	if ( $ISBAD($aquiferID(n=>i,m=>j)) || $aquiferID(n=>i,m=>j) < 1 ) continue;
+	indID	= $aquiferID(n=>i,m=>j);
+	indID	= $index_ID(iAqf=>indID);
+
+	bflOut	= $Qriv(n=>i,m=>j) <  0 ? -$Qriv(n=>i,m=>j) : 0;
+        bflIn	= $Qriv(n=>i,m=>j) >  0 ?  $Qriv(n=>i,m=>j) : 0;
+	$aqfArr(k=>0,nAqf=>indID)	+= bflOut;
+	$aqfArr(k=>1,nAqf=>indID)	+= bflIn ;
+	$aqfArr(k=>2,nAqf=>indID)	+= bflIn - bflOut;
+	$aqfArr(k=>3,nAqf=>indID)	+= bflIn - bflOut;
+
+	///// Update component tracking
+	if (!track) continue;
+
+			// Discharge to streams
+	if (bflOut) {
+	  if ($cSwitch(cNum=>0)) {	  // Water age
+	    $streamAge(n=>i,m=>j) *= $resStorage(n=>i,m=>j) - bflOut;
+	    $streamAge(n=>i,m=>j) += bflOut;
+	    $streamAge(n=>i,m=>j) /= $resStorage(n=>i,m=>j);
+	  }
+	  if ($cSwitch(cNum=>1)) {	  // Runoff components
+	    for (ii=0; ii<c_size; ii++) {
+	      $cStream(n=>i,m=>j,cc=>ii) *= $resStorage(n=>i,m=>j) - bflOut;	if (ii == 3) 
+	      $cStream(n=>i,m=>j,cc=>ii) += bflOut;
+	      $cStream(n=>i,m=>j,cc=>ii) /= $resStorage(n=>i,m=>j);
+
+	      if ($cStream(n=>i,m=>j,cc=>ii) < 0) $cStream(n=>i,m=>j,cc=>ii) = 0;		// Clip - should not happen
+	      if ($cStream(n=>i,m=>j,cc=>ii) > 1) $cStream(n=>i,m=>j,cc=>ii) = 1;		// Clip - should not happen
+	    }
+	  }
+	  if ($cSwitch(cNum=>2)) {	  // Primary components
+	    for (ii=0; ii<p_size; ii++) {
+	      $cStreamP(n=>i,m=>j,cp=>ii) *= $resStorage(n=>i,m=>j) - bflOut;
+	      $cStreamP(n=>i,m=>j,cp=>ii) += bflOut * $cAqWaterP(cp=>ii,nAqf=>indID);
+	      $cStreamP(n=>i,m=>j,cp=>ii) /= $resStorage(n=>i,m=>j);
+
+	      if ($cStreamP(n=>i,m=>j,cp=>ii) < 0) $cStreamP(n=>i,m=>j,cp=>ii) = 0;		// Clip - should not happen
+	      if ($cStreamP(n=>i,m=>j,cp=>ii) > 1) $cStreamP(n=>i,m=>j,cp=>ii) = 1;		// Clip - should not happen
+	    }
+	  }
+	  if ($cSwitch(cNum=>3)) {	  // Irrigation components
+	    for (ii=0; ii<i_size; ii++) {
+	      $cStreamIrr(n=>i,m=>j,ci=>ii) *= $resStorage(n=>i,m=>j) - bflOut;
+	      $cStreamIrr(n=>i,m=>j,ci=>ii) += bflOut * $cAqWaterIrr(ci=>ii,nAqf=>indID);
+	      $cStreamIrr(n=>i,m=>j,ci=>ii) /= $resStorage(n=>i,m=>j);
+
+	      if ($cStreamIrr(n=>i,m=>j,ci=>ii) < 0) $cStreamIrr(n=>i,m=>j,ci=>ii) = 0;		// Clip - should not happen
+	      if ($cStreamIrr(n=>i,m=>j,ci=>ii) > 1) $cStreamIrr(n=>i,m=>j,ci=>ii) = 1;		// Clip - should not happen
+	    }
+	  }
+	  if ($cSwitch(cNum=>4)) {	  // Water temperature
+	    $cStreamTw(n=>i,m=>j) *= $resStorage(n=>i,m=>j) - bflOut;
+	    $cStreamTw(n=>i,m=>j) += bflOut * $grndWaterTw(n=>i,m=>j);
+	    $cStreamTw(n=>i,m=>j) /= $resStorage(n=>i,m=>j);
+	  }
+	  if ($cSwitch(cNum=>5)) {	  // Runoff mask
+	    for (ii=0; ii<mm_size; ii++) {
+	      $cStreamMsk(n=>i,m=>j,mm=>ii) *= $resStorage(n=>i,m=>j) - bflOut;
+	      $cStreamMsk(n=>i,m=>j,mm=>ii) += bflOut * $rnffMask(n=>i,m=>j,mm=>ii);
+	      $cStreamMsk(n=>i,m=>j,mm=>ii) /= $resStorage(n=>i,m=>j);
+
+	      if ($cStreamMsk(n=>i,m=>j,mm=>ii) < 0) $cStreamMsk(n=>i,m=>j,mm=>ii) = 0;		// Clip - should not happen
+	      if ($cStreamMsk(n=>i,m=>j,mm=>ii) > 1) $cStreamMsk(n=>i,m=>j,mm=>ii) = 1;		// Clip - should not happen
+	    }
+	  }
+	  if ($cSwitch(cNum=>6)) {	  // DIN
+	    $cStreamDIN(n=>i,m=>j) *= $resStorage(n=>i,m=>j) - bflOut;
+	    $cStreamDIN(n=>i,m=>j) /= $resStorage(n=>i,m=>j);
+
+	    $cStmConDIN(n=>i,m=>j) *= $resStorage(n=>i,m=>j) - bflOut;
+	    $cStmConDIN(n=>i,m=>j) /= $resStorage(n=>i,m=>j);
+	  }
+	}
+			// Recharge to aquifer sums
+	if (bflIn) {
+	  if ($cSwitch(cNum=>2)) {	  // Primary components
+	    for (ii=0; ii<p_size; ii++)	prmSum[indID][ii] += bflIn * $cStreamP(n=>i,m=>j,cp=>ii);
+	  }
+	  if ($cSwitch(cNum=>3)) {	  // Irrigation components
+	    for (ii=0; ii<i_size; ii++)	irrSum[indID][ii] += bflIn * $cStreamIrr(n=>i,m=>j,ci=>ii);
+	  }
+	}
+      }
+    }	// End of per pixel loop
+
+	//////////////////////////////////////////////////
+	// Recharge to aquifer calcualtions
+    if ($cSwitch(cNum=>2)) {	  // Primary components
+      for (i=0; i<a_size; i++) {
+	for (ii=0; ii<p_size; ii++) {
+	  $cAqWaterP(cp=>ii,nAqf=>i) *= $aqfArr(k=>3,nAqf=>i) - $aqfArr(k=>1,nAqf=>i);
+	  $cAqWaterP(cp=>ii,nAqf=>i) += prmSum[i][ii];
+	  $cAqWaterP(cp=>ii,nAqf=>i) /= $aqfArr(k=>3,nAqf=>i);
+
+	  if ($cAqWaterP(cp=>ii,nAqf=>i) < 0) $cAqWaterP(cp=>ii,nAqf=>i) = 0;		// Clip - should not happen
+	  if ($cAqWaterP(cp=>ii,nAqf=>i) > 1) $cAqWaterP(cp=>ii,nAqf=>i) = 1;		// Clip - should not happen
+    } } }
+    if ($cSwitch(cNum=>3)) {	  // Irrigation components
+      for (i=0; i<a_size; i++) {
+	for (ii=0; ii<i_size; ii++) {
+	  $cAqWaterIrr(ci=>ii,nAqf=>i) *= $aqfArr(k=>3,nAqf=>i) - $aqfArr(k=>1,nAqf=>i);
+	  $cAqWaterIrr(ci=>ii,nAqf=>i) += irrSum[i][ii];
+	  $cAqWaterIrr(ci=>ii,nAqf=>i) /= $aqfArr(k=>3,nAqf=>i);
+
+	  if ($cAqWaterIrr(ci=>ii,nAqf=>i) < 0) $cAqWaterIrr(ci=>ii,nAqf=>i) = 0;		// Clip - should not happen
+	  if ($cAqWaterIrr(ci=>ii,nAqf=>i) > 1) $cAqWaterIrr(ci=>ii,nAqf=>i) = 1;		// Clip - should not happen
+    } } }
+
+	// Free OS memory
+    for (i=0; i<a_size; i++) {
+      free(prmSum[i]);
+      free(irrSum[i]);
+    }
+');
+
+#######################################################################
+
+pp_def('update_Aqf_comp', HandleBad => 1,
+  Pars => 'double aqfArr(k,nAqf); 
+    double cAqWater(cc,nAqf);	double	cWater(n,m,cc);   
+    int    aquiferID(n,m);	int     index_ID(iAqf);',
+  Code => '
+		// Dimension constants
+    int n_size = $SIZE(n);	int a_size = $SIZE(nAqf);
+    int m_size = $SIZE(m);	int c_size = $SIZE(cc);
+    int k_size = $SIZE(k);	// Hash keys: 0=StoragePrev; 1=Storage
+
+		// General internal/private variables
+    int    i, j, ii, indID;
+
+		// Dynamic variables, and their initialization
+    double *cmpSum[a_size];
+    for (i=0; i<a_size; i++) {				// Memory allocation
+      cmpSum[i] = (double *)malloc(c_size * sizeof(double));
+    }
+    for (i=0; i<a_size; i++) {				// Array initialization
+      for (ii=0; ii<c_size; ii++) { cmpSum[i][ii] = 0; }
+    }
+
+	//////////////////////////////////////////////////
+	//////////	Processing	//////////////////
+
+    for (j=0; j<m_size; j++) {
+      for (i=0; i<n_size; i++) {
+	if ( $ISBAD($aquiferID(n=>i,m=>j)) || $aquiferID(n=>i,m=>j) < 1 ) continue;
+	indID	= $aquiferID(n=>i,m=>j);
+	indID	= $index_ID(iAqf=>indID);
+		///// Accumulate the component
+	for (ii=0; ii<c_size; ii++) cmpSum[indID][ii] += $cWater(n=>i,m=>j,cc=>ii);
+      }
+    }
+
+	//////////////////////////////////////////////////
+	// Calcualte new component compositions
+    for (i=0; i<a_size; i++) {
+      for (ii=0; ii<c_size; ii++) {
+	$cAqWater(cc=>ii,nAqf=>i) *= $aqfArr(k=>0,nAqf=>i);
+	$cAqWater(cc=>ii,nAqf=>i) += cmpSum[i][ii];
+	$cAqWater(cc=>ii,nAqf=>i) /= $aqfArr(k=>1,nAqf=>i);
+
+	if ($cAqWater(cc=>ii,nAqf=>i) < 0) $cAqWater(cc=>ii,nAqf=>i) = 0;		// Clip - should not happen
+	if ($cAqWater(cc=>ii,nAqf=>i) > 1) $cAqWater(cc=>ii,nAqf=>i) = 1;		// Clip - should not happen
+    } }
+
+	// Free OS memory
+    for (i=0; i<a_size; i++) { free(cmpSum[i]); }
+');
+
+#######################################################################
+
+pp_def('add_Aqf_comp', HandleBad => 1,
+  Pars => 'double cWater(n,m,cc); 
+    double waterAdd(n,m);	double	cAqWater(cc,nAqf);
+    int    aquiferID(n,m);	int	index_ID(iAqf);',
+  Code => '
+		// Dimension constants
+    int n_size = $SIZE(n);	int a_size = $SIZE(nAqf);
+    int m_size = $SIZE(m);	int c_size = $SIZE(cc);
+
+		// General internal/private variables
+    int    i, j, ii, indID;
+
+	//////////////////////////////////////////////////
+	//////////	Processing	//////////////////
+
+    for (j=0; j<m_size; j++) {
+      for (i=0; i<n_size; i++) {
+	if ( $ISBAD($aquiferID(n=>i,m=>j)) || $aquiferID(n=>i,m=>j) < 1 ) continue;
+	indID	= $aquiferID(n=>i,m=>j);
+	indID	= $index_ID(iAqf=>indID);
+		///// Accumulate the component
+	for (ii=0; ii<c_size; ii++) $cWater(n=>i,m=>j,cc=>ii) += $waterAdd(n=>i,m=>j) * $cAqWater(cc=>ii,nAqf=>indID);
+      }
+    }
+');
+
+#######################################################################
+#######################################################################
+# Note:	Two function below is a workaround of an unexplained memory leak
+#	in many aquifer loop while usingg $pdl->indexND(...) function.
+#	My guess is that it holds on the parend piddle, becouse it is
+#	reused in each aquifer loop cycle. So the OS holds on it, but
+#	misses to send to the GC (sometimes?!) after the loop exit.
+#
+#	This function does the same as $pdl->indexND()->sum,
+#	but without creating a child for taking the sum.
+
+pp_def('aqfIdx_sum', HandleBad => 1,
+  Pars => 'double array(n,m);	int idx(xy,pix);
+    double [o] sum();',
+  Code => '
+    int p_size = $SIZE(pix);	int i, ix, iy;
+    double tmp = 0;
+
+    for (i=0; i<p_size; i++) {
+      ix   = $idx(xy=>0,pix=>i);
+      iy   = $idx(xy=>1,pix=>i);
+      tmp += $array(n=>ix,m=>iy);
+    }
+    $sum() = tmp;
 ');
 
 #######################################################################
