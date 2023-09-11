@@ -19,16 +19,18 @@ This directory contains:
 **WBM.conf**: configuration file, contains directory and file paths to other inputs. <br/>
 **RIMS.pm**: custom perl library required by WBM   <br/>
 **RIMS.conf**: configuration file for RIMS.pm. <br/>
-**build_spool.pl**: script called by WBM to generate binary input files from primary input data. <br/>
 **WBM_dataCube_expand.csv**: list of WBM output variables, and info required for temporal aggregation by utilites/temporal_aggregation.pl. <br/>
 **RIMS/**: directory containing RIMS perl library code. <br/>
 
 ### utilities/
 This directory contains:  
+**build_spool.pl**: script called by WBM to generate binary input files from primary input data. <br/>
 **networkTools.pl**: perl code to extract subsets of global digital river networks. <br/>
 **networkTools_manual.init**: instruction manual for how to use networkTools.pl. <br/>
 **spatial_aggregation.pl**: spatial aggregation of WBM output. Can be called by wbm.pl. <br/>
 **temporal_aggregation.pl**: temporal aggregation of WBM output. Can be called by wbm.pl. <br/>
+**flip_nc.pl**: flips row order in NetCDF files, if needed.  Can be called by wbm.pl.<br/>
+**shift_pm.pl**: shifts/wraps raster datasets symmetrically around prime meridian in VRT files. <br/>
 
 ## Code release notes
 This version of WBM is being released by the [Water Systems Analysis Group](https://wsag.unh.edu/) at the [University of New Hampshire](https://www.unh.edu/). Other research groups use unique development versions of WBM that may differ from the code provided here. If you use this model, please cite the following [paper](https://gmd.copernicus.org/articles/15/7287/2022/):     <br/>
