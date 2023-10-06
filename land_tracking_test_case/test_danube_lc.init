@@ -1,0 +1,119 @@
+{
+ID		=> 'test_danube_lc',
+Comment		=> 'junk, 6min Network, Danube basin, water tracking by land cover',
+Project		=> 'WBM_test',
+MT_Code_Name	=>  {
+          MT_ID		=> 'WMB_test_danube_lc',
+          Output_dir	=> '/net/nfs/rapid/data/WBM_TrANS/Tracking/test_danube_lc',
+          Run_End	=> '2019-12-31',
+          Run_Start	=> '2000-01-01'
+        },
+Spinup		=>  {
+          End		=> '1999-12-31',
+          Force_ID_Date	=> '',
+          Loops		=> 3,
+          Save_Vars	=> '',
+          Start		=> '1995-01-01',
+          State_ID	=> ''
+        },
+Output_vars	=> 'discharge',
+MT_Precip	=>  {
+          Primary	=> 'merra2_prectot_d'
+        },
+precipFraction	=> '',
+MT_airT		=>  {
+          Primary	=> 'merra2_t2m_d'
+        },
+Network		=> '/net/nfs/zero/data3/WBM_TrANS/data/Danube_6min/Danube_6min.asc',
+Projection	=> 'epsg:4326',
+Routing		=> 'LRR',
+wbmParam	=> '',
+ConnectivityNetwork	=>  {
+          EndYear	=> 'EndYear',
+          File		=> '/net/nfs/zero/data3/WBM_TrANS/spreadsheets/InterBasinWaterTransferDatabase.csv',
+          FromLat	=> 'STN6 From Latitude',
+          FromLon	=> 'STN6 From Longitude',
+          ID		=> 'ID',
+          MaxFlow	=> 'MaxFlow',
+          MinFlow	=> 'MinFlow',
+          PercentFlow	=> 'PercentFlow',
+          SkipLines	=> 7,
+          Speculative	=> 1,
+          StartYear	=> 'StartYear',
+          ToLat		=> 'STN6 To Latitude',
+          ToLon		=> 'STN6 To Longitude',
+          TransferLen	=> 'Length of Transfer',
+          Use		=> 'Use'
+        },
+Reservoirs	=>  {
+          Area		=> 'AREA_SKM',
+          Capacity	=> 'CAP_MCM',
+          CatchArea	=> 'CATCH_SKM',
+          File		=> '/net/nfs/zero/data3/WBM_TrANS/spreadsheets/GRanD_dams_v1_1.csv',
+          ID		=> 'GRAND_ID',
+          IrrFrequency	=> 'Merra_irrigationGross_Freq_dc',
+          Lat		=> 'LAT_DD',
+          Lon		=> 'LONG_DD',
+          Purpose	=> 'MAIN_USE',
+          SkipLines	=> 0,
+          StartYear	=> 'YEAR'
+        },
+soilAWCapacity	=> '',
+FieldCap	=> 'NETCDF:/net/nfs/zero/data3/WBM_TrANS/data/Global_Terrain_FieldCapacityWBM_LTXXXX_30min.nc:STNetwork',
+WiltingPoint	=> 'NETCDF:/net/nfs/zero/data3/WBM_TrANS/data/Global_Terrain_WiltingPointWBM_LTXXXX_30min.nc:STNetwork',
+rootingDepth	=> '/net/nfs/yukon/raid0/data/WBM_data/defaults/rootingDepth/Global_Terrain_RootDepthWBM_LTXXXX_30min.asc',
+PET		=> 'Hamon',
+MT_windU	=> '',
+MT_windV	=> '',
+MT_cloudFr	=> '',
+MT_humidity	=> '',
+MT_albedo	=> '',
+airT_yc		=> '',
+openWaterEvap	=> '',
+Glaciers	=> '',
+Aquifers	=> '',
+Springs		=> '',
+snowBands	=> '',
+lapseDownscale	=> '',
+DIN		=> '',
+Runoff_mask	=>  {
+          ColFile	=> 'FractionFile',
+          colID		=> 'ID',
+          colName	=> 'Description',
+          maskList	=> '/net/nfs/zero/data3/WBM_TrANS/spreadsheets/LandCoverParameters.csv'
+        },
+Impervious	=> '/net/nfs/ipswich/raid/atlas/data/impervious/imp.asc',
+openWater	=>  {
+          MaskDataset	=> '/net/nfs/ipswich/raid/atlas/data/UMD_landcover/zero_1km.tif',
+          openWaterMaskValue	=> 0
+        },
+canopyHt	=> '',
+MT_LAI		=> '',
+WaterDemand	=> '',
+landCollapse	=> 'average',
+LandCover	=> '',
+Irrigation	=>  {
+          CropAreaFrac	=> 'croplandarea',
+          CropParFile	=> '/net/nfs/zero/data3/WBM_TrANS/spreadsheets/MIRCA_complete_landCoverParameters.csv',
+          ExtraCoeff	=> 1,
+          IrrEfficiency	=> 'NETCDF:/net/nfs/zero/data3/WBM_TrANS/data/Global_Crops_IrrEfficiencyGlobalExtent_30min.nc:IrrEfficiency',
+          Order		=> 1,
+          ReturnCoeff	=> 1,
+          SW_GW_ratio	=> '/net/nfs/zero/data3/WBM_TrANS/data/FAO_SWGW_ratio_mod.tif',
+          SearchDist	=> 150,
+          irrGrwthRefYr	=> 2000,
+          ricePaddyDepth	=> 50,
+          ricePercolation	=> 'NETCDF:/net/nfs/zero/data3/WBM_TrANS/data/RicePercolationRate.nc:RicePercolationRate'
+        },
+WM_mod_precip	=> '',
+WM_obs_precip	=> '',
+WM_mod_airT	=> '',
+WM_obs_airT	=> '',
+PostProcessing	=>  {
+          Forks		=> 24,
+          Run		=> 1,
+          Temporal_Aggregation	=> 1
+        },
+WaterRights	=> '',
+USGS		=> ''
+}
