@@ -39,8 +39,9 @@
 #	Apr 2021	Added option to output files in nc3 for classic (v.3) NetCDF format
 #	Aug 2021	Removed Proj4 module dependencies.
 #	Aug 2022	Transition to GDAL FFI interface.
+#	Oct 2023	Added "no aggregation" option
 #
-#	Version- 23.4.0	(YY.M.#) - Small change if not listed above
+#	Version- 23.10.0	(YY.M.#) - Small change if not listed above
 #
 #######################################################################
 
@@ -90,7 +91,7 @@ if ($type) {
   $type = $data_type{lc($type)};
 }
 
-my @agg_type = qw/Average Cumulative Category/;
+my @agg_type = qw/Average Cumulative None/;
 die "\"-rr NUMBER\"- NUMBER must be positive...\n" if $rm_rec < 0;
 
 #######################################################################
@@ -221,7 +222,9 @@ foreach my $file (@$file_List)
       next;
     }
     else {
-      my $f_list = trim_file_list($file_list,$date_list,$$date_List[$count],$search);
+      my  $time_value	= $names_m{Time_Series} =~ m/daily[\w]*\{\d+\}/ ?
+			  sprintf("%.0f",$nc_Time[$count]*24) : $nc_Time[$count];
+      my  $f_list	= trim_file_list($file_list,$date_list,$$date_List[$count],$search);
       my ($info,$gT,$data,$sigma) = aggregate($f_list,$agg_type,$compression);
 
 		### Scale/Offset the output data if requested
@@ -234,10 +237,12 @@ foreach my $file (@$file_List)
 	$data	= $data ->slice(':,-1:0');
 	$sigma	= $sigma->slice(':,-1:0');
       }
+		### Case of no aggregation
+	$sigma	= 0 if $agg_type[$agg_type] eq 'None';
 
 		### Save aggregation data
       if (-e $path) {
-	update_nc($path,$names_m{Var_Name},$data,$sigma,$nc_Time[$count],$band);
+	update_nc($path,$names_m{Var_Name},$data,$sigma,$time_value,$band);
 	printf "\tFile- %s: updated (%s)\n",basename($path),$$date_List[$count] if $verbose;
       }
       else {
@@ -252,12 +257,12 @@ foreach my $file (@$file_List)
 	    printf "\tFile- %s: updated (%s)\n",basename($path),"Nodata, band=$b" if $verbose;
 	  }
 			### Save good data
-	  update_nc($path,$names_m{Var_Name},$data,$sigma,$nc_Time[$count],$band);
+	  update_nc($path,$names_m{Var_Name},$data,$sigma,$time_value,$band);
 	  printf "\tFile- %s: updated (%s)\n",basename($path),$$date_List[$count] if $verbose;
 	}
 	else {
 # 	die "Not coded to create NetCDF file with BAND # gt 1..." if $band != 1;
-	  write_nc($path,$nc_Time[$count],$lat,$lon,$data,$sigma,$type,$info,\%names_d,\%names_m,\@metadata,$credits,$gT,$nc3);
+	  write_nc($path,$time_value,$lat,$lon,$data,$sigma,$type,$info,\%names_d,\%names_m,\@metadata,$credits,$gT,$nc3);
 	  printf "\tFile- %s: written (%s)\n",basename($path),$$date_List[$count] if $verbose;
 	}
       }
@@ -281,7 +286,6 @@ exit;
 ######################  Functions  ####################################
 
 sub make_search_par
-
 {
   my ($ts_d,$ts_m) = @_;
 
@@ -323,7 +327,6 @@ sub make_search_par
 #######################################################################
 
 sub aggregate
-
 {
   my ($list,$agg_type,$compr) = @_;
   my ($agg_info,$agg_gT,$agg_data,$agg_data_sq);
@@ -349,7 +352,7 @@ sub aggregate
   if ($agg_type == 0) {
     $agg_data /= $count;
   }			### Cumulative
-  elsif ($agg_type == 1) {}
+  elsif ($agg_type == 1 || $agg_type == 2) {}
 			### Unknown
   else { die "Unknown aggregation method...\n"; }
 
@@ -363,7 +366,6 @@ sub aggregate
 #######################################################################
 
 sub read_GDAL
-
 {
   my ($file,$b,$compr) = @_;
 
@@ -410,7 +412,6 @@ sub make_Lon_Lat
 #######################################################################
 
 sub write_nc
-
 {
   my ($file,$time,$lat,$lon,$data,$sigma,$type,$info,$names_d,$names_m,$metadata,$credits,$gT,$nc3) = @_;
 
@@ -434,13 +435,14 @@ sub write_nc
   my $proj_crs	= crs_to_Obj($$names_m{Projection});
   my $wkt	= $proj_crs->Export('Wkt');		### Convert to Wkt fromat
   my($xVr,$yVr)	= Geo::GDAL::FFI::OSRIsGeographic($$proj_crs) ? qw(lon lat) : qw(x y);
+  my $TS_str	= parse_TS($$names_m{Time_Series});
 
 			###  Create NetCDF attributes
   my %var_att	= (
 	'missing_value'	=> $fill_val,
 	'long_name'	=> $$metadata[0],
 	'units'		=> $$metadata[1],
-	'format'	=> $$metadata[2],
+	'query_format'	=> $$metadata[2],
 	'aggregation'	=> $$metadata[3],
 	'source_TS'	=> $$metadata[4],
 	'grid_mapping'	=> 'crs'
@@ -450,7 +452,7 @@ sub write_nc
 	'missing_value'	=> $fill_val,
 	'long_name'	=> "Sigma of $$metadata[0]",
 	'units'		=> $$metadata[1],
-	'format'	=> $$metadata[2],
+	'query_format'	=> $$metadata[2],
 	'source_TS'	=> $$metadata[4],
 	'grid_mapping'	=> 'crs'
   );
@@ -462,9 +464,9 @@ sub write_nc
   );
 
   my %time_att	= (
-	'units'		=> 'days since 1900-1-1',
+	'units'		=> $TS_str =~ m/hour/ ? 'hours since 1900-01-01T00:00' : 'days since 1900-01-01',
 	'long_name'	=> 'Time',
-	'resolution'	=> $$names_m{Time_Series},
+	'resolution'	=> $TS_str,
 	'calendar'	=> $calendar_str{$calendar}
   );
 
@@ -483,14 +485,14 @@ sub write_nc
 	'title'		=> 'Temporal aggregation of data',
 	'history'	=> 'Created on '.date_now()." by $$credits[1] ($$credits[2])",
 	'projection'	=>  $$names_m{Projection},
-	'Temporal_Res.'	=>  $$names_m{Time_Series},
+	'Temporal_Res.'	=>  $TS_str,
 	'NetCDF_driver'	=> 'NetCDF.' . $PDL::NetCDF::VERSION,
 	'source'	=> 'Unreferenced Data',
 	'institution'	=>  $$credits[3],
 	'references'	=> 'https://www.wsag.unh.edu',
 	'FilePath'	=>  $file,
 	'System'	=>  get_file_path()->{SYSTEM},
-		$$names_m{Time_Series} =~ m/_clim/  ? (
+		$TS_str =~ m/_clim/  ? (
 	'AggrRangeStart'=> $$names_d{Start_Date},
 	'AggrRangeEnd'	=> $$names_d{End_Date}) : ()
   );
@@ -512,15 +514,16 @@ sub write_nc
   $nc->putslice($var_name,[$xVr,$yVr,'time'],[$$info[0],$$info[1],PDL::NetCDF::NC_UNLIMITED()],
 	[0,0,0], [$data->dims,1], ($type ? $data->$type : $data)->slice(':,-1:0'), $slice_opt);
   $nc->putslice($sig_name,[$xVr,$yVr,'time'],[$$info[0],$$info[1],PDL::NetCDF::NC_UNLIMITED()],
-	[0,0,0], [$data->dims,1], ($type ? $sigma->$type: $sigma)->slice(':,-1:0'),$slice_opt);
+	[0,0,0], [$data->dims,1], ($type ? $sigma->$type: $sigma)->slice(':,-1:0'),$slice_opt)
+	if ref($sigma) eq 'PDL';
 
 			###  Write Attributes
   foreach my $key (keys %global_att) { $nc->putatt ($global_att{$key}, $key); }
   foreach my $key (keys %time_att)   { $nc->putatt ($time_att{$key},   $key, 'time'); }
   foreach my $key (keys %lat_att)    { $nc->putatt ($lat_att{$key},    $key, $yVr); }
   foreach my $key (keys %lon_att)    { $nc->putatt ($lon_att{$key},    $key, $xVr); }
-  foreach my $key (keys %var_att)    { $nc->putatt ($var_att{$key},    $key, $var_name); }
-  foreach my $key (keys %sig_att)    { $nc->putatt ($sig_att{$key},    $key, $sig_name); }
+  foreach my $key (keys %var_att)    { $nc->putatt ($var_att{$key},    $key, $var_name); } if (ref($sigma) eq 'PDL') {
+  foreach my $key (keys %sig_att)    { $nc->putatt ($sig_att{$key},    $key, $sig_name); } }
   foreach my $key (keys %crs_att)    { $nc->putatt ($crs_att{$key},    $key, 'crs'); }
 
   $nc->close();
@@ -529,22 +532,32 @@ sub write_nc
 #######################################################################
 
 sub update_nc
-
 {
   my ($file,$var_name,$data,$sigma,$time,$band) = @_;
   my $sig_name	= $var_name.'_sigma';
 			### Open NetCDF file and write data
   my $ncobj = new PDL::NetCDF($file, {MODE => O_RDWR, REVERSE_DIMS => 1});
-  $ncobj->putslice('time',   [], [], [$band-1],    [1],            long($time));
+  $ncobj->putslice('time',   [], [], [$band-1],    [1],             long($time));
   $ncobj->putslice($var_name,[], [], [0,0,$band-1],[$data->dims,1], $data->slice(':,-1:0'), {SHUFFLE => 0, DEFLATE => 1});
-  $ncobj->putslice($sig_name,[], [], [0,0,$band-1],[$data->dims,1],$sigma->slice(':,-1:0'), {SHUFFLE => 0, DEFLATE => 1});
+  $ncobj->putslice($sig_name,[], [], [0,0,$band-1],[$data->dims,1],$sigma->slice(':,-1:0'), {SHUFFLE => 0, DEFLATE => 1})
+	if ref($sigma) eq 'PDL';
   $ncobj->close();
 }
 
 #######################################################################
 
-sub trim_file_list
+sub parse_TS
+{
+  my $MT_TS =  shift() . '';	# clone just in case
+     $MT_TS =  sprintf "%d-hourly",24/$1 if $MT_TS =~ m/daily[\w]*\{(\d+)\}/;
+     $MT_TS =~ s/^1-//;
 
+  return $MT_TS;
+}
+
+#######################################################################
+
+sub trim_file_list
 {
   my ($list,$dates,$date,$search) = @_;
 
@@ -573,7 +586,6 @@ sub trim_file_list
 #######################################################################
 
 sub trimDates
-
 {
   my @dateS = split m/-/,$_[0];
   my @dateE = split m/-/,$_[1];
@@ -605,7 +617,6 @@ sub trimDates
 #######################################################################
 
 sub pushDates
-
 {
   unless ($_[5] =~ m/_clim/) {
     if ($_[5] =~ m/monthly/) {
@@ -680,7 +691,6 @@ sub read_init
 #######################################################################
 
 sub time_used
-
 {
   my ($t_start,$t_end) = @_;
 
@@ -695,7 +705,6 @@ sub time_used
 #######################################################################
 
 sub usage
-
 {
   my $app_name = basename($0);
   print <<EOF;
@@ -715,7 +724,7 @@ sd	Start date (YYYY-MM-DD) for the aggregation.
 ed	End   date (YYYY-MM-DD) for the aggregation.
 ot	Output data type (byte, short, long, float, double). Default is float.
 a	Aggregation type. TYPE is 0 for average (default), 1 for cumulative,
-	  2 for category. Note- option 2 is not done yet.
+	  2 for "no aggregation" (e.g. adding CF-1.6 convention to NetCDF files).
 so	Scale and offset the output data. Consider changing units with -mtd flag:
 	  -mtd ":NEW_UNITS:"
 p	Patch input datasets nodata with value PATCH.

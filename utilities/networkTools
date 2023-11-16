@@ -24,8 +24,9 @@
 #	Jan 2022	Added Job # 10-11 to calculate landcover upstream percent and average in each network pixel
 #	Apr 2022	Added qgis style file for the flow direction shape file group
 #	Aug 2022	Transition to GDAL FFI interface.
+#	Oct 2023	New job sequence and change of init file format.
 #
-#	Version:	23.8.0
+#	Version:	23.10.1
 #
 #######################################################################
 
@@ -71,157 +72,25 @@ my %runIO		= read_init($input_file);
    $runIO{Net_proj}	= 'epsg:4326'	unless $runIO{Net_proj};
    $runIO{Net_projForce}= 0		unless $runIO{Net_projForce};
    $runIO{basinID_file}	= ''		unless $runIO{basinID_file};
+   $runIO{basinAtt_file}= ''		unless $runIO{basinAtt_file};
    $runIO{gdal_transl}	= get_file_path()->{gdal_translate};
 
-my $file_ntwk		= $runIO{Net_file}	? $runIO{Net_file} : '';
-my $file_bIDs		= $runIO{basinID_file}	? $runIO{basinID_file} : '';
-my $file_upArea		= $runIO{upArea_file}	? $runIO{upArea_file}  : '';
-my $flag_msk		= $runIO{stnMask}	? $runIO{stnMask}  : 0;
+my $file_ntwk		= $runIO{Net_file}	? $runIO{Net_file}	: '';
+my $file_bIDs		= $runIO{basinID_file}	? $runIO{basinID_file}	: '';
+my $file_bAtt		= $runIO{basinAtt_file}	? $runIO{basinAtt_file}	: '';
+my $file_upArea		= $runIO{upArea_file}	? $runIO{upArea_file}	: '';
+my $flag_msk		= $runIO{stnMask}	? $runIO{stnMask}	: 0;
 my $flag_preclip	= 0;
 my $area_opt		= {FORCE => $runIO{Net_projForce}};
 
+if($file_upArea) {
+  die "\nUpstream area file does not exist :\n   $file_upArea\nAborthing...\n\n" unless -e $file_upArea;
+}
 open STDOUT, '>/dev/null' unless $verbose;
 my $CT_header	= ['ToCell','ToCellX','ToCellY','X','Y','StreamOrder','Lon','Lat','SubbasinArea','DistanceToMouth'];
 
 #######################################################################
-#############   Job # 1 - Build Cell Table   ##########################
-
-if ($runIO{cell_table}) {
-  print	"\n\tCell Table job. The network to process:\n";
-  die	"Network file is not given or does not exists. Aborting...\n\n" unless -e $file_ntwk;
-  print	"$file_ntwk\n\n";
-
-		### Setting defaults for output flags
-  my $flag_csv	= set_default($runIO{cell_table}{CT_csv},		0);
-  my $flag_dat	= set_default($runIO{cell_table}{CT_dat},		0);
-  my $flag_IDs	= set_default($runIO{cell_table}{basinIDs},		0);
-  my $flag_sOd	= set_default($runIO{cell_table}{streamOrder},		0);
-  my $flag_mDs	= set_default($runIO{cell_table}{mouthDistance},	0);
-  my $flag_upA	= set_default($runIO{cell_table}{upstrArea},		0);
-  my $flag_shp	= set_default($runIO{cell_table}{Net_shape},		0);
-  my $flag_EnR	= set_default($runIO{cell_table}{endorheic},		0);
-  my $info_EnR	= set_default($runIO{cell_table}{endorheic_csv},	0);
-  my $bffr_EnR	= set_default($runIO{cell_table}{endorheicBuffer},	0);
-  my $segm_EnR	= set_default($runIO{cell_table}{segmentation},		0);
-  my $upAreaFmt	= set_default($runIO{cell_table}{upstrAreaFmt},	   '%.1f');
-  my $oceanMsk	= set_default($runIO{cell_table}{oceanMask_file},      '');
-
-		### Making file names
-  my $file_ctbl	= $runIO{cell_table}{output_file} || $file_ntwk;
-     $file_ctbl			=~ s/\.\w+$/.dat/;
- (my $file_ctab	= $file_ctbl)	=~ s/\.\w+$/.csv/;
- (my $file_sOdr	= $file_ctbl)	=~ s/\.\w+$/_strmOrder.asc/;
- (my $file_mDst	= $file_ctbl)	=~ s/\.\w+$/_mouthDist.asc/;
- (my $file_upAr	= $file_ctbl)	=~ s/\.\w+$/_upstrArea.asc/;
- (my $file_IDs	= $file_ctbl)	=~ s/\.\w+$/_IDs.asc/;
- (my $file_EnR	= $file_ctbl)	=~ s/\.\w+$/_EnR.asc/;	# IDs  of endorheic basins
- (my $file_EnRs	= $file_ctbl)	=~ s/\.\w+$/_EnR.csv/;	# Info of endorheic basins
- (my $file_msk	= $file_ctbl)	=~ s/\.\w+$/_msk.asc/;	# Network mask file
-  if($file_upArea) {
-     die "\nUpstream area file does not exist :\n   $file_upArea\nAborthing...\n\n" unless -e $file_upArea;
-     $file_upAr	= $file_upArea;
-     $flag_upA	= 0; }
-  my $shape_dir	= dirname($file_ctbl).'/Network_shape_files/';
- (my $file_shp	= $shape_dir .	basename(   $file_ctbl))=~s/\.\w+$//;
-     prepare_dir( $file_ctbl);	prepare_dir($file_shp)	if $flag_shp;
-
-		### Read Network data
-  print "Reading flow directon data...\n";
-  my @time		= (Benchmark->new);
-  my $extent		= get_extent($file_ntwk, $runIO{Net_proj});
-  my $flowDir		= $$extent{mask};
-  my($colTo,$rowTo)	= flow_to($flowDir);		# Modifies $flowDir too
-  my $basinID		= $file_bIDs ?
-	read_GDAL($extent, {'Projection'=>$runIO{Net_proj}}, 0, $file_bIDs, 1, -9999) : 0;
-  my $mask		= $flowDir->isgood	if $flag_msk;
-  printf "   File \"%s\": %s\n", basename($file_ntwk), netwkString($flowDir);
-  push @time, Benchmark->new;
-  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
-
-		### Check curcularity of the Network
-  printf "Checking curcularity of the Network (%d cells)...\n",$flowDir->ngood;
-  check_circularityC($flowDir, $$extent{gTransform});			# C-coded version
-  push @time, Benchmark->new;
-  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
-
-		### Calculate upstream area
-  print((-e $file_upArea?'Reading':'Calculating')," upstream area...\n");
-  my $cell_area	= cell_area(lonLat($extent),$extent,$area_opt);
-  my $up_area	= -e $file_upArea ? read_raster($file_upAr) : byte($flowDir)->upstrAccumAll($cell_area);
-  die "\nUpstream area data in the file provided:\n   $file_upArea\ndoes not match network grid. Aborting...\n\n"
-	if $up_area->dim(0)!=$cell_area->dim(0) || $up_area->dim(1)!=$cell_area->dim(1);
-  push @time, Benchmark->new;
-  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
-
-		### Build Cell table
-  print "Shaping Cell Table...\n";
-  my ($area,$cell_pdl) = cell_table($up_area,$flowDir,$colTo,$rowTo);
-  push @time, Benchmark->new;
-  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
-  
- 		### Calculate Stream Order
-  print 'Calculating stream order... ';
-  my  $strmOrder = $cell_pdl->streamOrder($colTo,$rowTo);
-  printf "Max value = %d\n", $strmOrder->max;
-  push @time, Benchmark->new;
-  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
-
- 		### Calculate Distance to mouth
-  print 'Calculating distance to mouth... ';
-  my  $mDist	= $flowDir->mouthDistance(lonLat($extent));
-  printf "Max distance = %.1f km\n", $mDist->max;
-  push @time, Benchmark->new;
-  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
-
-		### Build basin IDs
-  unless (ref($basinID)) {
-  print "Building basin IDs...\n";
-    $basinID	= byte($flowDir)->basinIDs($cell_pdl);
-  push @time, Benchmark->new;
-  printf "\t%s\n",timestr(timediff($time[-1], $time[-2])); }
-
-		### Build endorheic basin IDs
-  my ($basinEnR, $hdr_EnR, $list_EnR);
-  if ($flag_EnR || $info_EnR) {		# Skip, if not needed (may take a long time to compute)
-    my $buffer	= floor($bffr_EnR/sqrt($cell_area))->lclip(1)->long;
-    my $ocean	= $oceanMsk ? read_GDAL($extent, {}, 0, $oceanMsk, 1, 1) : zeroes($basinID->dims);
-    my $land	= (($ocean==0) & ($basinID>0))->setvaltobad(0)->long;
-    print "Building endorheic basin IDs...";
-    $basinEnR	= endorheic_basins($basinID, $flowDir, $buffer, $segm_EnR, $land);
-    printf " %.2f %% of the Network cells are %d endorheic basins.\n",
-		100*($basinEnR->ngood/$basinID->ngood), $basinEnR->uniq->dim(0);
-    if ($info_EnR) {
-      $hdr_EnR	= [qw(basin_ID mouth_Lon mouth_Lat mouth_Col mouth_Row n_pixels area)];
-      $list_EnR	= info_EnR($extent, $basinEnR, $flowDir, $up_area); }
-    push @time, Benchmark->new;
-    printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
-  }
-
-		### Save data to files
-  print "Finishing and saving output files for this job...\n";
-  write_CT_csv(	  $file_ctab,$CT_header,$extent, $area,$cell_pdl,$strmOrder,$mDist)	if $flag_csv;
-  write_shape(	  $file_shp, $CT_header,$extent, $area,$cell_pdl,$strmOrder,$basinID)	if $flag_shp;
-  write_gridascii($file_sOdr,$strmOrder,$extent, {FORMAT => '%d'})			if $flag_sOd;
-  write_gridascii($file_mDst,$mDist,    $extent, {FORMAT => '%.3f'})			if $flag_mDs;
-  write_gridascii($file_upAr,$up_area,	$extent, {FORMAT => $upAreaFmt})		if $flag_upA;
-  write_gridascii($file_IDs, $basinID,	$extent, {FORMAT => '%d'})			if $flag_IDs;
-  write_gridascii($file_EnR, $basinEnR,	$extent, {FORMAT => '%d'})			if $flag_EnR;
-  write_gridascii($file_msk, $mask,	$extent, {FORMAT => '%d'})			if $flag_msk;
-  writeflex(	  $file_ctbl,$up_area,	$area,    $cell_pdl)				if $flag_dat;
-  write_csv(	  $file_EnRs,$hdr_EnR,  $list_EnR)					if $info_EnR;
-  push @time, Benchmark->new;
-  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
-  print "\n\tCell Table job is Done! Output files:\n";
-  map { print "   $$_[0]\n" if $$_[1]; } [$file_ctab,$flag_csv], [$file_ctbl,$flag_dat], [$file_sOdr, $flag_sOd],
-		[$file_mDst, $flag_mDs], [$file_upAr,$flag_upA], [$file_IDs,$flag_IDs ], [$file_EnR, $flag_EnR],
-		[$file_EnRs, $info_EnR],
-	map(["$file_shp.$_",$flag_shp],   qw(geojson shp kml));
-
-  print $separator if $runIO{preclip} || $runIO{subset} || $runIO{combine} || $runIO{subtract};
-}
-
-#######################################################################
-#############   Job # 2 - Build Network Preclip   #####################
+#############   Job # 1 - Build Network Preclip   #####################
 
 if ($runIO{preclip}) {
   print	"\n\tNetwork pre-clipping job. Master network to process:\n";
@@ -254,8 +123,8 @@ if ($runIO{preclip}) {
 }
 
 #######################################################################
-#############   Job # 3 - Build Network Subset   ######################
-JOB_3: {					# This block is needed to use "last" function to quit out of it
+#############   Job # 2 - Build Network Subset   ######################
+
 if ($runIO{subset}) {
   print	"\n\tNetwork subsetting job. Master network to process:\n";
   die	"Network file is not given or does not exists. Aborting...\n\n" unless -e $file_ntwk;
@@ -263,33 +132,12 @@ if ($runIO{subset}) {
 
 		### Setting defaults for output flags
   my $flag_trim	= set_default($runIO{subset}{trim_nodata},	0);
-  my $flag_CTa	= set_default($runIO{subset}{CT_csv},		0);
-  my $flag_CTb	= set_default($runIO{subset}{CT_dat},		0);
-  my $flag_IDs	= set_default($runIO{subset}{basinIDs},		0);
-  my $flag_sOd	= set_default($runIO{subset}{streamOrder},	0);
-  my $flag_mDs	= set_default($runIO{subset}{mouthDistance},	0);
-  my $flag_upA	= set_default($runIO{subset}{upstrArea},	0);
-  my $flag_EnR	= set_default($runIO{subset}{endorheic},	0);
-  my $info_EnR	= set_default($runIO{subset}{endorheic_csv},	0);
-  my $bffr_EnR	= set_default($runIO{subset}{endorheicBuffer},	0);
-  my $segm_EnR	= set_default($runIO{subset}{segmentation},	0);
-  my $upAreaFmt	= set_default($runIO{subset}{upstrAreaFmt},'%.1f');
-  my $oceanMsk	= set_default($runIO{subset}{oceanMask_file},  '');
 
 		### Making file names
   my $file_Net	= $runIO{subset}{output_file} || $file_ntwk;
      $file_Net eq $file_ntwk ?
 		  $file_Net	=~ s/\.\w+$/_Subset.asc/ :
 		  $file_Net	=~ s/\.\w+$/.asc/;
- (my $file_ctab	= $file_Net)	=~ s/\.\w+$/.csv/;
- (my $file_ctbl	= $file_Net)	=~ s/\.\w+$/.dat/;
- (my $file_sOdr	= $file_ctbl)	=~ s/\.\w+$/_strmOrder.asc/;
- (my $file_mDst	= $file_ctbl)	=~ s/\.\w+$/_mouthDist.asc/;
- (my $file_upAr	= $file_Net)	=~ s/\.\w+$/_upstrArea.asc/;
- (my $file_IDs	= $file_Net)	=~ s/\.\w+$/_IDs.asc/;
- (my $file_EnR	= $file_Net)	=~ s/\.\w+$/_EnR.asc/;	# IDs  of internal basins
- (my $file_EnRs	= $file_ctbl)	=~ s/\.\w+$/_EnR.csv/;	# Info of endorheic basins
- (my $file_msk	= $file_Net)	=~ s/\.\w+$/_msk.asc/;	# Network mask file
   prepare_dir(	  $file_Net);
 
 		### Read Network data
@@ -313,9 +161,9 @@ if ($runIO{subset}) {
   printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
 
 		### Calculate upstream area
-  print((-e $file_upAr?'Reading':'Calculating')," upstream area...\n");
+  print((-e $file_upArea?'Reading':'Calculating')," upstream area...\n");
   my $cell_area	= cell_area(lonLat($extent),$extent,$area_opt);
-  my $up_area	= -e $file_upAr ? read_raster($file_upAr) : byte($flowDir)->upstrAccumAll($cell_area);
+  my $up_area	= -e $file_upArea ? read_raster($file_upArea) : byte($flowDir)->upstrAccumAll($cell_area);
   push @time, Benchmark->new;
   printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
 
@@ -380,7 +228,7 @@ if ($runIO{subset}) {
 	unless -e $runIO{subset}{polygon}{file};
     die "  Missing or wrong input format for polygon IDs- it must be a list (see manual). Aborting...\n\n"
 	unless ref( $runIO{subset}{polygon}{polIDs} ) eq 'ARRAY';
-    die "  Shape file in pyligon subsetting requires key for a masking variable name. Aborting...\n\n"
+    die "  Shape file in polygon subsetting requires key for a masking variable name. Aborting...\n\n"
 	if $runIO{subset}{polygon}{file} =~ m/\.shp$/i && !$runIO{subset}{polygon}{shp_var};
 
     my $proj	= $runIO{subset}{polygon}{proj} ? $runIO{subset}{polygon}{proj} : 'epsg:4326';
@@ -472,7 +320,6 @@ if ($runIO{subset}) {
 
 		### Subsetting using upstream mask
     $basinNet	= condition($mask, $flowDir, -9999)->setvaltobad(-9999);
-    $bsnIDNet	= condition($mask, $basinID, -9999)->setvaltobad(-9999);
 
     push @time, Benchmark->new;
     printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
@@ -485,57 +332,26 @@ if ($runIO{subset}) {
 
   if (defined $ID) {		# Subset Network by basin IDs
     $basinNet	= condition($basinID->in($ID), $flowDir, -9999)->setvaltobad(-9999);
-    $bsnIDNet	= condition($basinID->in($ID), $basinID, -9999)->setvaltobad(-9999);
   }
 		### Trim subset grids, if requested
   delete $$extent{mask};	# clone does not work with PDL objects
   ($basinNet,$extNet) = trim($basinNet, dclone($extent), $flag_trim, $flag_preclip);
-  ($bsnIDNet,$extNet) = trim($bsnIDNet, dclone($extent), $flag_trim, 0);
-   $$extNet{mask}     =      $basinNet;
-  ($colTo,   $rowTo ) = flow_to($basinNet) if $flag_CTa || $flag_sOd;
-
-		### Make optional output data
-  print "Making optional output data:\n";
-  my($basinEnR, $hdr_EnR, $list_EnR, $stnMask, $cell_csv, $strmOrder, $mDist);
-     $cell_area	= cell_area(lonLat($extNet),$extNet);					   print "   Upstream area...\n";
-     $up_area	= byte($basinNet)->upstrAccumAll($cell_area);		   if($flag_EnR) { print "   Endorheic basins...\n";
-  my $buffer	= floor($bffr_EnR/sqrt($cell_area))->lclip(1)->long;
-  my $ocean	= $oceanMsk ? read_GDAL($extNet, {}, 0, $oceanMsk, 1, 1) : zeroes($bsnIDNet->dims);
-  my $land	= (($ocean==0) & ($bsnIDNet>0))->setvaltobad(0)->long;
-     $basinEnR	= endorheic_basins($bsnIDNet,$basinNet,$buffer,$segm_EnR,$land); if ($info_EnR) {
-     $hdr_EnR	= [qw(basin_ID mouth_Lon mouth_Lat mouth_Col mouth_Row n_pixels area)];
-     $list_EnR	= info_EnR($extNet, $basinEnR, $basinNet, $up_area); } }
-									   if($flag_msk) { print "   Network mask...\n";
-     $stnMask	= $basinNet->isgood; }	if($flag_sOd || $flag_mDs||$flag_CTa||$flag_CTb) { print "   Cell Table...\n";
-    ($area,$cell_pdl) = cell_table($up_area,$basinNet,flow_to($basinNet));
-     $strmOrder	= $cell_pdl->streamOrder($colTo,$rowTo);
-     $mDist	= $basinNet->mouthDistance(lonLat($extNet)); }
 
 		### Save data to files
   print "   Saving output files...\n\n";
-  write_CT_csv(	  $file_ctab,$CT_header,$extNet,$area,$cell_pdl,$strmOrder,$mDist)	if $flag_CTa;
-  writeflex(	  $file_ctbl,$up_area,	$area,        $cell_pdl)			if $flag_CTb;
   write_gridascii($file_Net, $basinNet, $extNet, {FORMAT => '%d'  });
-  write_gridascii($file_sOdr,$strmOrder,$extNet, {FORMAT => '%d'  })			if $flag_sOd;
-  write_gridascii($file_mDst,$mDist,    $extent, {FORMAT => '%.3f'})			if $flag_mDs;
-  write_gridascii($file_IDs, $bsnIDNet, $extNet, {FORMAT => '%d'  })			if $flag_IDs;
-  write_gridascii($file_upAr,$up_area,  $extNet, {FORMAT => $upAreaFmt})		if $flag_upA;
-  write_gridascii($file_EnR, $basinEnR, $extNet, {FORMAT => '%d'  })			if $flag_EnR;
-  write_gridascii($file_msk, $stnMask,  $extNet, {FORMAT => '%d'  })			if $flag_msk;
-  write_csv(	  $file_EnRs,$hdr_EnR,  $list_EnR)					if $info_EnR;
   push @time, Benchmark->new;
   printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
   print "\n\tSubsetting job is Done! Output files:\n";
-  map { print "   $$_[0]\n" if $$_[1]; } ["$file_Net :\t".netwkString($basinNet), 1],
-	[$file_ctab, $flag_CTa], [$file_ctbl, $flag_CTb], [$file_sOdr, $flag_sOd], [$file_mDst, $flag_mDs],
-	[$file_IDs,  $flag_IDs], [$file_upAr, $flag_upA], [$file_EnR,  $flag_EnR], [$file_msk,  $flag_msk],
-	[$file_EnRs, $info_EnR];
+  map { print "   $$_[0]\n" if $$_[1]; } ["$file_Net :\t".netwkString($basinNet), 1];
 
   print $separator if $runIO{combine} || $runIO{subtract};
-}}
+
+  $file_ntwk	= $file_Net;		# Carryover network file
+}
 
 #######################################################################
-#############   Job # 4 - Combining list of Networks   ################
+#############   Job # 3 - Combining list of Networks   ################
 
 if ($runIO{combine}) {
   print	"\n\tNetwork combine job. Sub-networks to combine:\n";
@@ -591,10 +407,12 @@ if ($runIO{combine}) {
 	[$file_msk,$flag_msk];
 
   print $separator if $runIO{subtract};
+
+  $file_ntwk	= $file_out;		# Carryover network file
 }
 
 #######################################################################
-#############   Job # 5 - Subtracting list of Networks   ##############
+#############   Job # 4 - Subtracting list of Networks   ##############
 
 if ($runIO{subtract}) {
   print	"\n\tNetwork subtract job. Sub-networks to subtract:\n";
@@ -646,10 +464,12 @@ if ($runIO{subtract}) {
   print  "\n\tSubtract job is Done!  Output files:\n";
   map {  print "   $$_[0]\n" if $$_[1]; } ["$file_out :\t".netwkString($network->setvaltobad(-9999)), 1],
 	[$file_msk,$flag_msk];
+
+  $file_ntwk	= $file_out;		# Carryover network file
 }
 
 #######################################################################
-#############   Job # 6 - Copy basin attributes      ##################
+#############   Job # 5 - Copy basin attributes      ##################
 
 if ($runIO{copy_attrib}) {
   print	"\n\tCopy basin ID attributes job:\n";
@@ -710,13 +530,18 @@ if ($runIO{copy_attrib}) {
 
 
 #######################################################################
-#############   Job # 7 - Merge endorheic basins    ###################
+#############   Job # 6 - Merge endorheic basins    ###################
 
 if ($runIO{merge_endorheic}) {
   print	"\n\tMerge endorheic basins job:\n";
 
 	### Set defaults
-  my $method	= set_default($runIO{merge_endorheic}{search_method},	0);
+  my $flag_EnR	= set_default($runIO{merge_endorheic}{endorheic_ID},	  0);
+  my $bffr_EnR	= set_default($runIO{merge_endorheic}{endorheicBuffer},	  0);
+  my $segm_EnR	= set_default($runIO{merge_endorheic}{segmentation},	  0);
+  my $oceanMsk	= set_default($runIO{merge_endorheic}{oceanMask_file},	 '');
+
+  my $method	= set_default($runIO{merge_endorheic}{search_method},	  0);
   my $max_dist	= set_default($runIO{merge_endorheic}{max_distance},	1e6);	# No limit
   my $max_delta	= set_default($runIO{merge_endorheic}{max_elev_delta},	1e6);	# No limit
   my $max_area	= set_default($runIO{merge_endorheic}{max_area},	1e9);	# No limit
@@ -735,12 +560,30 @@ if ($runIO{merge_endorheic}) {
   my $flowDir	= $$extent{mask};
   my $cell_area	= cell_area(lonLat($extent),$extent); 
   my $basinID	= read_raster($runIO{merge_endorheic}{basin_ID_file});
-  my $endorhID	= read_raster($runIO{merge_endorheic}{endorh_ID_file});	# Endorheic basin IDs only in this file
   my $up_area	=-read_raster($runIO{merge_endorheic}{uparea_file});	# Must negate to use min method
   my $stnElev	= read_raster($runIO{merge_endorheic}{elev_file});
   my $subElev	= $mthd_out ? $up_area : $stnElev;
   print "Done...\n";
 
+		### Build/read endorheic basin IDs
+  my  $endorhID;
+      $flag_EnR	= 1 unless $runIO{merge_endorheic}{endorh_ID_file};
+  if ($flag_EnR) {		# Skip, if not needed (may take a long time to compute)
+    print "   Note: endorheic_ID flag is set to idetify endorheic basins.\n".
+	  "         It will cause the endorh_ID_file data (if any) to be ignored.\n";
+    print "   Building endorheic basin IDs...";
+    my @time	= (Benchmark->new);
+    my $buffer	= floor($bffr_EnR/sqrt($cell_area))->lclip(1)->long;
+    my $ocean	= $oceanMsk ? read_GDAL($extent, {}, 0, $oceanMsk, 1, 1) : zeroes($basinID->dims);
+    my $land	= (($ocean==0) & ($basinID>0))->setvaltobad(0)->long;
+    $endorhID	= endorheic_basins($basinID, $flowDir, $buffer, $segm_EnR, $land);
+    printf " %.2f %% of the Network cells are %d endorheic basins.\n",
+		100.0*$endorhID->ngood/$basinID->ngood, $endorhID->uniq->dim(0);
+    push @time, Benchmark->new;
+    printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+  } else {
+    $endorhID	= read_raster($runIO{merge_endorheic}{endorh_ID_file});
+  }
 	### Initializations
   my $dir	= byte([32,64,128],[16,0,1],[8,4,2]);
   my @direction	= ([0,1,1,0,-1,-1,-1,0,1],[0,0,1,1,1,0,-1,-1,-1]);
@@ -858,14 +701,16 @@ if ($runIO{merge_endorheic}) {
   print  "\n\tMerge endorheic basins job is Done!\n";
   printf "   Merged %d endorheic basins. Skipped (area/dist/wrap/elev): (%d/%d/%d/%d)\n", @result;
   printf "   Result summary:   %.2f %% of the Network cells are %d endorheic basins.\n",
-		100*($endorhID->ngood/$basinID->ngood), $endorhID->uniq->dim(0);
+		100.0*$endorhID->ngood/$basinID->ngood, $endorhID->uniq->dim(0);
   print  "   Output files (Note- Basin IDs are retained):\n";
   map {  print "     $$_[0]\n" if $$_[1]; } [$file_out, 1], [$file_upAr, 1], [$file_IDs, 1], [$file_EnR, 1],
 	[$file_EnRs, $info_EnR];
+
+  $file_ntwk	= $file_out;		# Carryover network file
 }
 
 #######################################################################
-#############   Job # 8 - Upstream area match       ###################
+#############   Job # 7 - Upstream area match       ###################
 
 if ($runIO{upstream_match}) {
   print	"\n\tUpstream area match job:\n";
@@ -909,7 +754,7 @@ if ($runIO{upstream_match}) {
 
 	### Save resulted data
   my @result	= map [ $ID[$_], $lon[$_], $lat[$_], $area[$_],
-    map(sprintf($c_round,$_+0.5*$$extent{cellsize}), ApplyGeoTransform($$extent{gTransform},@{$search[$_][0]})),
+    map(sprintf($c_round,$_), ApplyGeoTransform($$extent{gTransform},$search[$_][0][0]+0.5,$search[$_][0][1]+0.5)),
 	sprintf("%.2f", $search[$_][1]),
 	sprintf("%.2f", sqrt(($colRow[$_][0]-$search[$_][0][0])**2 + ($colRow[$_][1]-$search[$_][0][1])**2))], 0 .. $#data;
   write_csv($runIO{upstream_match}{output_file}, \@header, \@result);
@@ -917,7 +762,7 @@ if ($runIO{upstream_match}) {
 }
 
 #######################################################################
-#############   Job # 9 - Set endorheic mouth flow direction to -1  ###
+#############   Job # 8 - Set endorheic mouth flow direction to -1  ###
 
 if ($runIO{endorheic_dir}) {
   print	"\n\tEndorheic mouth flow direction job:\n";
@@ -953,7 +798,7 @@ if ($runIO{endorheic_dir}) {
 }
 
 #######################################################################
-#############   Job # 10 - Calculate landcover upstream percent     ###
+#############   Job # 9 - Calculate landcover upstream percent     ###
 
 if ($runIO{upstream_percent}) {
   print	"\n\tUpstream Percent job:\n";
@@ -997,7 +842,7 @@ if ($runIO{upstream_percent}) {
   push @time, Benchmark->new;
   printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
 
-	### Save resulted network
+	### Save resulted data
   print  "\n\tUpstream Percent job job is Done! Output files:\n";
   foreach my $suffix (sort keys %data) {
    (my $file	= $file_Net) =~ s/\.\w+$/_$suffix.asc/;
@@ -1007,7 +852,7 @@ if ($runIO{upstream_percent}) {
 }
 
 #######################################################################
-#############   Job # 11 - Calculate upstream average     #############
+#############   Job # 10 - Calculate upstream average     #############
 
 if ($runIO{upstream_average}) {
   print	"\n\tUpstream Average job:\n";
@@ -1040,10 +885,282 @@ if ($runIO{upstream_average}) {
   push @time, Benchmark->new;
   printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
 
-	### Save resulted network
+	### Save resulted data
   print  "\n\tUpstream Average job job is Done! Output file:\n";
   write_gridascii($file_Net, $data_out, $extent, {FORMAT => $round});
   print  "   $file_Net\n";
+}
+
+#######################################################################
+#############   Job # 11 - Calculate network slope        #############
+
+if ($runIO{network_slope}) {
+  print	"\n\tNetwork Slope job:\n";
+  die	"Network file is not given or does not exists. Aborting...\n\n" unless -e $file_ntwk;
+  print	"$file_ntwk\n\n";
+
+		### Setting defaults for output flags
+  my $data_file_proj	= set_default($runIO{network_slope}{data_file_proj}, 'epsg:4326');
+  my $round		= set_default($runIO{network_slope}{output_Fmt},	  '%.6f');
+
+		### Making file names
+  my $file_Net	= $runIO{network_slope}{output_file} || $file_ntwk;
+     $file_Net eq $file_ntwk ?
+		  $file_Net	=~ s/\.\w+$/_NetSlope.asc/ :
+		  $file_Net	=~ s/\.\w+$/.asc/;
+  my $data_file	= $runIO{network_slope}{netElev_file};
+  prepare_dir($file_Net);
+
+		### Read Network data
+  print "Reading flow directon and network elevation data...\n";
+  my @time		= (Benchmark->new);
+  my $extent		= get_extent($file_ntwk, $runIO{Net_proj});
+  my $flowDir		= $$extent{mask};
+  my $data_extent	= get_extent($data_file, $data_file_proj,{MASK=>0});
+  die "\n\nMismatch in Network and \"netElev_file\" dataset spatial resolutions (required). Aborting...\n\n"
+	if abs($$extent{cellsizeX} - $$data_extent{cellsizeX}) > 0.0001 * $$data_extent{cellsizeX} ||
+	   abs($$extent{cellsizeY} - $$data_extent{cellsizeY}) > 0.0001 * $$data_extent{cellsizeY};
+
+  my $data		= read_GDAL($extent, {'Projection'=>$data_file_proj}, 0, $data_file, 1, 0); # near resample
+  printf "   File \"%s\": %s\n", basename($file_ntwk), netwkString($flowDir);
+
+		### Calculations
+  my $data_out	= $flowDir->networkSlope($data, lonLat($extent));
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+
+	### Save resulted slopes
+  print  "\n\tNetwork Slope job job is Done! Output file:\n";
+  write_gridascii($file_Net, $data_out, $extent, {FORMAT => $round});
+  print  "   $file_Net\n";
+}
+
+#######################################################################
+#############   Job # 12 - Point data extractor           #############
+
+if ($runIO{site_data}) {
+  print	"\n\tPoint data extractor job:\n";
+  die	"Network file is not given or does not exists. Aborting...\n\n" unless -e $file_ntwk;
+  print	"$file_ntwk\n\n";
+
+		### Setting defaults for output flags
+  my $data_file_proj	= set_default($runIO{site_data}{data_file_proj}, 'epsg:4326');
+  my $round		= set_default($runIO{site_data}{output_Fmt},	      '%.2f');
+  my $colRowFlag	= set_default($runIO{site_data}{colRow_flag},	          0 );
+  my $snap_distance	= set_default($runIO{site_data}{snap_distance},	         10 );	# Snap distance, km
+
+		### Making file names
+  my $pnt_File	= $runIO{site_data}{sites_file};
+  my $data_file	= $runIO{site_data}{data_file};
+  my $file_out	= $runIO{site_data}{output_file} || $pnt_File;
+     $file_out eq $pnt_File ?
+		  $file_out	=~ s/\.\w+$/_data.csv/ :
+		  $file_out	=~ s/\.\w+$/.csv/;
+  prepare_dir($file_out);
+
+		### Sites file header names
+  my $pnt_ID	= $runIO{site_data}{site_ID}	or die "Site ID column header is required. Aborting...\n";
+  my $pnt_X	= $runIO{site_data}{site_X}	or die "Site X (Longitude) column header is required. Aborting...\n";
+  my $pnt_Y	= $runIO{site_data}{site_Y}	or die "Site Y (Latitude) column header is required. Aborting...\n";
+  my @pnt_cName	=($pnt_X,  $pnt_Y);
+
+		### Read Network data
+  print "Reading flow directon and network elevation data...\n";
+  my @time		= (Benchmark->new);
+  my $extent		= get_extent($file_ntwk, $runIO{Net_proj});
+  my $cell_area		= cell_area(lonLat($extent),$extent); 
+  my $flowDir		= $$extent{mask};
+  my $up_area		= unpdl_data((-e $file_upArea ? read_raster($file_upArea) :
+	byte($flowDir)->upstrAccumAll($cell_area))->setbadtoval(-9999));
+  printf "   File \"%s\": %s\n", basename($file_ntwk), netwkString($flowDir);
+		### Read Input data
+  my $data		= read_GDAL($extent, {'Projection'=>$data_file_proj}, 0, $data_file, 1, 0); # near resample
+
+		### Read Sites data
+  my($hc, @sites)	= read_table($pnt_File);
+  my @c_Cols		= map $$hc{$_}, @pnt_cName;
+		### This assumes that projections of sites and data are the same
+  my @colRow_init	= $colRowFlag ? map			      [@$_[@c_Cols]  ],@sites:
+		  map[map(int, ApplyGeoTransform($$extent{igTransform},@$_[@c_Cols]))],@sites;
+  my @c_ID_init		= map $$_[$$hc{$pnt_ID}], @sites;
+		###  Check/remove sites that are outside of the network extent
+  my (@colRow, @coord, @c_ID);
+  for (my $i=0; $i<=$#c_ID_init; $i++) {
+    if ($colRow_init[$i][0] >= 0 && $colRow_init[$i][0] < $$extent{ncols} &&
+	$colRow_init[$i][1] >= 0 && $colRow_init[$i][1] < $$extent{nrows} &&
+	$$extent{mask}->($colRow_init[$i][0],$colRow_init[$i][1])->isgood) {
+      push @colRow,	 $colRow_init[$i];
+      push @coord,	 $colRowFlag ?
+		[ApplyGeoTransform($$extent{gTransform}, $colRow_init[$i][0]+0.5,$colRow_init[$i][1]+0.5)] :
+		[@{$sites[$i]}[@c_Cols]];
+      push @c_ID,	 $c_ID_init[$i]; }
+    else { print "   Site \"$c_ID_init[$i]\" is removed (outside of WBM domain)\n"; }
+  }
+  die "\n   No sites to extract are in the WBM spatial domain. Aborting...\n" unless @colRow;
+		### Search/snap to highest upstream area within search distance
+  my $distance		= floor($snap_distance / sqrt($cell_area))->long;
+  my @colRow_snap	= map((search_3x3($up_area, $_, 1e8, $distance->at(@$_),1))[0],	@colRow);
+  my @coord_snap	= map [ApplyGeoTransform($$extent{gTransform}, $$_[0]+0.5,$$_[1]+0.5)],	@colRow_snap;
+  my @snap_distance	= map  sprintf("%.1f", arcLength(@{$coord[$_]}, @{$coord_snap[$_]})),	0 .. $#colRow;
+
+		### Extract the data
+# my @data_out	= map $data->at(@$_), @colRow_snap;
+  my $data_out	=[map[$c_ID[$_],@{$coord[$_]},@{$coord_snap[$_]},$snap_distance[$_],
+		  sprintf($round, $data->at(@{$colRow_snap[$_]}))], 0 .. $#colRow];
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+
+	### Save resulted data
+  my $hdr_out	= [qw(Site_ID Lon Lat Snap_Lon Snap_Lat Snap_Dist Data)];
+  print  "\n\tPoint data extractor job job is Done! Output file:\n";
+  write_csv( $file_out, $hdr_out, $data_out );
+  print  "   $file_out\n";
+}
+
+#######################################################################
+#############   Job # N - Input/Output network processing   ###########
+
+$runIO{output_processing} = $runIO{cell_table} if exists($runIO{cell_table}) && !exist($runIO{output_processing});
+
+if ($runIO{output_processing}) {
+  print	"\n\tNetwork processing job. The network to process:\n";
+  die	"Network file is not given or does not exists. Aborting...\n\n" unless -e $file_ntwk;
+  print	"$file_ntwk\n\n";
+
+		### Setting defaults for output flags
+  my $flag_csv	= set_default($runIO{output_processing}{CT_csv},		0);
+  my $flag_dat	= set_default($runIO{output_processing}{CT_dat},		0);
+  my $flag_IDs	= set_default($runIO{output_processing}{basinIDs},		0);
+  my $flag_sOd	= set_default($runIO{output_processing}{streamOrder},		0);
+  my $flag_mDs	= set_default($runIO{output_processing}{mouthDistance},	0);
+  my $flag_upA	= set_default($runIO{output_processing}{upstrArea},		0);
+  my $flag_shp	= set_default($runIO{output_processing}{Net_shape},		0);
+  my $flag_SHP	= set_default($runIO{output_processing}{basinID_shape},	0);
+  my $flag_EnR	= set_default($runIO{output_processing}{endorheic},		0);
+  my $info_EnR	= set_default($runIO{output_processing}{endorheic_csv},	0);
+  my $bffr_EnR	= set_default($runIO{output_processing}{endorheicBuffer},	0);
+  my $segm_EnR	= set_default($runIO{output_processing}{segmentation},	0);
+  my $upAreaFmt	= set_default($runIO{output_processing}{upstrAreaFmt},   '%.1f');
+  my $oceanMsk	= set_default($runIO{output_processing}{oceanMask_file},     '');
+
+		### Making file names
+  my $file_ctbl	= $runIO{output_processing}{output_file} || $file_ntwk;
+     $file_ctbl			=~ s/\.\w+$/.dat/;
+ (my $file_ctab	= $file_ctbl)	=~ s/\.\w+$/.csv/;
+ (my $file_sOdr	= $file_ctbl)	=~ s/\.\w+$/_strmOrder.asc/;
+ (my $file_mDst	= $file_ctbl)	=~ s/\.\w+$/_mouthDist.asc/;
+ (my $file_upAr	= $file_ctbl)	=~ s/\.\w+$/_upstrArea.asc/;
+ (my $file_IDs	= $file_ctbl)	=~ s/\.\w+$/_IDs.asc/;
+ (my $file_EnR	= $file_ctbl)	=~ s/\.\w+$/_EnR.asc/;	# IDs  of endorheic basins
+ (my $file_EnRs	= $file_ctbl)	=~ s/\.\w+$/_EnR.csv/;	# Info of endorheic basins
+ (my $file_msk	= $file_ctbl)	=~ s/\.\w+$/_msk.asc/;	# Network mask file
+  if($file_upArea) {
+     die "\nUpstream area file does not exist :\n   $file_upArea\nAborthing...\n\n" unless -e $file_upArea;
+     $file_upAr	= $file_upArea;
+     $flag_upA	= 0; }
+  my $shape_dir	= dirname($file_ctbl).'/Network_shape_files/';
+  my $shape_DIR	= dirname($file_ctbl).'/BasinID_shape_files/';
+ (my $file_shp	= $shape_dir .	basename(   $file_ctbl))=~s/\.\w+$//;
+ (my $file_SHP	= $shape_DIR .	basename(   $file_IDs ))=~s/\.\w+$//;
+     prepare_dir( $file_ctbl);	prepare_dir($file_shp)	if $flag_shp;
+				prepare_dir($file_SHP)	if $flag_SHP;
+
+		### Read Network data
+  print "Reading flow directon data...\n";
+  my @time		= (Benchmark->new);
+  my $extent		= get_extent($file_ntwk, $runIO{Net_proj});
+  my $flowDir		= $$extent{mask};
+  my($colTo,$rowTo)	= flow_to($flowDir);		# Modifies $flowDir too
+  my $basinID		= $file_bIDs ?
+	read_GDAL($extent, {'Projection'=>$runIO{Net_proj}}, 0, $file_bIDs, 1, -9999)	: 0;
+  my %basinAttr		= $file_bAtt ? read_table_hash($file_bAtt, 'ID')		: 0;
+  my $mask		= $flowDir->isgood	if $flag_msk;
+  printf "   File \"%s\": %s\n", basename($file_ntwk), netwkString($flowDir);
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+
+		### Check curcularity of the Network
+  printf "Checking curcularity of the Network (%d cells)...\n",$flowDir->ngood;
+  check_circularityC($flowDir, $$extent{gTransform});			# C-coded version
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+
+		### Calculate upstream area
+  print((-e $file_upArea?'Reading':'Calculating')," upstream area...\n");
+  my $cell_area	= cell_area(lonLat($extent),$extent,$area_opt);
+  my $up_area	= -e $file_upArea ? read_raster($file_upAr) : byte($flowDir)->upstrAccumAll($cell_area);
+  die "\nUpstream area data in the file provided:\n   $file_upArea\ndoes not match network grid. Aborting...\n\n"
+	if $up_area->dim(0)!=$cell_area->dim(0) || $up_area->dim(1)!=$cell_area->dim(1);
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+
+		### Build Cell table
+  print "Shaping Cell Table...\n";
+  my ($area,$cell_pdl) = cell_table($up_area,$flowDir,$colTo,$rowTo);
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+  
+ 		### Calculate Stream Order
+  print 'Calculating stream order... ';
+  my  $strmOrder = $cell_pdl->streamOrder($colTo,$rowTo);
+  printf "Max value = %d\n", $strmOrder->max;
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+
+ 		### Calculate Distance to mouth
+  print 'Calculating distance to mouth... ';
+  my  $mDist	= $flowDir->mouthDistance(lonLat($extent));
+  printf "Max distance = %.1f km\n", $mDist->max;
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+
+		### Build basin IDs
+  unless (ref($basinID)) {
+  print "Building basin IDs...\n";
+    $basinID	= byte($flowDir)->basinIDs($cell_pdl);
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2])); }
+
+		### Build endorheic basin IDs
+  my ($basinEnR, $hdr_EnR, $list_EnR);
+  if ($flag_EnR || $info_EnR) {		# Skip, if not needed (may take a long time to compute)
+    my $buffer	= floor($bffr_EnR/sqrt($cell_area))->lclip(1)->long;
+    my $ocean	= $oceanMsk ? read_GDAL($extent, {}, 0, $oceanMsk, 1, 1) : zeroes($basinID->dims);
+    my $land	= (($ocean==0) & ($basinID>0))->setvaltobad(0)->long;
+    print "Building endorheic basin IDs...";
+    $basinEnR	= endorheic_basins($basinID, $flowDir, $buffer, $segm_EnR, $land);
+    printf " %.2f %% of the Network cells are %d endorheic basins.\n",
+		100.0*$basinEnR->ngood/$basinID->ngood, $basinEnR->uniq->dim(0);
+    if ($info_EnR) {
+      $hdr_EnR	= [qw(basin_ID mouth_Lon mouth_Lat mouth_Col mouth_Row n_pixels area)];
+      $list_EnR	= info_EnR($extent, $basinEnR, $flowDir, $up_area); }
+    push @time, Benchmark->new;
+    printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+  }
+
+		### Save data to files
+  print "Finishing and saving output files for this job...\n";
+  write_CT_csv(	  $file_ctab,$CT_header,$extent, $area,$cell_pdl,$strmOrder,$mDist)	if $flag_csv;
+  write_shape_Net($file_shp, $CT_header,$extent, $area,$cell_pdl,$strmOrder,$basinID)	if $flag_shp;
+  write_shape_IDs($file_SHP, $basinID,  $extent, \%basinAttr)				if $flag_SHP;
+  write_gridascii($file_sOdr,$strmOrder,$extent, {FORMAT => '%d'})			if $flag_sOd;
+  write_gridascii($file_mDst,$mDist,    $extent, {FORMAT => '%.3f'})			if $flag_mDs;
+  write_gridascii($file_upAr,$up_area,	$extent, {FORMAT => $upAreaFmt})		if $flag_upA;
+  write_gridascii($file_IDs, $basinID,	$extent, {FORMAT => '%d'})			if $flag_IDs;
+  write_gridascii($file_EnR, $basinEnR,	$extent, {FORMAT => '%d'})			if $flag_EnR;
+  write_gridascii($file_msk, $mask,	$extent, {FORMAT => '%d'})			if $flag_msk;
+  writeflex(	  $file_ctbl,$up_area,	$area,    $cell_pdl)				if $flag_dat;
+  write_csv(	  $file_EnRs,$hdr_EnR,  $list_EnR)					if $info_EnR;
+  push @time, Benchmark->new;
+  printf "\t%s\n",timestr(timediff($time[-1], $time[-2]));
+  print "\n\tCell Table job is Done! Output files:\n";
+  map { print "   $$_[0]\n" if $$_[1]; } [$file_ctab,$flag_csv], [$file_ctbl,$flag_dat], [$file_sOdr, $flag_sOd],
+		[$file_mDst, $flag_mDs], [$file_upAr,$flag_upA], [$file_IDs,$flag_IDs ], [$file_EnR, $flag_EnR],
+		[$file_EnRs, $info_EnR],
+	map(["$file_shp.$_",$flag_shp],   qw(geojson shp kml)),
+	map(["$file_SHP.$_",$flag_SHP],   qw(geojson shp kml));
+
+  print $separator if $runIO{preclip} || $runIO{subset} || $runIO{combine} || $runIO{subtract};
 }
 
 #######################################################################
@@ -1096,7 +1213,7 @@ sub preclip_polygon
 	unless -e $$runIO{preclip}{polygon}{file};
   die "Missing or wrong input format for preclip polygon ID- it must be numeric. Aborting...\n\n"
 	unless ref( $$runIO{preclip}{polygon}{polIDs} ) eq 'ARRAY';
-  die "Shape file in preclip_pyligon requires key for a masking variable name. Aborting...\n\n"
+  die "Shape file in preclip_polygon requires key for a masking variable name. Aborting...\n\n"
 	if $$runIO{preclip}{polygon}{file} =~ m/\.shp$/i && !$$runIO{preclip}{polygon}{shp_var};
 
   my  $proj	= $$runIO{preclip}{polygon}{proj} ? $$runIO{preclip}{polygon}{proj} : 'epsg:4326';
@@ -1293,6 +1410,24 @@ sub search_3x3		### TODO- rewrite it in PDL
 
 #######################################################################
 
+sub arcLength
+		### Great-circle distance between two Lon/Lat points
+		### From: http://en.m.wikipedia.org/wiki/Great-circle_distance
+{
+  my ($L1,$P1,$L2,$P2)	= map $_*pi/180, @_;
+
+  return 0 if $L1==$L2 && $P1==$P2;	# Same location of the two points
+
+  my ($sinP1,  $sinP2,  $cosP1,  $cosP2,   $sinDL,      $cosDL) =
+    (sin($P1),sin($P2),cos($P1),cos($P2), sin($L1-$L2),cos($L1-$L2));
+
+  return 6371 *		# Earth radius in WGS84 (km)
+  	atan2(	sqrt(($cosP2*$sinDL)**2 + ($cosP1*$sinP2-$sinP1*$cosP2*$cosDL)**2),
+		$sinP1*$sinP2 + $cosP1*$cosP2*$cosDL);
+}
+
+#######################################################################
+
 sub trim
 {
   my($net,$ext,$trm,$pcl) = @_;
@@ -1403,11 +1538,11 @@ sub write_CT_csv
 
 #######################################################################
 
-sub write_shape
+sub write_shape_Net
 {
   my ($file, $header, $extent, $area, $cell_pdl, $strmOrder,$basinID) = @_;
   my ($count,$size,   $cName) = (0,$area->dim(0), basename($file));
-  print "\r   Saving Network ESRI shape files: ";
+  print "   Saving Network vector files: ";
 
   open (FILE,">$file.geojson") or die "Couldn't open $file.geojson, $!";
     print FILE <<EOF;		### Header
@@ -1428,13 +1563,63 @@ die sprintf("(%d,%d)\n%s\n%s\n%s\n%s\n",@colRow,$basinID->at(@colRow),$strmOrder
     }
   close FILE;
   print "\r   Saving Network GeoJSON: row $size of $size - Done!\n";
-  print   "   Saving Network ESRI Shape File...";
+  print   "   Saving Network ESRI Shape files...";
     system "ogr2ogr -f 'ESRI Shapefile' $file.shp  $file.geojson";
     open (FILE,">$file.qml") or die "Couldn't open $file.qml, $!";	# Save QGIS style file
       print FILE flowDir_style();
     close FILE;
   print " Done!\n";
-  print   "   Saving Network KML File...";
+  print   "   Saving Network KML file...";
+    system "ogr2ogr -f 'KML' $file.kml $file.geojson";
+  print " Done!\n";
+}
+
+#######################################################################
+
+sub write_shape_IDs
+{
+  my ($file, $basinID, $extent, $basinAttr) = @_;
+		### Make tmp file string
+  my $tmp_obj	= new File::Temp(TEMPLATE => 'file'.('X' x 10), DIR => '/dev/shm');
+  my $tmp_file	= $tmp_obj->filename;	# Do not combine with the line above otherwise it will fail in forks
+
+		### Save JSON file
+  print "   Saving Basin ID GeoJSON file...";
+  unlink <$file.*>;
+  write_tif($extent, 'Int32', $tmp_file.'.tif', $basinID, {NODATA=>-9999});
+  system "gdal_polygonize.py -q -8 -f GeoJSON $tmp_file.tif $file.geojson Basin_IDs Basin_ID";
+  unlink $tmp_file.'.tif';
+		### Add attributes to the GeoJSON file
+  if ($basinAttr) {
+    my @attID	= sort keys %$basinAttr;
+    my @aProp	= sort keys %{$$basinAttr{$attID[0]}};
+    my $templ	= join(', ', map("\"$_\": ".(m/Name/?'"':'').$_.(m/Name/?'"':''), @aProp));
+    my @lines	= split m/\n/, htm_template("$file.geojson");
+    my($N, $n)	=( $basinID->uniq->nelem, 0);
+       $N--	if $basinID->min < 0;
+       print "\n";
+    foreach my $line (@lines) {
+      my $prop	= $line =~ m/("Basin_ID": \d+)/ ? $1 : next;
+      my $ID		= substr($prop, 12);
+      if (exists $$basinAttr{$ID}) {
+	my  $str	= "$prop, $templ";
+	map $str	=~ s/($_.+?)$_/$1$$basinAttr{$ID}{$_}/, @aProp;
+	    $str	=~ s/: N\/A/: -9999/g;
+	    $line	=~ s/$prop/$str/;
+      }     $n++;
+      print "\r      Adding basin attributes: $n of $N" unless $n % 10000;
+    } print "\r      Adding basin attributes: $n of $N";
+    open (FILE,">$file.geojson") or die "Couldn't open $file.geojson, $!";
+    print FILE join("\n", @lines);
+    close FILE;
+  }
+  print " Done!\n";
+		### Save ESRI Shape file
+  print   "   Saving Basin ID ESRI Shape files...";
+    system "ogr2ogr -f 'ESRI Shapefile' $file.shp  $file.geojson 2> /dev/null";
+  print " Done!\n";
+		### Save KML Shape file
+  print   "   Saving Basin ID KML file...";
     system "ogr2ogr -f 'KML' $file.kml $file.geojson";
   print " Done!\n";
 }
@@ -1446,7 +1631,7 @@ sub netwkString
   my  $network	= shift();
   my ($nCells, $nElem)	= ($network->ngood, $network->nelem);
   return sprintf "%d network cells, %.1f %% in (%dx%d) layer, %d basins",
-	$nCells, 100*$nCells/$nElem, $network->dims, ($network==0)->sum;
+	$nCells, 100.0*$nCells/$nElem, $network->dims, ($network==0)->sum;
 }
 
 #######################################################################
@@ -2032,6 +2217,48 @@ pp_def('upstrAverage', HandleBad => 1,
     free(myData);
     free(myArea);
     free(myStack);
+');
+
+
+#######################################################################
+
+pp_def('networkSlope', HandleBad => 1,
+  Pars => 'byte flowDir(n,m); double data(n,m); double lon(n); double lat(m);
+    double [o] slopeData(n,m);',
+  Code => '
+    int n_size = $SIZE(n);
+    int m_size = $SIZE(m);
+    int NN, MM, NTo, MTo, dir;
+    double dX, dY, avY;
+    double pi	   = 3.14159;
+    double radius  = 6378.1;
+    double degLen  = pi * radius * 1000 / 180;		// Length of 1 rad degree, m
+    int dirTo[2][9] = { {0,1,1,0,-1,-1,-1,0,1} , {0,0,1,1,1,0,-1,-1,-1} };
+
+	////	Initializations
+    loop(n,m) %{ if ($ISBAD($flowDir())) { $SETBAD($slopeData()); }
+		 else { $slopeData() = 0; } %}
+
+	////	Calculations
+    for (MM=0; MM<m_size; MM++) {
+      for (NN=0; NN<n_size; NN++) {
+	    dir = $flowDir(n=>NN,m=>MM) == 0 ? 0 : $flowDir(n=>NN,m=>MM) == 1 ? 1 : $flowDir(n=>NN,m=>MM) == 2 ? 2 :
+		  $flowDir(n=>NN,m=>MM) == 4 ? 3 : $flowDir(n=>NN,m=>MM) == 8 ? 4 : $flowDir(n=>NN,m=>MM) ==16 ? 5 :
+		  $flowDir(n=>NN,m=>MM) ==32 ? 6 : $flowDir(n=>NN,m=>MM) ==64 ? 7 : $flowDir(n=>NN,m=>MM) ==128? 8 :
+		  $flowDir(n=>NN,m=>MM) ==255? 0 : 9;
+	    if ( dir == 0 ) continue;
+	    if ( dir == 9 ) {
+	      printf( "\nUnexpected flow direction = %d in Pdlpp networkSlope(). Aborting...\n\n", $flowDir(n=>NN,m=>MM));
+	      exit(0xFF);		// It is exit with BAD status
+	    }
+            NTo = NN + dirTo[0][dir];
+            MTo = MM + dirTo[1][dir];
+	    avY =     ($lat(m=>MM) + $lat(m=>MTo)) / 2;
+	    dX  = fabs($lon(n=>NN) - $lon(n=>NTo)) * degLen * cos(avY/180 * pi);
+	    dY  = fabs($lat(m=>MM) - $lat(m=>MTo)) * degLen;
+	    $slopeData(n=>NN,m=>MM)=($data(n=>NN,m=>MM) - $data(n=>NTo,m=>MTo)) / sqrt(dX*dX + dY*dY);
+      }
+    }
 ');
 
 #######################################################################

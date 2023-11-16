@@ -1,49 +1,61 @@
 #!/usr/bin/perl
 
-	###  Comment:	Example of the input *.init file for network subsetting
+	###  Comment:	Example of the input *.init file for river network processing
 	###
 	###	NB 1- Remove, comment out, or empty all jobs, keys that you do not want to use.
-	###	NB 2- All keys are "optional" or have a default value
-	###	NB 3- Use quotes for file names, and do not change Perl brackets/syntax when changing values
-	###	NB 4- Use hash character "#" to start comment or comment line(s)
+	###	NB 2- All keys are "optional" or have default values meaning that they (corresponding lines)
+	###		can be removed from the actual init file to take default values.
+	###	NB 3- Use quotes for file names, and do not change Perl brackets/syntax when changing values.
+	###	NB 4- Use hash character "#" to start comment or comment line(s).
 
-	###	Compatible version of networkTools utility is:	22.4.0
+	###	Compatible version of networkTools utility is:	23.10.1
 
 {
-  Net_file	=> '/net/nfs/zero/data3/WBM_TrANS/data/flowdirection602.ascii',	# Optional- if running jobs ## 4 or 6
+  Net_file	=> '/net/nfs/zero/data3/WBM_TrANS/data/flowdirection602.asc',	# Optional- if running jobs ## 4 or 6
   Net_proj	=> '',	# Optional- Projection of the "Net_file".  Default is "epsg:4326", if omitted
   Net_projForce	=> 0,	# Optional- Force to assume equal area proj. Value is conversion to meters. Default is 0
   basinID_file	=> '',	# Optional- to retain known basin IDs
+  basinAtt_file	=> '',	# Optional- to use for adding attributes to the basin ID vector files. Must match by IDs
   upArea_file	=> '',	# Optional- to use known upstream area data matching the network grid
   stnMask	=> 0,	# Optional- Save mask file of resulting Network (suffix "_msk"). Default is 0
 
-	### Top level jobs (e.g. "cell_table", "preclip", etc.) are done strictly in the following sequence:
-		# 1- cell_table		5- subtract			9 - Endorheic direction
-		# 2- preclip		6- copy_attrib			10- Upstream percent
-		# 3- subset		7- merge_endorheic		11- Upstream average
-		# 4- combine		8- Upstream area match
+	### Top level jobs (e.g. "preclip", "subset", etc.) are done strictly in the following sequence:
+		# 1 - Preclip			2 - Subset			3 - Combine
+		# 4 - Subtract			5 - Copy attributes		6 - Merge Endorheic
+		# 7 - Upstream area match	8 - Endorheic direction		9 - Upstream percent
+		# 10- Upstream average		11- Network slope		12- Site/Point data extractor
+		# N - Network output processing (last)
 
 	#######################################################################
-	###  Job # 1 : Build cell table (CT), if "cell_table" key is given
-  cell_table	=> {
-	output_file	=> 'test.csv',	# Optional- Same directory and Network file basename, if omitted
-	CT_csv		=> 1,		# Optional- Flag to build text   (CSV) version of the CT.        Default is 0
+	###  Job # N (last) :
+	###	Output river network processing (if any) for the network derivative files.
+	###	It is done to the resulting river network file from all listed jobs in the sequence.
+	###	If no relevant jobs listed, then it will do it for the input network file (Net_file => '...')
+
+  output_processing => {
+	output_file	=> '',		# Optional- Input network file path and basename is used, if omitted.
+					#	    Note- it is recommended to omit it to avoid different file basenames
+					#		  in the network derived output files below.
+	CT_csv		=> 0,		# Optional- Flag to build text   (CSV) version of the CT.        Default is 0
 	CT_dat		=> 0,		# Optional- Flag to build binary (PDL) version of the CT.        Default is 0
 	Net_shape	=> 0,		# Optional- Flag to build ESRI shape and GeoJSON files.          Default is 0
+	basinID_shape	=> 0,		# Optional- Flag to build ESRI shape and GeoJSON files.          Default is 0
+					# Optional- Use "basinAtt_file" above to add attributes to it.
 	streamOrder	=> 0,		# Optional- Save stream order file (suffix "_strmOrder").        Default is 0
 	mouthDistance	=> 0,		# Optional- Save distance to mouth, km (suffix "_mouthDist").    Default is 0
-	basinIDs	=> 1,		# Optional- Save basin ID file (suffix "_IDs").                  Default is 0
-	upstrArea	=> 1,		# Optional- Save upstream area (km2) file (suffix "_upstrArea"). Default is 0
+	basinIDs	=> 0,		# Optional- Save basin ID file (suffix "_IDs").                  Default is 0
+	upstrArea	=> 0,		# Optional- Save upstream area (km2) file (suffix "_upstrArea"). Default is 0
 	upstrAreaFmt	=> '%.1f',	# Optional- Upstream area rounding in output file.               Default is %.1f
 	endorheic	=> 0,		# Optional- Save mask file for endorheic basins (suffix "_EnR"). Default is 0
 	endorheic_csv	=> 0,		# Optional- Save csv file for endorheic basins info (suffix "_EnR"). Default is 0
+			### Endorheic basin identification parameters, if "endorheic =>" flag is set:
 	endorheicBuffer	=> 200,		# Optional- Buffer around boundary to exclude endorheic outlets, km. Default is 0
 	segmentation	=> 0,		# Optional- Segmentation  boundary to exclude endorheic outlets. Default is 0
 	oceanMask_file	=> ''		# Optional- Ocean mask file to use to exclude endorheic outlets.
 		   },
 
 	#######################################################################
-	###  Job # 2 : Perform blind pre-clipping of the input network for consequent subsetting or blind use
+	###  Job # 1 : Perform blind pre-clipping of the input network for consequent subsetting or blind use
 
   preclip	=> {
 	output_file	=> 'PRECLIP.asc',	# Optional- Adds suffix "_preClip" to Network file basename, if omitted
@@ -62,25 +74,12 @@
 		   },
 
 	#######################################################################
-	###  Job # 3 : Build subset of the Network
+	###  Job # 2 : Build subset of the Network
 	###	Note - It uses precliped network file, if Job # 2 (precip) is pervoremed in the same run
 
   subset	=> {
 	output_file	=> 'SUBSET.asc',# Optional- Adds suffix "_Subset" to Network file basename, if omitted
-	trim_nodata	=> 1,		# Optional- Flag to trim nodata margins.                         Default is 0
-	CT_csv		=> 0,		# Optional- Flag to build text   (CSV) version of the CT.        Default is 0
-	CT_dat		=> 0,		# Optional- Flag to build binary (PDL) version of the CT.        Default is 0
-	streamOrder	=> 0,		# Optional- Save stream order file (suffix "_strmOrder").        Default is 0
-	mouthDistance	=> 0,		# Optional- Save distance to mouth, km (suffix "_mouthDist").    Default is 0
-	basinIDs	=> 1,		# Optional- Save basin ID file.                                  Default is 0
-	upstrArea	=> 1,		# Optional- Save upstream area (km2) file (suffix "_upstrArea"). Default is 0
-	upstrAreaFmt	=> '%.1f',	# Optional- Upstream area rounding in output file.               Default is %.1f
-	endorheic	=> 0,		# Optional- Save mask file for endorheic basins.                 Default is 0
-	endorheic_csv	=> 0,		# Optional- Save csv file for endorheic basins info (suffix "_EnR"). Default is 0
-	endorheicBuffer	=> 200,		# Optional- Buffer around boundary to exclude endorheic outlets, km. Default is 0
-	segmentation	=> 0,		# Optional- Segmentation  boundary to exclude endorheic outlets. Default is 0
-	oceanMask_file	=> '',		# Optional- Ocean mask file to use to exclude endorheic outlets.
-	
+	trim_nodata	=> 1,		# Optional- Flag to trim nodata margins.	Default is 0	
 
 	### Priority order of subsetting methods:
 	#   If multiple methods are enabled only the first one from the prioprity list will be used, others ignored-
@@ -119,7 +118,7 @@
 		   },
 
 	#######################################################################
-	###  Job # 4 : Combine a list of Network subsets of the same parent network into a single file
+	###  Job # 3 : Combine a list of Network subsets of the same parent network into a single file
 
   combine	=> {
 	Net_files	=> [	'/net/nfs/zero/home/WBM_TrANS/data/karsub3.asc',
@@ -129,7 +128,7 @@
 		   },
 
 	#######################################################################
-	###  Job # 5 : Subtract a list of Network subsets of the same parent network from it
+	###  Job # 4 : Subtract a list of Network subsets of the same parent network from it
 
 			# Note- preclip job does not apply to this function
   subtract	=> {
@@ -140,7 +139,7 @@
 		   },
 
 	#######################################################################
-	###  Job # 6 : Copy basin ID attributes from one network to another by the overlap method
+	###  Job # 5 : Copy basin ID attributes from one network to another by the overlap method
 
   copy_attrib	=> {
 	src_basin_ID	=> '/net/nfs/zero/data3/WBM_TrANS/data/30min_w_stn-6.04/GloPotSTNetwork604_30min_basinid.asc',
@@ -162,9 +161,16 @@
 		   },
 
 	#######################################################################
-	###  Job # 7 : Fix endorheic basins by connecting them to adjacent catchments
+	###  Job # 6 : Fix endorheic basins by connecting them to adjacent catchments
 
   merge_endorheic => {
+		# Optional- endorheic basin identification from the input network file
+	endorheic_ID	=> 0,		# Optional- Save mask file for endorheic basins (suffix "_EnR"). Default is 0
+			### Endorheic basin identification parameters, if "endorheic_ID =>" flag is set:
+	endorheicBuffer	=> 200,		# Optional- Buffer around boundary to exclude endorheic outlets, km. Default is 0
+	segmentation	=> 0,		# Optional- Segmentation  boundary to exclude endorheic outlets. Default is 0
+	oceanMask_file	=> ''		# Optional- Ocean mask file to use to exclude endorheic outlets.
+
 		# Data source files must match the same grid (proj, resolution, cell size, etc.)
 	output_file	=> '/net/nfs/swift/raid2/data/MERIT/MERIT_Hydro_IHU/05min/05min_flwdir_endrh_0.asc',
 	basin_ID_file	=> '/net/nfs/swift/raid2/data/MERIT/MERIT_Hydro_IHU/05min/MERIT_05min_basinid.asc',	# Input
@@ -181,7 +187,7 @@
 		   },
 
 	#######################################################################
-	###  Job # 8 : Upstream area match between observed (sites) and network values
+	###  Job # 7 : Upstream area match between observed (sites) and network values
 
   upstream_match => {
 	output_file	=> 'match.csv',
@@ -197,7 +203,7 @@
 		   },
 
 	#######################################################################
-	###  Job # 9 : Set endorheic mouth flow direction to -1
+	###  Job # 8 : Set endorheic mouth flow direction to -1
 
   endorheic_dir => {
 	output_file	=> 'EnR_dir.asc',	# Optional- Adds suffix "_EnR_dir" to Network file basename, if omitted
@@ -205,7 +211,7 @@
   }
 
 	#######################################################################
-	###  Job # 10 : Calculate landcover upstream percent in each network pixel
+	###  Job # 9 : Calculate landcover upstream percent in each network pixel
 
   upstream_percent => {
 	output_file	=> 'upstr_pct.asc',	# Optional- Adds suffix "_upstr_pct" to Network file basename, if omitted
@@ -218,11 +224,38 @@
   }
 
 	#######################################################################
-	###  Job # 11 : Calculate data upstream average in each network pixel
+	###  Job # 10 : Calculate data upstream average in each network pixel
 
   upstream_average => {
 	output_file	=> 'upstr_avg.asc',	# Optional- Adds suffix "_upstr_avg" to Network file basename, if omitted
 	data_file	=> 'my_data.asc',	# Input
+	data_file_proj	=> 'epsg:4326',		# Optional- Projection of the one above. Default is 'epsg:4326'	# Input
+	output_Fmt	=> '%.2f',		# Optional- Rounding in output file. Default is '%.2f'
+  }
+
+	#######################################################################
+	###  Job # 11 : Calculate network slope from network elevation data
+
+  network_slope => {
+	output_file	=> 'NetSlope.asc',	# Optional- Adds suffix "_NetSlope" to Network file basename, if omitted
+	netElev_file	=> 'my_data.asc',	# Input. Note, it must match input network grid
+	data_file_proj	=> 'epsg:4326',		# Optional- Projection of the one above. Default is 'epsg:4326'	# Input
+	output_Fmt	=> '%.6f',		# Optional- Rounding in output file of AAIGrid format. Default is '%.6f'
+  }
+
+	#######################################################################
+	###  Job # 12 : Point data extractor
+
+  site_data => {
+	sites_file	=> 'my_sites.csv',	# Path to the site file with the required header fields:
+	site_ID		=> 'Site_ID',			# Header name for site IDs
+	site_X		=> 'Longitude',			# Header name for Longitude or X
+	site_Y		=> 'Latitude',			# Header name for Latitude  or Y
+	colRow_flag	=> 0,			# Use actual (col,row) instead of (Lon,Lat). Default is 0
+
+	output_file	=> 'my_sites_data.csv',	# Optional- Adds suffix "_data" to the sites file basename, if omitted
+	data_file	=> 'my_data.asc',	# Input data to extract from for each site in the spreadsheet above
+	snap_distance	=> 10,			# Optional- Site to network snapping distance. Default is 0 km
 	data_file_proj	=> 'epsg:4326',		# Optional- Projection of the one above. Default is 'epsg:4326'	# Input
 	output_Fmt	=> '%.2f',		# Optional- Rounding in output file. Default is '%.2f'
   }
