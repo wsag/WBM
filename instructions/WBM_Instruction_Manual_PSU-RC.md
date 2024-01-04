@@ -146,7 +146,7 @@ WBM works on a series of `.init` files. There is one file which defines the mode
 
 **For now, if you have not accessed the WBM container by the passing command example, make sure you have a WBM interactive shell open and please run:**
 ```shell
-/wbm/model/wbm.pl -v /wbm/wbm_init/test.ini
+/wbm/model/wbm.pl -v /wbm/wbm_init/test.init
 ```
 
 Once the model has finished processing, near the end of the printed lines you should see a block of text that looks like this:
@@ -215,7 +215,7 @@ If the input files are large or your system is constrained _the spooling process
 Due to certain adjustments made within the spooling process, it is very likely the data that has been spooled will be slightly different than the input. This is very common when modifying raster data, particularly when those modifications affect cell size and spatial referencing. In the example of Ipswich River, the input data has been minimally affected by the spooling process. **If you would like to see the difference between the original data and the spooled data, run the following code.**
 ```shell
 ##Uses GDAL to calculate the difference between original data and spooled data
-gdal_calc.py -A netcdf:data/metdata_air.2m_d/1999.nc:air_temperature -B netcdf:spool/Merit_30sec_Ipswich/metdata_air.2m_d/1999.nc:air_temperature --outfile="test.nc" --format="netcdf" --A_band=50 --B_band=50 --calc="A-B"
+gdal_calc.py -A netcdf:/wbm/data/metdata_air.2m_d/1999.nc:air_temperature -B netcdf:/wbm/spool/Merit_30sec_Ipswich/metdata_air.2m_d/1999.nc:air_temperature --outfile="test.nc" --format="netcdf" --A_band=50 --B_band=50 --calc="A-B"
 
 ##Print to console a summary of the resulting GDAL calculation
 gdalinfo test.nc -stats
