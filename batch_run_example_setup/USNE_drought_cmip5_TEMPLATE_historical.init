@@ -1,0 +1,65 @@
+{
+ID	=> 'USNE_cmip5_TEMPLATE_historical',
+Comment	=> 'US Northeast, LOCA cmip 5 downscaling, drought',
+Project	=> 'MSB',
+MT_Code_Name	=>  {
+          MT_ID      => 'USNE_drought_cmip5_TEMPLATE_historical_runoff',
+          Output_dir => '/net/nfs/merrimack/raid/data/WBM_USNE_drought/TEMPLATE_historical',
+          Run_Start  => '1980-01-01',
+          Run_End    => '2005-12-31'
+          },
+spinup_state_ID	    => '',
+Spinup_Loops	    => '6',
+Spinup_Start	    => '1980-01-01',
+Spinup_End	    => '1984-12-31',
+Output_vars	    =>  'runoff
+		    runoff_ps
+		    discharge
+		    discharge_ps
+                    soilMoist
+		    soilMoist_ps
+		    soilMoistFrac
+		    evapotrans
+		    pet
+		    grdWater
+		    grndWater_ps
+		    ',
+MT_Precip	    => { Primary => '/net/nfs/zero/home/WBM_TrANS/data_init_files/climate/Northeast_US_Downscaling_cmip5/TEMPLATE_historical_pr_d.init'},
+precipFraction	    => '',
+MT_airT	            => { Primary => '/net/nfs/zero/home/WBM_TrANS/data_init_files/climate/Northeast_US_Downscaling_cmip5/TEMPLATE_historical_tasmean_d.init'},
+Network	            => '/net/nfs/zero/home/WBM_TrANS/data/USNE_flowdirection206_Subset.asc',
+Projection	    => 'epsg:4326',
+Routing	            => 'LRR',
+wbmParam	    => {scrPrintScale => 0.01},
+ConnectivityNetwork => '', 
+Reservoirs	    => '',
+soilAWCapacity	    => 'NETCDF:/net/nfs/zero/home/WBM_TrANS/data/HarmSoilData/Harmonized-SoilMap_AWC-mm_6min.nc:Band1',
+FieldCap	    => '',
+WiltingPoint	    => '',
+rootingDepth        => 'NETCDF:/net/nfs/zero/home/WBM_TrANS/data/Global_Terrain_RootDepthWBM_LTXXXX_30min.nc:STNetwork',
+FreeWaterEvap	    => '',
+Glaciers	    => '',
+snowBands	    => 1,
+lapseDownscale	    => '',
+waterTemperature    => '',
+Runoff_mask	=> '',
+Impervious	=> '',
+openWater	=> '',
+MT_LAI	        => '',
+WaterDemand	=> '',
+landCollapse	=> '',
+LandCover	=> '',
+Irrigation	=> '',
+WM_mod_precip	=> '',
+WM_obs_precip	=> '',
+WM_mod_airT	=> '',
+WM_obs_airT	=> '',
+PostProcessing	=>  {
+          Forks => 8,
+          Polygon_Aggregation => '',
+          Run => 1,
+          TA_multi_year_start    => '',
+          TA_multi_year_timestep => '',
+          Temporal_Aggregation   => 1
+        }
+}
