@@ -107,7 +107,11 @@ directory, and important file called build\_spool\_batch.pl.
 
 model/wbm.pl -v -noRun wbm\_init/ipswich.init
 
-Change directory to the output folder. Call the build spool batch file
+Change directory to the output folder. Change the permission on the build spool batch spool script, to make it executable.
+
+chmod 775 build_spool_batch.pl
+
+Call the build spool batch file
 specifying the number of forks to use, and requesting that NetCDF output
 of the spooled data is created in addition to the binary files that wbm
 references during run time.
