@@ -70,7 +70,7 @@ from the root directory of your virtual machine folder.
 For a minimal test case suitable for a personal computer download the
 minimal test case from the Water Systems Analysis Group website.
 
-wget https://wbm.unh.edu/v1.0.0/ipswich\_test.tar.gz
+wget [](https://wbm.unh.edu/resources/ipswich_test.tar.gz)
 
 Extract the test directory archive:
 
